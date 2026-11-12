@@ -44,12 +44,16 @@ static inline bool worker_reaped(struct agent_worker *workers, size_t count,
     return false;
 }
 
-/* The signals the supervisor blocks and waits for. */
-static inline void worker_wait_signals(sigset_t *set) {
+/* The signals the supervisor blocks and waits for. As PID 1 it leaves SIGTERM
+ * and SIGINT alone: the kernel drops them for init, and taking one would let
+ * init exit, which panics the guest. */
+static inline void worker_wait_signals(sigset_t *set, bool is_init) {
     sigemptyset(set);
     sigaddset(set, SIGCHLD);
-    sigaddset(set, SIGTERM);
-    sigaddset(set, SIGINT);
+    if (!is_init) {
+        sigaddset(set, SIGTERM);
+        sigaddset(set, SIGINT);
+    }
 }
 
 /* Milliseconds until the earliest pending restart, or -1 when every worker is

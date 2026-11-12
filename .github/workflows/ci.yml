@@ -51,8 +51,10 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Build agent and test worker supervision
         run: make -C vmm/guest/agent all test CFLAGS='-O2 -Wall -Wextra -pedantic -Werror'
-      - name: Test serial hangup recovery (needs root for TIOCVHANGUP)
-        run: sudo python3 vmm/guest/agent/test_serial_hangup.py vmm/guest/agent/vmm-agent
+      - name: Run the root-only agent tests (serial hangup, PID 1 signals)
+        run: |
+          sudo python3 vmm/guest/agent/test_serial_hangup.py vmm/guest/agent/vmm-agent
+          sudo python3 vmm/guest/agent/test_pid1_signals.py vmm/guest/agent/vmm-agent
 
   sdk:
     name: generate / type-check / test (SDKs)

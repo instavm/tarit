@@ -2249,7 +2249,7 @@ static uint64_t monotonic_ms(void) {
     return (uint64_t)now.tv_sec * 1000U + (uint64_t)now.tv_nsec / 1000000U;
 }
 
-static int supervise_workers(void) {
+static int supervise_workers(bool is_init) {
     struct agent_worker workers[] = {
         {.name = "vsock exec", .serve = serve_vsock_forever},
         {.name = "vsock PTY", .serve = serve_pty_forever},
@@ -2257,11 +2257,11 @@ static int supervise_workers(void) {
     };
     const size_t count = sizeof(workers) / sizeof(workers[0]);
     /* Sleep until a worker exits, an adopted orphan needs reaping, a restart
-     * falls due or we are told to stop. Blocking these signals first means
-     * none can arrive between the reap and the wait unseen. */
+     * falls due or (not as PID 1) we are told to stop. Blocking these signals
+     * first means none can arrive between the reap and the wait unseen. */
     sigset_t wait_set;
     sigset_t child_mask;
-    worker_wait_signals(&wait_set);
+    worker_wait_signals(&wait_set, is_init);
     if (sigprocmask(SIG_BLOCK, &wait_set, &child_mask) < 0) {
         return 1;
     }
@@ -2313,12 +2313,13 @@ static int supervise_workers(void) {
 
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
-    if (getpid() == 1) {
+    bool is_init = (getpid() == 1);
+    if (is_init) {
         setup_as_init();
         configure_boot_dns();
     }
 #ifdef __linux__
-    return supervise_workers();
+    return supervise_workers(is_init);
 #else
     serve_serial_forever();
     return 1;

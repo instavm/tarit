@@ -137,10 +137,12 @@ Restarts and fork failures back off from 100 ms to 5 seconds; ten seconds of
 stable service resets the backoff. In-flight commands or PTY sessions are not
 replayed. A reconnect after a worker failure starts a new request/session.
 When running as PID 1, the supervisor also reaps adopted command orphans.
-Between events it sleeps in `sigtimedwait` until a child exits, a restart
-falls due or SIGTERM or SIGINT asks it to stop its workers, so an idle guest
-gets no wakeups from it. Workers and the commands they run start with the
-signal mask the agent started with.
+Between events it sleeps in `sigtimedwait` until a child exits or a restart
+falls due, so an idle guest gets no wakeups from it. Workers and the commands
+they run start with the signal mask the agent started with. When it is not
+PID 1 the supervisor also waits for SIGTERM and SIGINT and then stops its
+workers; as PID 1 it leaves both at their default, which the kernel ignores for
+init, so neither can make init exit and panic the guest.
 
 Run `make test` for process-level crash/restart, orphan isolation, fork failure,
 backoff, idle wakeup, signal mask and cleanup regressions. The supervision tests

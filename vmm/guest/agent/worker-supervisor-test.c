@@ -42,8 +42,12 @@ static void await_ready(pid_t expected) {
 }
 
 static void test_wait_signals_and_deadline(void) {
+    /* As PID 1 SIGTERM/SIGINT must never be taken: init exiting panics the guest. */
     sigset_t set;
-    worker_wait_signals(&set);
+    worker_wait_signals(&set, true);
+    assert(sigismember(&set, SIGCHLD) == 1);
+    assert(sigismember(&set, SIGTERM) == 0 && sigismember(&set, SIGINT) == 0);
+    worker_wait_signals(&set, false);
     assert(sigismember(&set, SIGCHLD) == 1);
     assert(sigismember(&set, SIGTERM) == 1 && sigismember(&set, SIGINT) == 1);
 
@@ -68,7 +72,7 @@ static void test_wait_signals_and_deadline(void) {
 static void test_worker_mask_is_restored(void) {
     sigset_t wait_set;
     sigset_t saved;
-    worker_wait_signals(&wait_set);
+    worker_wait_signals(&wait_set, false);
     assert(sigprocmask(SIG_BLOCK, &wait_set, &saved) == 0);
     struct agent_worker worker = {.name = "mask", .serve = mask_worker};
     assert(worker_start(&worker, 0, fork, &child_mask) == 1);
@@ -147,6 +151,6 @@ int main(void) {
     assert(waitpid(-1, NULL, WNOHANG) == -1 && errno == ECHILD);
     close(ready_pipe[0]);
     close(ready_pipe[1]);
-    puts("worker supervisor: signal wait, worker mask, crash/restart, orphan isolation, fork failure/backoff, cleanup passed");
+    puts("worker supervisor: signal wait, PID 1 signals, worker mask, crash/restart, orphan isolation, fork failure/backoff, cleanup passed");
     return 0;
 }
