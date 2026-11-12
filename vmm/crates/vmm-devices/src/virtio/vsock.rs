@@ -1834,7 +1834,9 @@ mod tests {
         let mem = new_mem();
         setup_queues(&dev, &mem, 4);
         dev.set_host_listener(Arc::new(UdsHostListener { path }));
-        publish_tx(&mem, 0, 0, &guest_packet(5000, op::REQUEST, &[]));
+        // The control socket admits only privileged guest source ports (what
+        // guest root and the agent use); others are reset without connect().
+        publish_tx(&mem, 0, 0, &guest_packet(1023, op::REQUEST, &[]));
         let confined = dev.clone();
         std::thread::spawn(move || {
             vmm_jailer::seccomp::SeccompProfile::vcpu()
