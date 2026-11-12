@@ -4581,6 +4581,14 @@ pub async fn put_egress_policy_local(
 // Host application may have partially changed rules even on error. Restore the
 // last committed policy on either failure; never publish the requested revision
 // before successful host application. NetProvisioner contains failed updates.
+//
+// BadRequest/NotFound from the apply step are refusals, not host failures
+// (see Supervisor::update_egress and NetProvisioner::apply_egress). BadRequest
+// (no host networking, no allocation, invalid rule) is always raised before
+// any host rule is touched. NotFound means this VM's allocation is not, or no
+// longer, active; if it is raised after rules were touched, apply_egress has
+// already taken the TAP down. In both cases a restore would be refused the
+// same way and turn a clean 4xx into a 500, so return the refusal as is.
 fn apply_and_commit_egress(
     current: &EgressPolicyRecord,
     allowlist: &[String],
@@ -4588,7 +4596,10 @@ fn apply_and_commit_egress(
     mut apply: impl FnMut(&[String], bool) -> Result<usize, OrchError>,
     persist: impl FnOnce() -> Result<EgressPolicyRecord, OrchError>,
 ) -> Result<EgressPolicyRecord, OrchError> {
-    let result = apply(allowlist, allow_existing).and_then(|_| persist());
+    let result = match apply(allowlist, allow_existing) {
+        Err(refused @ (OrchError::BadRequest(_) | OrchError::NotFound(_))) => return Err(refused),
+        applied => applied.and_then(|_| persist()),
+    };
     match result {
         Ok(policy) => Ok(policy),
         Err(error) => match apply(&current.allowlist, current.allow_existing) {
@@ -7764,6 +7775,11 @@ mod tests {
     fn live_egress_without_host_network_does_not_advance_persisted_policy() {
         let (state, _) = test_state_with_durable_writer();
         let id = insert_running_vm(&state);
+        // A live runtime without host networking, so the request reaches
+        // Supervisor::update_egress instead of stopping at the operation gate.
+        state
+            .supervisor
+            .install_test_control_runtime(id, PathBuf::from("unused.sock"));
         let result = test_runtime().block_on(put_egress_policy_local(
             &state,
             id,
@@ -7772,10 +7788,55 @@ mod tests {
             vec!["1.1.1.1:443".into()],
             true,
         ));
-        assert!(result.is_err());
+        // The host refused before touching any rule: a clean 400, not the
+        // 500 "restoring committed revision ... also failed" of a restore.
+        let error = result.unwrap_err();
+        assert!(
+            matches!(&error, OrchError::BadRequest(message) if message.contains("TARIT_ENABLE_NET")),
+            "{error:?}"
+        );
+        assert_eq!(error.http_status(), 400);
         let stored = get_egress_policy_local(&state, id, "test").unwrap();
         assert_eq!(stored.revision, 1);
         assert!(stored.allowlist.is_empty());
+    }
+
+    #[test]
+    fn live_egress_refused_before_host_apply_skips_restore() {
+        let (state, _) = test_state_with_durable_writer();
+        let id = insert_running_vm(&state);
+        let current = get_egress_policy_local(&state, id, "test").unwrap();
+        for refusal in [
+            OrchError::BadRequest("no host networking".into()),
+            OrchError::NotFound("allocation no longer active".into()),
+        ] {
+            let status = refusal.http_status();
+            let refusal = std::cell::RefCell::new(Some(refusal));
+            let calls = std::cell::Cell::new(0);
+            let error = apply_and_commit_egress(
+                &current,
+                &["1.1.1.1:443/tcp".to_owned()],
+                true,
+                |_, _| {
+                    calls.set(calls.get() + 1);
+                    Err(refusal
+                        .borrow_mut()
+                        .take()
+                        .unwrap_or_else(|| OrchError::BadRequest("refused again".into())))
+                },
+                || panic!("a refused policy must not be persisted"),
+            )
+            .unwrap_err();
+            assert_eq!(calls.get(), 1, "no restore after a refusal");
+            assert_eq!(error.http_status(), status);
+            assert_ne!(status, 500);
+        }
+        assert_eq!(
+            get_egress_policy_local(&state, id, "test")
+                .unwrap()
+                .revision,
+            1
+        );
     }
 
     #[test]
