@@ -252,9 +252,13 @@ impl PtyRegistry {
             .lock()
             .map_err(|_| OrchError::Internal("pty registry lock".into()))?;
         purge_expired_sessions(&mut sessions);
+        // Only sessions that are not connected count against the tenant's
+        // pending cap. Established connections are bounded separately and
+        // configurably by PtyConnectionLimits.per_tenant, so a tenant's live
+        // shells neither block its own new sessions nor shrink this budget.
         if sessions
             .values()
-            .filter(|session| session.owner.tenant == owner.tenant)
+            .filter(|session| !session.active_connection && session.owner.tenant == owner.tenant)
             .count()
             >= MAX_PENDING_PTY_SESSIONS_PER_TENANT
             || sessions.len() >= MAX_PENDING_PTY_SESSIONS
@@ -1108,6 +1112,49 @@ mod tests {
             .create(Uuid::new_v4(), 80, 24, None, test_identity_for("noisy"))
             .unwrap();
         assert!(registry.get(replacement.vm_id, replacement.pty_id).is_err());
+    }
+
+    #[test]
+    fn pending_tenant_cap_ignores_established_connections() {
+        let registry = registry_with_limits(1_024, MAX_PENDING_PTY_SESSIONS_PER_TENANT, 16);
+        let identity = || test_identity_for("busy");
+        // Fill the tenant's whole active-connection budget with established
+        // sessions spread across VMs.
+        let mut permits = Vec::new();
+        let mut active_vm = Uuid::new_v4();
+        for index in 0..MAX_PENDING_PTY_SESSIONS_PER_TENANT {
+            if index % 16 == 0 {
+                active_vm = Uuid::new_v4();
+            }
+            let session = registry
+                .create(active_vm, 80, 24, None, identity())
+                .unwrap();
+            permits.push(
+                registry
+                    .admit_connect(session.vm_id, session.pty_id, &session.connect_token)
+                    .unwrap(),
+            );
+        }
+
+        // Established sessions must not consume the pending budget: the
+        // tenant can still stage a full set of pending sessions.
+        let mut pending_vm = Uuid::new_v4();
+        for index in 0..MAX_PENDING_PTY_SESSIONS_PER_TENANT {
+            if index % MAX_PENDING_PTY_SESSIONS_PER_VM == 0 {
+                pending_vm = Uuid::new_v4();
+            }
+            registry
+                .create(pending_vm, 80, 24, None, identity())
+                .unwrap_or_else(|err| panic!("pending session {index} rejected: {err:?}"));
+        }
+        assert!(matches!(
+            registry.create(Uuid::new_v4(), 80, 24, None, identity()),
+            Err(OrchError::Overloaded { .. })
+        ));
+        registry
+            .create(Uuid::new_v4(), 80, 24, None, test_identity_for("other"))
+            .unwrap();
+        drop(permits);
     }
 
     #[test]
