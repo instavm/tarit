@@ -500,9 +500,13 @@ support snapshots), `500`.
 
 ### `GET /v1/snapshots`
 
-List the caller's snapshots held by this node, oldest first. Snapshots owned
+List the caller's snapshots, oldest first. Snapshots owned
 by a fork or used as a hibernated VM's wake image are managed by that VM and
 are not listed.
+
+Snapshots are always scoped to the caller's own tenant, for `admin` keys too:
+unlike VMs and shares, an admin key cannot list another tenant's snapshots
+(owner decision, 2026-11-13).
 
 Response `200`:
 
@@ -528,6 +532,9 @@ that checkpoints often should delete the ones it no longer needs; otherwise
 the node eventually reaches disk pressure and refuses new snapshots with `429`.
 A snapshot that a branch head references, a hibernated VM would wake from, or
 a fork owns is refused. Delete the branch first to release a branch head.
+
+Like listing, deletion is scoped to the caller's own tenant for `admin` keys
+too. Another tenant's snapshot answers exactly like one that does not exist.
 
 Status codes: `204`, `401`, `404` (unknown, or another tenant's), `409`
 (still referenced), `422` (held by another node), `503` (fleet store

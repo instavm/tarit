@@ -1130,12 +1130,9 @@ async fn internal_delete_snapshot(
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
     let identity = require_peer_identity(identity.as_ref().map(|identity| &identity.0))?;
-    ops::delete_snapshot_local(
-        &state,
-        (!identity.is_admin()).then_some(identity.tenant.as_str()),
-        id,
-    )
-    .await?;
+    // Admins are scoped to their own tenant here too (owner decision,
+    // 2026-11-13); a foreign snapshot answers exactly like a missing one.
+    ops::delete_snapshot_local(&state, Some(identity.tenant.as_str()), id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1446,7 +1443,43 @@ mod tests {
             .unwrap();
         let owner = state.config.api_keys.resolve("tenant-a-key").unwrap();
         let foreign = state.config.api_keys.resolve("tenant-b-key").unwrap();
+        let admin = state.config.api_keys.resolve("admin-key").unwrap();
         runtime.block_on(async {
+            // An admin identity forwarded to the owner is scoped to its own
+            // tenant like any other (owner decision, 2026-11-13), and a
+            // foreign snapshot answers exactly like a missing one.
+            assert!(
+                internal_list_snapshots(State(state.clone()), Some(Extension(admin.clone())))
+                    .await
+                    .unwrap_or_else(|error| panic!("{}", error.0))
+                    .0
+                    .is_empty()
+            );
+            let delete_as_admin = |id| {
+                let state = state.clone();
+                let admin = admin.clone();
+                async move {
+                    crate::api::tests::snapshot_error_response(
+                        internal_delete_snapshot(State(state), Some(Extension(admin)), Path(id))
+                            .await
+                            .err()
+                            .unwrap(),
+                    )
+                    .await
+                }
+            };
+            let missing_id = Uuid::new_v4();
+            let missing = delete_as_admin(missing_id).await;
+            assert_eq!(missing.0, StatusCode::NOT_FOUND);
+            let foreign_as_admin = delete_as_admin(snapshot.snapshot_id).await;
+            assert_eq!(foreign_as_admin.0, missing.0);
+            assert_eq!(
+                foreign_as_admin.1,
+                missing
+                    .1
+                    .replace(&missing_id.to_string(), &snapshot.snapshot_id.to_string()),
+                "the requested id is echoed, nothing else differs"
+            );
             assert_eq!(
                 internal_list_snapshots(State(state.clone()), None)
                     .await

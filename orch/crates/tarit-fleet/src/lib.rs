@@ -606,15 +606,16 @@ impl PostgresFleet {
         }))
     }
 
-    /// Hosts with published snapshots visible to a tenant, or all owners for
-    /// an administrator. Local metadata on each host remains authoritative for
-    /// shape and lifecycle-managed image filtering.
-    pub async fn snapshot_hosts(&self, owner_key: Option<&str>) -> Result<Vec<String>, FleetError> {
+    /// Hosts with published snapshots of one tenant. There is deliberately no
+    /// all-tenants form: snapshot listing is tenant-scoped for every caller.
+    /// Local metadata on each host remains authoritative for shape and
+    /// lifecycle-managed image filtering.
+    pub async fn snapshot_hosts(&self, owner_key: &str) -> Result<Vec<String>, FleetError> {
         let client = self.pool.get().await?;
         let rows = client
             .query(
                 "SELECT DISTINCT host_id FROM fleet_snapshots
-             WHERE ($1::TEXT IS NULL OR owner_key = $1) ORDER BY host_id",
+             WHERE owner_key = $1 ORDER BY host_id",
                 &[&owner_key],
             )
             .await?;
@@ -5102,16 +5103,17 @@ mod tests {
         };
         fleet.upsert_snapshot(&unrelated).await?;
         assert_eq!(
-            fleet.snapshot_hosts(snapshot.owner_key.as_deref()).await?,
+            fleet
+                .snapshot_hosts(snapshot.owner_key.as_deref().unwrap())
+                .await?,
             vec![snapshot.host_id.clone()]
         );
         assert_eq!(
-            fleet.snapshot_hosts(unrelated.owner_key.as_deref()).await?,
+            fleet
+                .snapshot_hosts(unrelated.owner_key.as_deref().unwrap())
+                .await?,
             vec![unrelated.host_id.clone()]
         );
-        let all_hosts = fleet.snapshot_hosts(None).await?;
-        assert!(all_hosts.contains(&snapshot.host_id));
-        assert!(all_hosts.contains(&unrelated.host_id));
         let client = fleet.pool.get().await?;
         client
             .execute(
