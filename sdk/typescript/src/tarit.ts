@@ -78,11 +78,13 @@ export class TaritApiError extends Error {
 
 export class TaritDeadlineExceeded extends Error {
   readonly executionId: string | undefined;
+  readonly childId: string | undefined;
 
-  constructor(message: string, options: { executionId?: string | undefined } = {}) {
+  constructor(message: string, options: { executionId?: string | undefined; childId?: string | undefined } = {}) {
     super(options.executionId === undefined ? message : `${message}; execution ID ${options.executionId}`);
     this.name = "TaritDeadlineExceeded";
     this.executionId = options.executionId;
+    this.childId = options.childId;
   }
 }
 
@@ -116,6 +118,12 @@ async function sleepUntil(wakeAt: number): Promise<void> {
     const remaining = Math.max(0, wakeAt - performance.now());
     await sleep(Math.min(Math.ceil(remaining), 2_147_483_647));
   } while (performance.now() < wakeAt);
+}
+
+// Native browser/Node timers accept at most a signed 32-bit millisecond delay.
+const MAX_TIMER_MS = 2_147_483_647;
+function validTimerDeadline(milliseconds: number): boolean {
+  return Number.isFinite(milliseconds) && milliseconds > 0 && milliseconds <= MAX_TIMER_MS;
 }
 
 function validatePollInterval(milliseconds: number): void {
@@ -344,7 +352,7 @@ export class PtyConnection {
     if (queued !== undefined) return Promise.resolve(queued);
     if (this.terminalError !== undefined) return Promise.reject(this.terminalError);
     const deadlineMs = options.deadlineMs ?? 30_000;
-    if (!Number.isFinite(deadlineMs) || deadlineMs <= 0) {
+    if (!validTimerDeadline(deadlineMs)) {
       return Promise.reject(new TaritDeadlineExceeded(`PTY session ${this.ptyId} read exceeded its deadline`));
     }
     return new Promise((resolve, reject) => {
@@ -440,10 +448,10 @@ export class TaritClient {
     const rows = options.rows ?? 24;
     validatePtyDimensions(cols, rows);
     const deadlineMs = options.deadlineMs ?? 30_000;
-    if (!Number.isFinite(deadlineMs) || deadlineMs <= 0) {
-      throw new RangeError("PTY deadlineMs must be a finite positive number");
+    if (!validTimerDeadline(deadlineMs)) {
+      throw new RangeError("PTY deadlineMs must be positive and at most 2147483647");
     }
-    const deadline = Date.now() + deadlineMs;
+    const deadline = performance.now() + deadlineMs;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), deadlineMs);
     let created: { pty_id: string; connect_token: string };
@@ -468,7 +476,7 @@ export class TaritClient {
     } finally {
       clearTimeout(timer);
     }
-    const remaining = deadline - Date.now();
+    const remaining = deadline - performance.now();
     if (remaining <= 0) {
       await this.deletePtySession(vmId, created.pty_id);
       throw new TaritDeadlineExceeded(`open PTY for VM ${vmId} exceeded its deadline`);
@@ -481,7 +489,7 @@ export class TaritClient {
         remaining,
       );
       connection = new PtyConnection(this, vmId, created.pty_id, socket);
-      const attachRemaining = deadline - Date.now();
+      const attachRemaining = deadline - performance.now();
       if (attachRemaining <= 0) {
         throw new TaritDeadlineExceeded(`open PTY for VM ${vmId} exceeded its deadline`);
       }
@@ -509,12 +517,19 @@ export class TaritClient {
   }
 
   async fork(vmId: string, options: ForkOptions = {}): Promise<ForkVmResponse> {
+    const deadlineMs = options.deadlineMs ?? 30_000;
+    if (!validTimerDeadline(deadlineMs)) {
+      throw new RangeError("fork deadlineMs must be positive and at most 2147483647");
+    }
     const childId = options.childId ?? crypto.randomUUID();
-    const deadline = Date.now() + (options.deadlineMs ?? 30_000);
+    const deadline = performance.now() + deadlineMs;
+    const deadlineError = () => new TaritDeadlineExceeded(
+      `fork VM ${vmId} exceeded its deadline; child ID ${childId}`, { childId },
+    );
     let attempt = 0;
     while (true) {
-      const requestBudget = deadline - Date.now();
-      if (requestBudget <= 0) throw new TaritDeadlineExceeded(`fork VM ${vmId} exceeded its deadline`);
+      const requestBudget = deadline - performance.now();
+      if (requestBudget <= 0) throw deadlineError();
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), Math.max(1, requestBudget));
       try {
@@ -523,6 +538,7 @@ export class TaritClient {
           body: { id: childId },
           signal: controller.signal,
         });
+        if (controller.signal.aborted || performance.now() >= deadline) throw deadlineError();
         // 201 creates the child; 200 replays a fork that already used this child id.
         if ((result.response.status === 201 || result.response.status === 200) && result.data !== undefined) {
           return result.data;
@@ -541,8 +557,8 @@ export class TaritClient {
       } finally {
         clearTimeout(timer);
       }
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) throw new TaritDeadlineExceeded(`fork VM ${vmId} exceeded its deadline`);
+      const remaining = deadline - performance.now();
+      if (remaining <= 0) throw deadlineError();
       await sleep(Math.min(retryDelay(attempt), remaining));
       attempt += 1;
     }
