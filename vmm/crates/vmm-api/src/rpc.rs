@@ -442,7 +442,50 @@ pub fn serve_with_controller(socket_path: &str, controller: VmmController) -> st
     // an orphaned guest or a stale socket behind.
     install_shutdown_handler(controller.clone(), socket_path.to_string());
     log::info!("api listening on {socket_path}");
-    for stream in listener.incoming() {
+    let dispatch_controller = controller.clone();
+    serve_requests(
+        listener.incoming(),
+        move |req| dispatch(req, &dispatch_controller),
+        move |stream, cols, rows, shell| {
+            serve_attach_pty(stream, controller.clone(), cols, rows, shell);
+        },
+    )
+}
+
+// Only PTY bypasses the serialized control lane. A bounded queue keeps a busy
+// control lane from preventing the accept loop from recognizing PTY requests.
+fn serve_requests<I, D, A>(incoming: I, dispatch_request: D, attach: A) -> std::io::Result<()>
+where
+    I: IntoIterator<Item = std::io::Result<UnixStream>>,
+    D: Fn(ApiRequest) -> ApiResponse + Send + 'static,
+    A: Fn(UnixStream, u16, u16, Option<String>) + Send + Sync + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(UnixStream, ApiRequest)>(8);
+    let worker = std::thread::Builder::new()
+        .name("api-control".into())
+        .spawn(move || {
+            for (mut stream, req) in rx {
+                let resp = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    dispatch_request(req)
+                }))
+                .unwrap_or_else(|payload| {
+                    let msg = payload
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "unknown panic".to_string());
+                    log::error!("request handler panicked: {msg}");
+                    ApiResponse::Err {
+                        msg: format!("internal error: {msg}"),
+                    }
+                });
+                if let Err(e) = write_frame(&mut stream, &encode_response_for_frame(&resp)) {
+                    log::warn!("write_frame: {e}");
+                }
+            }
+        })?;
+    let attach = std::sync::Arc::new(attach);
+    for stream in incoming {
         let mut stream = match stream {
             Ok(s) => s,
             Err(e) => {
@@ -472,41 +515,44 @@ pub fn serve_with_controller(socket_path: &str, controller: VmmController) -> st
             }
         };
         if let ApiRequest::AttachPty { cols, rows, shell } = req {
-            // PTY sessions are intentionally long-lived. The absolute framing
-            // deadline protects only their initial authenticated request.
+            if shell.as_ref().is_some_and(|s| s.len() > 4096) {
+                let _ = vmm_core::pty_stream::write_error_frame(
+                    &mut stream,
+                    "PTY shell exceeds 4096 bytes",
+                );
+                continue;
+            }
+            // PTY sessions are long-lived; only initial framing has a deadline.
             if let Err(e) = clear_control_timeouts(&stream) {
                 log::warn!("clear AttachPty control timeout: {e}");
                 continue;
             }
-            let controller = controller.clone();
+            let attach = attach.clone();
             if let Err(e) = std::thread::Builder::new()
                 .name("api-attach-pty".into())
-                .spawn(move || serve_attach_pty(stream, controller, cols, rows, shell))
+                .spawn(move || attach(stream, cols, rows, shell))
             {
                 log::warn!("attach_pty thread spawn: {e}");
             }
             continue;
         }
-        // Isolate handler panics: a panic in dispatch must not crash the whole
-        // `vmm serve` process (which would orphan the VM before the orchestrator
-        // can stop it cleanly). Catch it and return a framed error instead.
-        let resp =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dispatch(req, &controller)))
-                .unwrap_or_else(|payload| {
-                    let msg = payload
-                        .downcast_ref::<&str>()
-                        .map(|s| s.to_string())
-                        .or_else(|| payload.downcast_ref::<String>().cloned())
-                        .unwrap_or_else(|| "unknown panic".to_string());
-                    log::error!("request handler panicked: {msg}");
-                    ApiResponse::Err {
-                        msg: format!("internal error: {msg}"),
-                    }
-                });
-        if let Err(e) = write_frame(&mut stream, &encode_response_for_frame(&resp)) {
-            log::warn!("write_frame: {e}");
+        match tx.try_send((stream, req)) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::TrySendError::Full((mut stream, _))) => {
+                let response = ApiResponse::Err {
+                    msg: "control request queue full".into(),
+                };
+                let _ = write_frame(&mut stream, &encode_response(&response));
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                return Err(std::io::Error::other("control worker stopped"));
+            }
         }
     }
+    drop(tx);
+    worker
+        .join()
+        .map_err(|_| std::io::Error::other("control worker panicked"))?;
     Ok(())
 }
 
@@ -881,6 +927,144 @@ mod tests {
             volumes: vec![],
             net: vec![],
         }
+    }
+
+    fn read_mock_frame(stream: &mut UnixStream) -> Vec<u8> {
+        let mut len = [0; 4];
+        stream.read_exact(&mut len).unwrap();
+        let mut body = vec![0; u32::from_be_bytes(len) as usize];
+        stream.read_exact(&mut body).unwrap();
+        body
+    }
+    #[test]
+    fn pty_bypasses_blocked_exec_while_control_requests_stay_ordered() {
+        let (mut exec, exec_server) = UnixStream::pair().unwrap();
+        let (mut pause, pause_server) = UnixStream::pair().unwrap();
+        let (mut pty, pty_server) = UnixStream::pair().unwrap();
+        for (stream, request) in [
+            (
+                &mut exec,
+                ApiRequest::Exec {
+                    command: "slow".into(),
+                    timeout_ms: 5000,
+                },
+            ),
+            (&mut pause, ApiRequest::Pause),
+            (
+                &mut pty,
+                ApiRequest::AttachPty {
+                    cols: 80,
+                    rows: 24,
+                    shell: None,
+                },
+            ),
+        ] {
+            write_frame(stream, &serde_json::to_vec(&request).unwrap()).unwrap();
+        }
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            serve_requests(
+                [Ok(exec_server), Ok(pause_server), Ok(pty_server)],
+                move |req| {
+                    if matches!(req, ApiRequest::Exec { .. }) {
+                        entered_tx.send("exec").unwrap();
+                        release_rx.recv().unwrap();
+                    } else {
+                        entered_tx.send("pause").unwrap();
+                    }
+                    ApiResponse::Ok
+                },
+                |mut stream, _, _, _| {
+                    write_frame(&mut stream, b"PTY ready").unwrap();
+                },
+            )
+        });
+        assert_eq!(
+            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "exec"
+        );
+        let (attached_tx, attached_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut header = [0; 4];
+            pty.read_exact(&mut header).expect("mock PTY header");
+            let mut body = vec![0; u32::from_be_bytes(header) as usize];
+            pty.read_exact(&mut body).expect("mock PTY body");
+            attached_tx.send(Ok::<_, std::io::Error>(body)).unwrap();
+        });
+        let attachment = attached_rx.recv_timeout(Duration::from_secs(1));
+        let control_remained_blocked = entered_rx.try_recv().is_err();
+        release_tx.send(()).unwrap();
+        assert_eq!(attachment.unwrap().unwrap(), b"PTY ready");
+        reader.join().unwrap();
+        assert!(control_remained_blocked);
+        assert_eq!(
+            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "pause"
+        );
+        assert!(matches!(
+            serde_json::from_slice::<ApiResponse>(&read_mock_frame(&mut exec)).unwrap(),
+            ApiResponse::Ok
+        ));
+        assert!(matches!(
+            serde_json::from_slice::<ApiResponse>(&read_mock_frame(&mut pause)).unwrap(),
+            ApiResponse::Ok
+        ));
+        server.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn full_control_queue_rejects_excess_work_without_blocking_pty() {
+        let (incoming_tx, incoming_rx) = std::sync::mpsc::channel();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            serve_requests(
+                incoming_rx.into_iter().take(11),
+                move |req| {
+                    if matches!(req, ApiRequest::Exec { .. }) {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                    }
+                    ApiResponse::Ok
+                },
+                |mut stream, _, _, _| {
+                    write_frame(&mut stream, b"PTY ready").unwrap();
+                },
+            )
+        });
+        let submit = |request: ApiRequest| {
+            let (mut client, accepted) = UnixStream::pair().unwrap();
+            write_frame(&mut client, &serde_json::to_vec(&request).unwrap()).unwrap();
+            incoming_tx.send(Ok(accepted)).unwrap();
+            client
+        };
+        let _exec = submit(ApiRequest::Exec {
+            command: "slow".into(),
+            timeout_ms: 5000,
+        });
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let mut queued = Vec::new();
+        for _ in 0..8 {
+            queued.push(submit(ApiRequest::Pause));
+        }
+        let mut excess = submit(ApiRequest::Pause);
+        let rejected =
+            serde_json::from_slice::<ApiResponse>(&read_mock_frame(&mut excess)).unwrap();
+        let mut pty = submit(ApiRequest::AttachPty {
+            cols: 80,
+            rows: 24,
+            shell: None,
+        });
+        let (attached_tx, attached_rx) = std::sync::mpsc::channel();
+        let reader =
+            std::thread::spawn(move || attached_tx.send(read_mock_frame(&mut pty)).unwrap());
+        let attached = attached_rx.recv_timeout(Duration::from_secs(1));
+        release_tx.send(()).unwrap();
+        assert!(matches!(rejected, ApiResponse::Err { msg } if msg.contains("queue full")));
+        assert_eq!(attached.unwrap(), b"PTY ready");
+        reader.join().unwrap();
+        server.join().unwrap().unwrap();
     }
 
     #[test]
