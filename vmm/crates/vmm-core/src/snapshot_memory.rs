@@ -15,14 +15,21 @@ pub(crate) struct LazySnapshotReader {
 #[cfg(feature = "boot")]
 impl LazySnapshotReader {
     /// Caller excludes balloon discard while this population map is used.
-    pub(crate) fn new(memory: &GuestMemory) -> Result<Option<Self>> {
-        let Some(lazy) = memory.lazy_page_discard() else {
-            return Ok(None);
+    ///
+    /// `None` when RAM is not lazily restored, and also when the page map
+    /// cannot be read (a jail without /proc): the snapshot then reads RAM
+    /// through the mapping, as it did before this reader existed. That faults
+    /// the missing pages in, which costs host memory but never correctness,
+    /// so it must not fail the snapshot.
+    pub(crate) fn new(memory: &GuestMemory) -> Option<Self> {
+        let lazy = memory.lazy_page_discard()?;
+        let Some(populated) = memory.populated_pages() else {
+            log::warn!(
+                "snapshot: guest page map unreadable; reading lazily restored RAM in full"
+            );
+            return None;
         };
-        let populated = memory
-            .populated_pages()
-            .ok_or_else(|| VmmError::Snapshot("read lazy guest population map".into()))?;
-        Ok(Some(Self { lazy, populated }))
+        Some(Self { lazy, populated })
     }
 }
 

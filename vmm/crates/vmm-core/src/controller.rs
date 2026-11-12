@@ -871,9 +871,7 @@ impl VmmController {
             let lazy_reader = vm
                 .guest_mem
                 .as_ref()
-                .map(crate::snapshot_memory::LazySnapshotReader::new)
-                .transpose()?
-                .flatten();
+                .and_then(crate::snapshot_memory::LazySnapshotReader::new);
             let state_blob: Vec<u8> = vm.state_blob.clone().unwrap_or_default();
             #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
             let state_blob = if volume_rewrites.is_empty() {
@@ -9699,8 +9697,7 @@ mod tests {
         let before = memory.populated_pages().unwrap();
         assert!(!before[1] && !before[2] && before[3] && before[4]);
         let reader = crate::snapshot_memory::LazySnapshotReader::new(&memory)
-            .unwrap()
-            .unwrap();
+            .expect("lazy RAM with a readable page map");
         // SAFETY: the mapping stays live and no guest/device workers run here.
         let raw = unsafe { std::slice::from_raw_parts(memory.as_ptr(), LEN) };
         let mut expected = vec![0x5a; LEN];
@@ -9776,6 +9773,142 @@ mod tests {
         assert_eq!(memory.populated_pages().unwrap(), before);
         memory.clear_lazy_page_discard();
         drop(lazy);
+    }
+
+    /// InstaVM runs the vmm in a jail without /proc, so the page map of a
+    /// lazily restored guest cannot be read there. A paused snapshot must then
+    /// read RAM in full, as it did before the page map was consulted, and not
+    /// fail. The test reruns itself in a private mount namespace with /proc
+    /// unmounted and snapshots a paused lazily restored VM through the
+    /// controller.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    #[test]
+    #[ignore = "requires root (a private mount namespace) and permitted userfaultfd"]
+    fn lazy_snapshot_without_proc_reads_ram_in_full() {
+        const CHILD: &str = "TARIT_TEST_LAZY_SNAPSHOT_WITHOUT_PROC";
+        if let Some(marker) = std::env::var_os(CHILD) {
+            lazy_snapshot_without_proc_child();
+            std::fs::write(marker, b"done").unwrap();
+            return;
+        }
+        use std::os::unix::process::CommandExt as _;
+        // The child writes this only after its assertions, so a filter that
+        // matched no test cannot pass.
+        let marker = tempfile::NamedTempFile::new().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "controller::tests::lazy_snapshot_without_proc_reads_ram_in_full",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, marker.path());
+        // SAFETY: the hook runs between fork and exec and only makes raw
+        // syscalls on static C strings; it neither allocates nor locks.
+        unsafe {
+            child.pre_exec(|| {
+                let fail = |rc: libc::c_int| {
+                    if rc == 0 {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::last_os_error())
+                    }
+                };
+                fail(libc::unshare(libc::CLONE_NEWNS))?;
+                fail(libc::mount(
+                    c"none".as_ptr(),
+                    c"/".as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_REC | libc::MS_PRIVATE,
+                    std::ptr::null(),
+                ))?;
+                fail(libc::umount2(c"/proc".as_ptr(), libc::MNT_DETACH))
+            });
+        }
+        let status = child.status().expect("rerun the test without /proc");
+        assert!(status.success(), "snapshot without /proc: {status}");
+        assert_eq!(std::fs::read(marker.path()).unwrap(), b"done");
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    fn lazy_snapshot_without_proc_child() {
+        use std::io::Write as _;
+        use vmm_memory_backend::{uffd_restore::start_lazy_restore, GuestMemory};
+        const PAGE: usize = 4096;
+        const LEN: usize = 16 * PAGE;
+        assert!(
+            std::fs::File::open("/proc/self/pagemap").is_err(),
+            "the child must run without /proc"
+        );
+        let memory = GuestMemory::new(LEN as u64).unwrap();
+        // SAFETY: this is the live page-aligned mapping owned by memory.
+        assert_eq!(
+            unsafe {
+                libc::madvise(
+                    memory.as_ptr() as *mut libc::c_void,
+                    LEN,
+                    libc::MADV_NOHUGEPAGE,
+                )
+            },
+            0
+        );
+        let mut source = tempfile::tempfile().unwrap();
+        source.write_all(&vec![0x5a; LEN]).unwrap();
+        let lazy = start_lazy_restore(
+            memory.as_ptr() as *mut u8,
+            LEN,
+            &source,
+            0,
+            LEN as u64,
+            None,
+        )
+        .expect("permitted userfaultfd");
+        memory.set_lazy_page_discard(lazy.page_discard());
+        assert!(
+            crate::snapshot_memory::LazySnapshotReader::new(&memory).is_none(),
+            "without a page map the snapshot reads RAM in full"
+        );
+        memory.write_phys((3 * PAGE) as u64, &[0xa5; PAGE]).unwrap();
+        memory
+            .discard_range(PAGE as u64, (2 * PAGE) as u64)
+            .unwrap();
+        let mut expected = vec![0x5a; LEN];
+        expected[PAGE..3 * PAGE].fill(0);
+        expected[3 * PAGE..4 * PAGE].fill(0xa5);
+
+        let controller = VmmController::new();
+        *controller.lock() = Some(VmInstance {
+            state: VmState::Paused,
+            generation: next_vm_generation(),
+            created_at: std::time::Instant::now(),
+            last_snapshot: None,
+            base_identity: None,
+            restore_base: None,
+            transient_files: VmTransientFiles::default(),
+            dirty_logging: false,
+            config: cfg(),
+            guest_mem: Some(memory),
+            state_blob: Some(b"state".to_vec()),
+            mem_dump: None,
+            lazy_restore: Some(lazy),
+            running: None,
+            runtime_dir: RuntimeDirUse::acquire(),
+        });
+        let path = controller
+            .snapshot(false)
+            .expect("a paused snapshot without a page map");
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[..4], b"VMSN");
+        let state_len = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        let mem_len = u64::from_le_bytes(bytes[20..28].try_into().unwrap()) as usize;
+        assert_eq!(mem_len, LEN);
+        assert!(
+            bytes[32 + state_len..] == expected[..],
+            "the full read keeps the source, discarded and written pages"
+        );
+        controller.stop().unwrap();
     }
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
