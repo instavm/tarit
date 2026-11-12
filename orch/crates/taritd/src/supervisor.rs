@@ -2843,12 +2843,46 @@ impl ManagedProcess {
     }
 }
 
+/// How a registered boot ended, as seen by everyone waiting on it.
+///
+/// Joiners only care whether the runtime was published. Teardown waiters
+/// (DELETE, stop-all) must also know whether cleanup is still owed: a boot that
+/// failed and released everything it held must never be cleaned up again,
+/// because its VM id may already belong to a newer boot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BootCompletion {
+    /// The runtime was published, or the boot succeeded and its owner tore it
+    /// down deliberately. Nothing is owed.
+    Succeeded,
+    /// The boot failed and its owner released everything it held for it. The
+    /// `booting` entry was removed in the same step.
+    FailedCleaned(String),
+    /// The boot failed or its owner was abandoned, and cleanup is still owed.
+    /// The `booting` entry for this exact control stays registered (which also
+    /// blocks a newer boot of the same id) until a retry succeeds.
+    CleanupOwed(String),
+}
+
+impl BootCompletion {
+    fn into_join_result(self) -> Result<(), OrchError> {
+        match self {
+            Self::Succeeded => Ok(()),
+            Self::FailedCleaned(error) | Self::CleanupOwed(error) => {
+                Err(OrchError::Internal(error))
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 struct BootControl {
     purpose: SpawnPurpose,
     cancelled: AtomicBool,
     cancellation: (Mutex<bool>, Condvar),
-    completion: (Mutex<Option<Result<(), String>>>, Condvar),
+    completion: (Mutex<Option<BootCompletion>>, Condvar),
+    /// Serializes retried cleanup of this exact boot, so two teardown waiters
+    /// cannot both act on it and neither can act after the entry is released.
+    cleanup: Mutex<()>,
 }
 
 /// Tracks a lifecycle worker independently of the API/refill future that waits
@@ -2860,6 +2894,9 @@ pub(crate) struct OwnedTaskControl {
     terminal_converged: AtomicBool,
     cancellation: (Mutex<bool>, Condvar),
     completion: (Mutex<Option<Result<(), String>>>, Condvar),
+    /// The boot this worker registered, so a worker failure cleans up exactly
+    /// that boot and never whatever later holds the same VM id.
+    boot: Mutex<Option<BootIdentity>>,
 }
 
 impl OwnedTaskControl {
@@ -2869,7 +2906,22 @@ impl OwnedTaskControl {
             terminal_converged: AtomicBool::new(false),
             cancellation: (Mutex::new(false), Condvar::new()),
             completion: (Mutex::new(None), Condvar::new()),
+            boot: Mutex::new(None),
         }
+    }
+
+    pub(crate) fn attach_boot(&self, boot: BootIdentity) {
+        *self
+            .boot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(boot);
+    }
+
+    fn attached_boot(&self) -> Option<BootIdentity> {
+        self.boot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     fn request_cancellation(&self) {
@@ -2975,6 +3027,7 @@ impl BootControl {
             cancelled: AtomicBool::new(false),
             cancellation: (Mutex::new(false), Condvar::new()),
             completion: (Mutex::new(None), Condvar::new()),
+            cleanup: Mutex::new(()),
         }
     }
 
@@ -2998,17 +3051,46 @@ impl BootControl {
         }
     }
 
+    /// `Ok` means nothing is owed; `Err` means cleanup is still owed.
     fn complete(&self, result: Result<(), OrchError>) {
-        let completion = result.map_err(|error| error.to_string());
-        if let Ok(mut completed) = self.completion.0.lock() {
-            if completed.is_none() {
-                *completed = Some(completion);
-                self.completion.1.notify_all();
-            }
+        self.finish(match result {
+            Ok(()) => BootCompletion::Succeeded,
+            Err(error) => BootCompletion::CleanupOwed(error.to_string()),
+        });
+    }
+
+    /// The boot failed and its owner already released everything it held.
+    fn complete_failed_cleaned(&self, cause: &OrchError) {
+        self.finish(BootCompletion::FailedCleaned(cause.to_string()));
+    }
+
+    fn finish(&self, completion: BootCompletion) {
+        let mut completed = self
+            .completion
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if completed.is_none() {
+            *completed = Some(completion);
+            self.completion.1.notify_all();
         }
     }
 
+    fn outcome(&self) -> Option<BootCompletion> {
+        self.completion
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Joiners: `Ok` only when the runtime was published.
     fn wait_for_completion(&self) -> Result<(), OrchError> {
+        self.wait_for_outcome()?.into_join_result()
+    }
+
+    /// Teardown waiters: how the boot ended, including whether cleanup is owed.
+    fn wait_for_outcome(&self) -> Result<BootCompletion, OrchError> {
         let mut completed = self
             .completion
             .0
@@ -3021,13 +3103,9 @@ impl BootControl {
                 .wait(completed)
                 .map_err(|_| OrchError::Internal("boot completion lock poisoned".into()))?;
         }
-        let completed = completed
-            .as_ref()
-            .ok_or_else(|| OrchError::Internal("boot completion disappeared after wait".into()))?;
-        match completed {
-            Ok(()) => Ok(()),
-            Err(error) => Err(OrchError::Internal(error.clone())),
-        }
+        completed
+            .clone()
+            .ok_or_else(|| OrchError::Internal("boot completion disappeared after wait".into()))
     }
 }
 
@@ -3062,20 +3140,25 @@ impl BootCompletionGuard {
 
 impl Drop for BootCompletionGuard {
     fn drop(&mut self) {
-        let mut completed = self
-            .control
-            .completion
-            .0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if completed.is_none() {
-            self.control.request_cancellation();
-            *completed = Some(Err(
-                "boot owner exited before runtime publication or cleanup completed".into(),
-            ));
-            self.control.completion.1.notify_all();
+        if self.control.outcome().is_some() {
+            return;
         }
+        self.control.request_cancellation();
+        // The owner left without publishing or cleaning up, so cleanup is owed.
+        // Its `booting` entry stays registered for DELETE/stop-all to retry.
+        self.control.finish(BootCompletion::CleanupOwed(
+            "boot owner exited before runtime publication or cleanup completed".into(),
+        ));
     }
+}
+
+/// The exact boot a ticket belongs to. A caller that hands its ticket to a
+/// worker keeps this, so failure handling after the worker is gone acts only on
+/// that boot and never on a newer boot that reuses the VM id.
+#[derive(Clone, Debug)]
+pub(crate) struct BootIdentity {
+    id: Uuid,
+    control: Arc<BootControl>,
 }
 
 #[derive(Debug, Clone)]
@@ -3146,6 +3229,15 @@ pub(crate) struct BootTicket {
     purpose: SpawnPurpose,
     shape: ResourceShape,
     completion: BootCompletionGuard,
+}
+
+impl BootTicket {
+    pub(crate) fn identity(&self) -> BootIdentity {
+        BootIdentity {
+            id: self.id,
+            control: Arc::clone(&self.control),
+        }
+    }
 }
 
 pub(crate) struct BootedVm {
@@ -4794,12 +4886,15 @@ impl VmmSupervisor {
         tokio::spawn(async move {
             let result = match worker.await {
                 Ok(result) => result,
-                Err(error) => Err(supervisor.cleanup_registered_boot_failure(
-                    id,
-                    OrchError::Internal(format!(
+                Err(error) => {
+                    let cause = OrchError::Internal(format!(
                         "supervisor-owned lifecycle worker failed: {error}"
-                    )),
-                )),
+                    ));
+                    Err(match control.attached_boot() {
+                        Some(boot) => supervisor.cleanup_registered_boot_failure(&boot, cause),
+                        None => cause,
+                    })
+                }
             };
             let completion = match &result {
                 Ok(_) => Ok(()),
@@ -5102,7 +5197,8 @@ impl VmmSupervisor {
     }
 
     /// Cleanup success is not boot success: joiners must still observe the
-    /// original failure, while teardown waiters may retry idempotent cleanup.
+    /// original failure. Teardown waiters see that nothing is owed, so they
+    /// never re-run id-keyed cleanup against a newer boot of the same id.
     fn complete_cleaned_boot_failure(
         &self,
         id: Uuid,
@@ -5117,7 +5213,52 @@ impl VmmSupervisor {
                 booting.remove(&id);
             }
         }
-        control.complete(Err(OrchError::Internal(cause.to_string())));
+        control.complete_failed_cleaned(cause);
+    }
+
+    /// Retry the cleanup still owed by one exact boot. Acts only while that
+    /// boot's own `booting` entry is registered; while it is, no newer boot of
+    /// the id can register, so id-keyed teardown cannot reach another boot.
+    /// Returns whether this call performed the cleanup (`false` when the boot
+    /// is no longer registered because it was cleaned or published already).
+    fn retry_owed_boot_cleanup(
+        &self,
+        id: Uuid,
+        control: &Arc<BootControl>,
+    ) -> Result<bool, OrchError> {
+        let _cleanup = control
+            .cleanup
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let booting_vm = self
+            .booting
+            .lock()
+            .map_err(|_| OrchError::Internal("supervisor booting lock poisoned".into()))?
+            .get(&id)
+            .filter(|booting_vm| Arc::ptr_eq(&booting_vm.control, control))
+            .cloned();
+        let Some(booting_vm) = booting_vm else {
+            return Ok(false);
+        };
+        self.retry_booting_cleanup(id, &booting_vm)?;
+        self.complete_booting(id, control, Ok(()));
+        Ok(true)
+    }
+
+    /// A teardown waiter's half of a cancelled boot: wait for its owner, then
+    /// retry cleanup only if that exact boot still owes it.
+    fn settle_cancelled_boot(&self, id: Uuid, control: &Arc<BootControl>) -> Result<(), OrchError> {
+        match control.wait_for_outcome()? {
+            BootCompletion::Succeeded | BootCompletion::FailedCleaned(_) => Ok(()),
+            BootCompletion::CleanupOwed(completion_error) => self
+                .retry_owed_boot_cleanup(id, control)
+                .map(|_| ())
+                .map_err(|retry_error| {
+                    OrchError::Internal(format!(
+                        "{completion_error}; retrying boot cleanup failed: {retry_error}"
+                    ))
+                }),
+        }
     }
 
     fn cleanup_boot_failure(
@@ -5203,46 +5344,41 @@ impl VmmSupervisor {
 
     pub(crate) fn cleanup_boot_join_failure(
         &self,
-        id: Uuid,
+        boot: &BootIdentity,
         context: &str,
         join_error: tokio::task::JoinError,
     ) -> OrchError {
         self.cleanup_registered_boot_failure(
-            id,
+            boot,
             OrchError::Internal(format!("{context}: {join_error}")),
         )
     }
 
-    fn cleanup_registered_boot_failure(&self, id: Uuid, cause: OrchError) -> OrchError {
-        let booting = self
-            .booting
-            .lock()
-            .ok()
-            .and_then(|booting| booting.get(&id).cloned());
-        let Some(booting) = booting else {
+    /// Clean up after a boot whose owner is gone (its worker panicked or was
+    /// dropped). Acts only on that exact boot: a boot that already completed
+    /// its own cleanup, or a newer boot that reuses the id, is never touched.
+    fn cleanup_registered_boot_failure(&self, boot: &BootIdentity, cause: OrchError) -> OrchError {
+        let BootIdentity { id, control } = boot;
+        let id = *id;
+        control.request_cancellation();
+        // The owner is gone, so its completion guard has already fired; this
+        // only covers an owner that somehow left without one.
+        if control.outcome().is_none() {
+            control.complete(Err(OrchError::Internal(cause.to_string())));
+        }
+        if !matches!(control.outcome(), Some(BootCompletion::CleanupOwed(_))) {
             return cause;
-        };
-        booting.control.request_cancellation();
-        match self.retry_booting_cleanup(id, &booting) {
-            Ok(()) => {
-                self.complete_cleaned_boot_failure(id, &booting.control, &cause);
-                if booting.purpose == SpawnPurpose::Refill {
+        }
+        match self.retry_owed_boot_cleanup(id, control) {
+            Ok(cleaned) => {
+                if cleaned && control.purpose == SpawnPurpose::Refill {
                     self.release_reservation_after_cleanup(id);
                 }
                 cause
             }
-            Err(cleanup_error) => {
-                self.complete_booting(
-                    id,
-                    &booting.control,
-                    Err(OrchError::Internal(format!(
-                        "{cause}; cleanup retained resources: {cleanup_error}"
-                    ))),
-                );
-                OrchError::Internal(format!(
-                    "{cause}; cleanup retained booting VM {id} for retry: {cleanup_error}"
-                ))
-            }
+            Err(cleanup_error) => OrchError::Internal(format!(
+                "{cause}; cleanup retained booting VM {id} for retry: {cleanup_error}"
+            )),
         }
     }
 
@@ -5471,29 +5607,10 @@ impl VmmSupervisor {
         &self,
         booting: Vec<(Uuid, BootingVm)>,
     ) -> Vec<(Uuid, SpawnPurpose, Result<(), OrchError>)> {
-        let outcomes = wait_for_booting_tasks(
-            booting
-                .iter()
-                .map(|(_, booting_vm)| Arc::clone(&booting_vm.control)),
-        );
         booting
             .into_iter()
-            .zip(outcomes)
-            .map(|((id, booting_vm), outcome)| {
-                let outcome = match outcome {
-                    Ok(()) => Ok(()),
-                    Err(completion_error) => {
-                        self.retry_booting_cleanup(id, &booting_vm)
-                            .map_err(|retry_error| {
-                                OrchError::Internal(format!(
-                                "{completion_error}; retrying boot cleanup failed: {retry_error}"
-                            ))
-                            })
-                    }
-                };
-                if outcome.is_ok() {
-                    self.complete_booting(id, &booting_vm.control, Ok(()));
-                }
+            .map(|(id, booting_vm)| {
+                let outcome = self.settle_cancelled_boot(id, &booting_vm.control);
                 (id, booting_vm.purpose, outcome)
             })
             .collect()
@@ -5548,17 +5665,44 @@ impl VmmSupervisor {
         let id = ticket.id;
         let socket_path = runtime.host_socket.clone();
         let _ = std::fs::remove_file(&socket_path);
-        let cgroup_args = self.cgroup_args(id, ticket.shape, runtime)?;
+        // Every failure before the child exists cleans up and completes this
+        // exact boot here, so callers never need an id-keyed cleanup.
+        let cgroup_args = match self.cgroup_args(id, ticket.shape, runtime) {
+            Ok(args) => args,
+            Err(error) => {
+                return Err(self.cleanup_boot_failure_without_process(id, &ticket.control, error));
+            }
+        };
         let boot_gate = self.boot_gate.blocking_read();
-        let can_start = !self.is_shutting_down()
-            && !ticket.control.is_cancelled()
-            && self
-                .booting
-                .lock()
-                .map_err(|_| OrchError::Internal("supervisor booting lock poisoned".into()))?
-                .get(&id)
-                .is_some_and(|booting_vm| Arc::ptr_eq(&booting_vm.control, &ticket.control));
-        if !can_start {
+        // The poisoned guard is dropped inside `map_err`, so nothing below
+        // re-locks `booting` while this thread still holds it.
+        let registered = self
+            .booting
+            .lock()
+            .map_err(|_| OrchError::Internal("supervisor booting lock poisoned".into()))
+            .map(|booting| {
+                booting
+                    .get(&id)
+                    .is_some_and(|booting_vm| Arc::ptr_eq(&booting_vm.control, &ticket.control))
+            });
+        let registered = match registered {
+            Ok(registered) => registered,
+            Err(error) => {
+                // The completion guard reports the failure; DELETE/stop-all own
+                // the retry once the registry is usable again.
+                drop(boot_gate);
+                return Err(error);
+            }
+        };
+        if !registered {
+            // Not this boot's registration any more: id-keyed cleanup here could
+            // reach a newer boot. The completion guard reports the failure.
+            drop(boot_gate);
+            return Err(OrchError::Conflict(format!(
+                "boot registration changed for VM {id}"
+            )));
+        }
+        if self.is_shutting_down() || ticket.control.is_cancelled() {
             drop(boot_gate);
             return Err(self.cleanup_boot_failure_without_process(
                 id,
@@ -5689,28 +5833,34 @@ impl VmmSupervisor {
         // boot must remain retryable if its first teardown attempt fails.
         #[cfg(test)]
         self.wait_after_spawn_before_registry_attachment();
+        let mut registration_lost = false;
         let attached = self
             .booting
             .lock()
             .map_err(|_| OrchError::Internal("supervisor booting lock poisoned".into()))
-            .and_then(|mut booting| {
-                let booting_vm = booting.get_mut(&id).ok_or_else(|| {
-                    OrchError::Internal(format!("boot registration disappeared for VM {id}"))
-                })?;
-                if !Arc::ptr_eq(&booting_vm.control, &ticket.control) {
-                    return Err(OrchError::Conflict(format!(
-                        "boot registration changed for VM {id}"
-                    )));
+            .and_then(|mut booting| match booting.get_mut(&id) {
+                Some(booting_vm) if Arc::ptr_eq(&booting_vm.control, &ticket.control) => {
+                    booting_vm.socket_path = socket_path.clone();
+                    booting_vm.process = Some(process.clone());
+                    if ticket.control.is_cancelled() || self.is_shutting_down() {
+                        Err(self.shutdown_error())
+                    } else {
+                        Ok(())
+                    }
                 }
-                booting_vm.socket_path = socket_path.clone();
-                booting_vm.process = Some(process.clone());
-                if ticket.control.is_cancelled() || self.is_shutting_down() {
-                    Err(self.shutdown_error())
-                } else {
-                    Ok(())
+                _ => {
+                    registration_lost = true;
+                    Err(OrchError::Conflict(format!(
+                        "boot registration changed for VM {id}"
+                    )))
                 }
             });
         drop(boot_gate);
+        if registration_lost {
+            // This boot no longer owns the id, so id-keyed teardown could reach
+            // a newer boot. `unregistered` kills only this child on return.
+            return Err(attached.expect_err("lost registration is an error"));
+        }
         // From here either the registry or the explicit failure cleanup owns it.
         unregistered.0 = None;
         let vm = RunningVm::new(pid, socket_path, process, net_alloc);
@@ -5760,9 +5910,7 @@ impl VmmSupervisor {
             }
             None => None,
         };
-        let base_vm = self
-            .spawn_server_for_boot(&ticket, &runtime, net_alloc)
-            .map_err(|error| self.cleanup_registered_boot_failure(id, error))?;
+        let base_vm = self.spawn_server_for_boot(&ticket, &runtime, net_alloc)?;
         if let Err(error) =
             self.wait_for_socket_or_cancellation(&base_vm.socket_path, &ticket.control)
         {
@@ -5982,9 +6130,7 @@ impl VmmSupervisor {
             }
             None => None,
         };
-        let base_vm = self
-            .spawn_server_for_boot(&ticket, &runtime, net_alloc)
-            .map_err(|error| self.cleanup_registered_boot_failure(id, error))?;
+        let base_vm = self.spawn_server_for_boot(&ticket, &runtime, net_alloc)?;
         if let Err(error) =
             self.wait_for_socket_or_cancellation(&base_vm.socket_path, &ticket.control)
         {
@@ -6157,6 +6303,8 @@ impl VmmSupervisor {
                 || async { Ok(()) },
             )
             .await?;
+        let boot = ticket.identity();
+        task.attach_boot(boot.clone());
         if task.is_cancelled() {
             self.abort_unstarted_boot(&ticket).await;
             task.mark_terminal_converged();
@@ -6175,7 +6323,7 @@ impl VmmSupervisor {
                 return Err(error);
             }
             Err(error) => {
-                return Err(self.cleanup_boot_join_failure(id, "warm boot task", error));
+                return Err(self.cleanup_boot_join_failure(&boot, "warm boot task", error));
             }
         };
         if task.is_cancelled() {
@@ -6247,6 +6395,8 @@ impl VmmSupervisor {
                 || async { Ok(()) },
             )
             .await?;
+        let boot = ticket.identity();
+        task.attach_boot(boot.clone());
         if task.is_cancelled() {
             self.abort_unstarted_boot(&ticket).await;
             task.mark_terminal_converged();
@@ -6265,7 +6415,7 @@ impl VmmSupervisor {
                 return Err(error);
             }
             Err(error) => {
-                return Err(self.cleanup_boot_join_failure(id, "golden boot task", error));
+                return Err(self.cleanup_boot_join_failure(&boot, "golden boot task", error));
             }
         };
         if task.is_cancelled() {
@@ -6499,6 +6649,8 @@ impl VmmSupervisor {
                 || async { Ok(()) },
             )
             .await?;
+        let boot = ticket.identity();
+        task.attach_boot(boot.clone());
         if task.is_cancelled() {
             self.abort_unstarted_boot(&ticket).await;
             task.mark_terminal_converged();
@@ -6521,7 +6673,7 @@ impl VmmSupervisor {
                 return Err(error);
             }
             Err(error) => {
-                return Err(self.cleanup_boot_join_failure(id, "warm restore task", error));
+                return Err(self.cleanup_boot_join_failure(&boot, "warm restore task", error));
             }
         };
         if task.is_cancelled() {
@@ -7795,19 +7947,7 @@ impl VmmSupervisor {
     }
 
     fn finish_cancelled_boot(&self, id: Uuid, booting_vm: BootingVm) -> Result<(), OrchError> {
-        match booting_vm.control.wait_for_completion() {
-            Ok(()) => Ok(()),
-            Err(completion_error) => {
-                self.retry_booting_cleanup(id, &booting_vm)
-                    .map_err(|retry_error| {
-                        OrchError::Internal(format!(
-                            "{completion_error}; retrying boot cleanup failed: {retry_error}"
-                        ))
-                    })
-            }
-        }?;
-        self.complete_booting(id, &booting_vm.control, Ok(()));
-        Ok(())
+        self.settle_cancelled_boot(id, &booting_vm.control)
     }
 
     pub fn pause_vm(&self, id: Uuid) -> Result<(), OrchError> {
@@ -8638,15 +8778,6 @@ impl VmmSupervisor {
             leases.remove(&id);
         }
     }
-}
-
-fn wait_for_booting_tasks(
-    controls: impl IntoIterator<Item = Arc<BootControl>>,
-) -> Vec<Result<(), OrchError>> {
-    controls
-        .into_iter()
-        .map(|control| control.wait_for_completion())
-        .collect()
 }
 
 fn boot_can_publish(control: &BootControl, shutting_down: bool) -> bool {
@@ -11898,6 +12029,11 @@ mod tests {
                 .to_string()
                 .contains("memory cgroup limit overflow"));
             assert_boot_failed_for_all_waiters(&control);
+            // Cleaned here, so a later DELETE/stop-all owes nothing.
+            assert!(matches!(
+                control.outcome(),
+                Some(BootCompletion::FailedCleaned(_))
+            ));
             assert!(!supervisor.has_retained_boot(id));
             assert!(!supervisor.scheduler.is_reserved(id));
             assert!(!supervisor.artifact_owners.lock().unwrap().contains_key(&id));
@@ -11949,6 +12085,7 @@ mod tests {
             ))
             .unwrap();
         let control = Arc::clone(&ticket.control);
+        let boot = ticket.identity();
         let process = ManagedProcess::new(Command::new("sleep").arg("30").spawn().unwrap());
         let pid = process.pid;
         let worker = thread::spawn(move || {
@@ -11960,11 +12097,127 @@ mod tests {
         assert_boot_failed_for_all_waiters(&control);
         assert_ne!(unsafe { libc::kill(pid as libc::pid_t, 0) }, 0);
         supervisor
-            .cleanup_registered_boot_failure(id, OrchError::Internal("worker panicked".into()));
+            .cleanup_registered_boot_failure(&boot, OrchError::Internal("worker panicked".into()));
         assert!(!supervisor.has_retained_boot(id));
         assert!(!supervisor.scheduler.is_reserved(id));
         assert!(!supervisor.artifact_owners.lock().unwrap().contains_key(&id));
         supervisor.stop_all().unwrap();
+    }
+
+    /// A DELETE or stop-all that captured a boot before it ended must never
+    /// clean up a newer boot that reuses the same VM id: neither after a fully
+    /// cleaned failure (nothing is owed) nor after another waiter already paid
+    /// the cleanup that was owed.
+    #[test]
+    fn stale_teardown_waiter_never_cleans_a_newer_boot_of_the_same_id() {
+        for owed in [false, true] {
+            let supervisor = test_supervisor();
+            let id = Uuid::new_v4();
+            let runtime = test_runtime();
+            let first = runtime
+                .block_on(supervisor.begin_boot_with_registration(
+                    id,
+                    SpawnPurpose::Live,
+                    ResourceShape::new(1, 1),
+                    || async { Ok(()) },
+                ))
+                .unwrap();
+            // What stop_vm/stop_all hold while they wait for the boot to end.
+            let stale = supervisor
+                .booting
+                .lock()
+                .unwrap()
+                .get(&id)
+                .cloned()
+                .unwrap();
+            if owed {
+                // The owner leaves without cleaning up; one waiter pays.
+                drop(first);
+                assert!(matches!(
+                    stale.control.outcome(),
+                    Some(BootCompletion::CleanupOwed(_))
+                ));
+                supervisor.stop_vm(id).unwrap();
+            } else {
+                runtime.block_on(supervisor.abort_unstarted_boot(&first));
+                assert!(matches!(
+                    stale.control.outcome(),
+                    Some(BootCompletion::FailedCleaned(_))
+                ));
+                drop(first);
+            }
+            assert!(!supervisor.has_retained_boot(id));
+            supervisor.release_reservation_after_terminal(id).unwrap();
+
+            let second = runtime
+                .block_on(supervisor.begin_boot_with_registration(
+                    id,
+                    SpawnPurpose::Live,
+                    ResourceShape::new(1, 1),
+                    || async { Ok(()) },
+                ))
+                .unwrap();
+            supervisor.finish_cancelled_boot(id, stale.clone()).unwrap();
+            supervisor.cleanup_registered_boot_failure(
+                &BootIdentity {
+                    id,
+                    control: Arc::clone(&stale.control),
+                },
+                OrchError::Internal("stale worker failure".into()),
+            );
+
+            let current = supervisor
+                .booting
+                .lock()
+                .unwrap()
+                .get(&id)
+                .cloned()
+                .unwrap();
+            assert!(Arc::ptr_eq(&current.control, &second.control));
+            assert!(!second.control.is_cancelled(), "newer boot was cancelled");
+            assert!(
+                second.control.outcome().is_none(),
+                "newer boot was completed"
+            );
+            assert!(
+                supervisor.artifact_owners.lock().unwrap().contains_key(&id),
+                "newer boot lost its artifact ownership (owed={owed})"
+            );
+            assert!(supervisor.scheduler.is_reserved(id));
+            runtime.block_on(supervisor.abort_unstarted_boot(&second));
+            supervisor.release_reservation_after_terminal(id).unwrap();
+        }
+    }
+
+    /// Two teardown waiters on one boot that owes cleanup: exactly one retries,
+    /// and the other only observes that nothing is owed any more.
+    #[test]
+    fn owed_boot_cleanup_runs_once_for_concurrent_waiters() {
+        let supervisor = test_supervisor();
+        let id = Uuid::new_v4();
+        let ticket = test_runtime()
+            .block_on(supervisor.begin_boot_with_registration(
+                id,
+                SpawnPurpose::Live,
+                ResourceShape::new(1, 1),
+                || async { Ok(()) },
+            ))
+            .unwrap();
+        let control = Arc::clone(&ticket.control);
+        drop(ticket);
+        let cleaned = thread::scope(|scope| {
+            let workers = (0..4)
+                .map(|_| scope.spawn(|| supervisor.retry_owed_boot_cleanup(id, &control).unwrap()))
+                .collect::<Vec<_>>();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .filter(|cleaned| *cleaned)
+                .count()
+        });
+        assert_eq!(cleaned, 1);
+        assert!(!supervisor.has_retained_boot(id));
+        supervisor.release_reservation_after_terminal(id).unwrap();
     }
 
     #[test]
