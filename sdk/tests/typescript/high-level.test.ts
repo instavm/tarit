@@ -230,6 +230,48 @@ test("fork aborts an in-flight request at its deadline", async () => {
   );
 });
 
+test("fork returns a success response that arrives after its deadline", async () => {
+  // The child exists once the server answers 201; a late reply is not ambiguous, so the
+  // caller must get it rather than a deadline error that forces a replay.
+  let calls = 0;
+  const fetch: typeof globalThis.fetch = async () => {
+    calls += 1;
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    return json(201, forkResult());
+  };
+  const client = new TaritClient({ baseUrl: "https://tarit.test", apiKey: "tenant-key", fetch });
+  const result = await client.fork(vmId, { childId, deadlineMs: 5 });
+  assert.equal(result.vm.id, childId);
+  assert.equal(calls, 1);
+});
+
+test("fork reports a non-retryable error that arrives after its deadline", async () => {
+  const fetch: typeof globalThis.fetch = async () => {
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    return json(403, { error: "VM belongs to another tenant" });
+  };
+  const client = new TaritClient({ baseUrl: "https://tarit.test", apiKey: "tenant-key", fetch });
+  await assert.rejects(
+    () => client.fork(vmId, { childId, deadlineMs: 5 }),
+    (error: unknown) => error instanceof TaritApiError && error.status === 403,
+  );
+});
+
+test("fork turns a retryable response after its deadline into a deadline error", async () => {
+  let calls = 0;
+  const fetch: typeof globalThis.fetch = async () => {
+    calls += 1;
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    return json(503, { error: "busy" });
+  };
+  const client = new TaritClient({ baseUrl: "https://tarit.test", apiKey: "tenant-key", fetch });
+  await assert.rejects(
+    () => client.fork(vmId, { childId, deadlineMs: 5 }),
+    (error: unknown) => error instanceof TaritDeadlineExceeded && error.childId === childId,
+  );
+  assert.equal(calls, 1);
+});
+
 test("fork deadline exposes the SDK-generated child ID sent to the server", async () => {
   let sentId: string | undefined;
   const fetch: typeof globalThis.fetch = async (request, init) => {

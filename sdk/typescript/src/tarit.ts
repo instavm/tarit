@@ -538,7 +538,9 @@ export class TaritClient {
           body: { id: childId },
           signal: controller.signal,
         });
-        if (controller.signal.aborted || performance.now() >= deadline) throw deadlineError();
+        // A complete response is authoritative even when it lands after the deadline: a
+        // late 201/200 means the child exists and a late 4xx is a definite rejection. Only
+        // a retryable status falls through to the deadline check below.
         // 201 creates the child; 200 replays a fork that already used this child id.
         if ((result.response.status === 201 || result.response.status === 200) && result.data !== undefined) {
           return result.data;
