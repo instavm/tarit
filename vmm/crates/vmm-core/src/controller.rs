@@ -555,6 +555,19 @@ impl VmmController {
         })
     }
 
+    fn begin_empty_restore(&self) -> Result<LifecycleGuard<'_>> {
+        // The lifecycle guard excludes create/stop/another restore until the
+        // replacement is installed. Check before opening snapshots or adopting
+        // descriptors so a rejected restore cannot disturb the existing VM.
+        let guard = self.begin_lifecycle(LifecycleOp::Restore)?;
+        if self.lock().is_some() {
+            return Err(VmmError::InvalidConfig(
+                "VM already exists (1:1 model — stop first)".into(),
+            ));
+        }
+        Ok(guard)
+    }
+
     /// Boot the single VM. Error if one already exists.
     pub fn create(&self, config: VmConfig) -> Result<()> {
         let _lifecycle = self.begin_lifecycle(LifecycleOp::Create)?;
@@ -2040,7 +2053,7 @@ impl VmmController {
     ) -> Result<()> {
         use std::time::Instant;
 
-        let _lifecycle = self.begin_lifecycle(LifecycleOp::Restore)?;
+        let _lifecycle = self.begin_empty_restore()?;
         let runtime_dir = RuntimeDirUse::acquire();
         let start = Instant::now();
         let restored =
@@ -2294,6 +2307,7 @@ impl VmmController {
         _memory_integrity: Option<tarit_proto::MemoryIntegrity>,
         _target_memory_mib: Option<u64>,
     ) -> Result<()> {
+        let _lifecycle = self.begin_empty_restore()?;
         Err(VmmError::Snapshot("restore needs Linux+KVM+boot".into()))
     }
 
@@ -9165,6 +9179,42 @@ mod tests {
             runtime_dir: RuntimeDirUse::acquire(),
         });
         controller
+    }
+
+    #[test]
+    fn occupied_restore_rejects_before_snapshot_io_and_preserves_the_instance() {
+        for state in [
+            VmState::Created,
+            VmState::Running,
+            VmState::Paused,
+            VmState::Suspended,
+            VmState::Stopped,
+        ] {
+            let controller = controller_in_state(state);
+            let generation = controller.lock().as_ref().unwrap().generation;
+            for _ in 0..2 {
+                let error = controller
+                    .restore_with_memory_target(
+                        "/nonexistent/restore-must-not-open-this",
+                        None,
+                        None,
+                        None,
+                        tarit_proto::RestoreMemoryPolicy::default(),
+                        None,
+                        None,
+                    )
+                    .unwrap_err();
+                assert!(error.to_string().contains("VM already exists"), "{error}");
+                let slot = controller.lock();
+                let vm = slot.as_ref().unwrap();
+                assert_eq!(vm.generation, generation);
+                assert_eq!(vm.state, state);
+                assert_eq!(vm.mem_dump.as_ref().unwrap(), &vec![0; 4096]);
+            }
+            // Failure released its lifecycle reservation, so teardown is usable.
+            controller.stop().unwrap();
+            assert!(controller.lock().is_none());
+        }
     }
 
     fn net(tap: &str, mac: &str, ip: &str) -> NetConfig {
