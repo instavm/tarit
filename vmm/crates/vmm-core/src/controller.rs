@@ -1698,14 +1698,17 @@ impl VmmController {
                 capture_live_state_blob(&running, &base_blob)
             },
         );
-        let source_vcpus_paused = running
-            .vcpu_thread
-            .paused
-            .load(std::sync::atomic::Ordering::Acquire)
-            || running
-                .ap_threads
-                .iter()
-                .any(|thread| thread.paused.load(std::sync::atomic::Ordering::Acquire));
+        let source_vcpus = live_source_vcpus(
+            std::iter::once(&running.vcpu_thread)
+                .chain(running.ap_threads.iter())
+                .map(|thread| {
+                    (
+                        thread.control.load(std::sync::atomic::Ordering::Acquire),
+                        thread.paused.load(std::sync::atomic::Ordering::Acquire),
+                        thread.is_exited(),
+                    )
+                }),
+        );
 
         // Put the VM back only if the slot still holds the same instance. A
         // concurrent stop + create would otherwise get this VM's threads and
@@ -1715,10 +1718,8 @@ impl VmmController {
             let mut slot = self.lock();
             match slot.as_mut() {
                 Some(vm) if vm.generation == generation && vm.running.is_none() => {
-                    if source_vcpus_paused {
-                        vm.state = VmState::Paused;
-                    }
                     vm.running = reclaimed.take();
+                    settle_live_snapshot_source(vm, source_vcpus);
                 }
                 _ => {
                     log::warn!("live_snapshot: VM replaced during the snapshot; discarding it");
@@ -3431,6 +3432,59 @@ fn resolve_vcpu_resume(vm: &mut VmInstance, result: Result<()>) -> Result<()> {
         stop_after_uncertain_pause(vm);
     }
     result
+}
+
+/// Where a live snapshot left the source VM's vCPUs.
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveSourceVcpus {
+    /// Every vCPU left its pause: the VM keeps its state.
+    Released,
+    /// Every vCPU still holds the requested pause with this attempt's
+    /// capture, because an I/O worker could not be released: the VM is
+    /// fenced Paused for explicit recovery, as before.
+    Held,
+    /// Some vCPU was released but did not confirm, or its thread exited.
+    Uncertain,
+}
+
+/// Classify a live snapshot's source from each vCPU's (pause still
+/// requested, parked, thread exited).
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
+fn live_source_vcpus(vcpus: impl IntoIterator<Item = (bool, bool, bool)>) -> LiveSourceVcpus {
+    let (mut any_parked, mut all_held) = (false, true);
+    for (pause_requested, parked, exited) in vcpus {
+        any_parked |= parked || exited;
+        all_held &= pause_requested && parked && !exited;
+    }
+    if !any_parked {
+        LiveSourceVcpus::Released
+    } else if all_held {
+        LiveSourceVcpus::Held
+    } else {
+        LiveSourceVcpus::Uncertain
+    }
+}
+
+/// Record the source's state after a live snapshot. Main recorded Paused
+/// whenever any vCPU was still parked, including after a rollback that
+/// could not be confirmed; that is the uncertain pause #154 stops.
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
+fn settle_live_snapshot_source(vm: &mut VmInstance, vcpus: LiveSourceVcpus) {
+    match vcpus {
+        LiveSourceVcpus::Released => {}
+        LiveSourceVcpus::Held => vm.state = VmState::Paused,
+        LiveSourceVcpus::Uncertain => stop_after_uncertain_pause(vm),
+    }
 }
 
 #[cfg(any(
@@ -9441,6 +9495,43 @@ mod tests {
                     .to_string()
                     .contains("stopped"));
             }
+        }
+    }
+
+    #[test]
+    fn live_snapshot_source_is_paused_only_while_every_vcpu_holds_its_pause() {
+        // (pause still requested, parked, thread exited)
+        let running = (false, false, false);
+        let held = (true, true, false);
+        let unconfirmed = (false, true, false);
+        let exited = (false, true, true);
+        assert_eq!(
+            live_source_vcpus([running, running]),
+            LiveSourceVcpus::Released
+        );
+        assert_eq!(live_source_vcpus([held, held]), LiveSourceVcpus::Held);
+        // Main recorded Paused for each of these.
+        let uncertain: [&[(bool, bool, bool)]; 4] = [
+            &[running, unconfirmed],
+            &[unconfirmed, unconfirmed],
+            &[held, exited],
+            &[exited],
+        ];
+        for vcpus in uncertain {
+            assert_eq!(
+                live_source_vcpus(vcpus.iter().copied()),
+                LiveSourceVcpus::Uncertain
+            );
+        }
+
+        for (vcpus, expected) in [
+            (LiveSourceVcpus::Released, VmState::Running),
+            (LiveSourceVcpus::Held, VmState::Paused),
+            (LiveSourceVcpus::Uncertain, VmState::Stopped),
+        ] {
+            let controller = controller_in_state(VmState::Running);
+            settle_live_snapshot_source(controller.lock().as_mut().unwrap(), vcpus);
+            assert_eq!(controller.lock().as_ref().unwrap().state, expected);
         }
     }
 
