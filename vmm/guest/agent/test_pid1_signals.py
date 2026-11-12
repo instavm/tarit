@@ -60,16 +60,21 @@ def main(agent):
     if sys.platform != 'linux' or os.geteuid() != 0 or shutil.which('unshare') is None:
         print('SKIP: needs Linux, root and unshare')
         return 0
-    agent = os.path.abspath(agent)
     master, slave = pty.openpty()
     workdir = tempfile.mkdtemp(prefix='vmm-agent-pid1-', dir='/var/tmp')
     serial = os.path.join(workdir, 'serial')
     open(serial, 'w').close()
+    # Root in the new user namespace has no DAC override on files of users it
+    # does not map, such as a checkout under a 0750 home directory: run a
+    # root-owned copy of the agent instead.
+    binary = os.path.join(workdir, 'vmm-agent')
+    shutil.copyfile(agent, binary)
+    os.chmod(binary, 0o755)
     errors = tempfile.TemporaryFile(dir=workdir)
     env = dict(os.environ, VMM_AGENT_SERIAL=serial)
     proc = subprocess.Popen(
         ['unshare', '--user', '--map-root-user', '--pid', '--fork', '--kill-child',
-         '--mount', '--net', 'sh', '-xc', SETUP, 'sh', os.ttyname(slave), serial, agent],
+         '--mount', '--net', 'sh', '-xc', SETUP, 'sh', os.ttyname(slave), serial, binary],
         env=env, stdin=subprocess.DEVNULL, stdout=errors, stderr=errors,
         start_new_session=True)
     init = None
@@ -109,6 +114,7 @@ def main(agent):
         os.close(slave)
         errors.close()
         os.unlink(serial)
+        os.unlink(binary)
         os.rmdir(workdir)
 
 
