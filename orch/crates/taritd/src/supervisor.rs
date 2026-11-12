@@ -1648,6 +1648,9 @@ fn claim_or_validate_jail_base(path: &Path, expected_uid: u32) -> Result<(), Orc
     }
 }
 
+// Off Linux the mount-table scan is compiled out, which leaves an `if` that
+// clippy (1.100+) reads as a needless bool; the Linux shape is intentional.
+#[cfg_attr(not(target_os = "linux"), allow(clippy::needless_bool))]
 fn is_mount_root(path: &Path, metadata: &std::fs::Metadata) -> Result<bool, OrchError> {
     let parent = path.parent().ok_or_else(|| {
         OrchError::Internal(format!("VM jail base {} has no parent", path.display()))
