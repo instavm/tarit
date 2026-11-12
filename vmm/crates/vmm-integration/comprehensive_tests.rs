@@ -782,6 +782,9 @@ fn perf_gates_comprehensive() {
         snapshot_times.push(snap_ms);
         flushed_eprintln!("iter {i}: snapshot done — {snap_ms}ms ({snap_path})");
 
+        // One process owns one VM: stop the source before restoring into the
+        // same controller. Teardown is not part of the restore measurement.
+        controller.stop().expect("stop source before restore");
         let t2 = Instant::now();
         controller
             .restore(
@@ -972,9 +975,36 @@ fn snapshot_tampering_rejected() {
     let tampered_path = format!("{snap_path}.tampered");
     std::fs::write(&tampered_path, &snap_bytes).unwrap();
 
-    // Restore must fail.
-    let result = controller.restore(&tampered_path, None);
-    assert!(result.is_err(), "restore of tampered snapshot must fail");
+    // Restore into an empty controller so the refusal can only come from the
+    // tampered file, not from the source still occupying the VM slot.
+    controller.stop().expect("stop source before restore");
+    let error = controller
+        .restore(&tampered_path, None)
+        .expect_err("restore of tampered snapshot must fail");
+    assert!(
+        error.to_string().contains("magic"),
+        "tampered restore was refused for another reason: {error}"
+    );
+    assert!(
+        controller.status().is_err(),
+        "a rejected restore must not publish a VM"
+    );
+    // The untampered snapshot restores into the same controller.
+    controller
+        .restore(
+            &snap_path,
+            Some(
+                private_overlay_path("tamper-control")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        )
+        .expect("restore of the untampered snapshot");
+    assert_guest_exec(
+        &controller,
+        "bash -c 'echo tamper-control-ok'",
+        "tamper-control-ok",
+    );
     eprintln!("snapshot tampering: PASS (corrupted snapshot rejected)");
 
     controller.stop().ok();
