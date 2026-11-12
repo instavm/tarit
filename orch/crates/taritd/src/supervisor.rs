@@ -152,6 +152,10 @@ fn clear_cloexec_for_child(fd: libc::c_int) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Best-effort Stop before teardown kills the VMM. Bounded by
+/// `TEARDOWN_STOP_TIMEOUT` so a hung VMM (stopped, wedged) cannot hold a
+/// delete, an idle-warm reclaim or a shutdown sweep for the client's default
+/// request budget per VM.
 fn graceful_stop_vmm(socket_path: &Path) {
     if socket_path.as_os_str().is_empty() || !socket_path.exists() {
         return;
@@ -4956,7 +4960,7 @@ impl VmmSupervisor {
         let Some(warm_vm) = taken else {
             return false;
         };
-        let _ = VmmClient::new(&warm_vm.vm.socket_path).stop();
+        graceful_stop_vmm(&warm_vm.vm.socket_path);
         match self.teardown_vm(warm_vm.id, &warm_vm.vm) {
             Ok(()) => {
                 self.release_reservation_after_cleanup(warm_vm.id);
@@ -7678,8 +7682,7 @@ impl VmmSupervisor {
                     .and_then(|index| warm.remove(index))
             };
             if let Some(warm) = warm {
-                let client = VmmClient::new(&warm.vm.socket_path);
-                let _ = client.stop();
+                graceful_stop_vmm(&warm.vm.socket_path);
                 return self.teardown_vm(id, &warm.vm);
             }
             if let Some(net) = &self.net {
@@ -7691,8 +7694,7 @@ impl VmmSupervisor {
         };
 
         if !running.execution_cancelled_for_delete() {
-            let client = VmmClient::new(&running.socket_path);
-            let _ = client.stop();
+            graceful_stop_vmm(&running.socket_path);
         }
         if let Err(error) = self.teardown_vm(id, &running) {
             self.running
@@ -8382,16 +8384,14 @@ impl VmmSupervisor {
         }
         let mut retained_running = Vec::new();
         for (id, vm) in running {
-            let client = VmmClient::new(&vm.socket_path);
-            let _ = client.stop();
+            graceful_stop_vmm(&vm.socket_path);
             if !transitions.running(id, self.teardown_vm(id, &vm)) {
                 retained_running.push((id, vm));
             }
         }
         let mut retained_warm = Vec::new();
         for warm_vm in warm {
-            let client = VmmClient::new(&warm_vm.vm.socket_path);
-            let _ = client.stop();
+            graceful_stop_vmm(&warm_vm.vm.socket_path);
             if !transitions.warm(warm_vm.id, self.teardown_vm(warm_vm.id, &warm_vm.vm)) {
                 retained_warm.push(warm_vm);
             }
@@ -11044,6 +11044,85 @@ mod tests {
         );
         drop(supervisor);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A hung VMM (for example SIGSTOPped) keeps its socket and listen
+    /// backlog, so connect succeeds and the request is accepted, but no reply
+    /// ever comes. Returns the socket, a release signal, and the server thread
+    /// that reports how many connections it held.
+    #[cfg(target_os = "linux")]
+    fn hung_vmm_socket() -> (PathBuf, mpsc::Sender<()>, thread::JoinHandle<usize>) {
+        let socket_path = PathBuf::from(format!(
+            "target/taritd-hung-stop-{}.sock",
+            Uuid::new_v4().simple()
+        ));
+        let _ = std::fs::remove_file(&socket_path);
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket_path).expect("bind hung VMM socket");
+        listener
+            .set_nonblocking(true)
+            .expect("make hung VMM socket nonblocking");
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let server = thread::spawn(move || {
+            let mut held = Vec::new();
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => held.push(stream),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if release_rx.try_recv().is_ok() {
+                            return held.len();
+                        }
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("hung VMM accept failed: {error}"),
+                }
+            }
+        });
+        (socket_path, release_tx, server)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn teardown_stops_are_bounded_when_the_vmm_never_answers() {
+        // Every teardown path must give up within TEARDOWN_STOP_TIMEOUT per
+        // Stop instead of the VMM client's 30 s default request budget. Each
+        // path sends at most two Stops: its own and teardown_vm's.
+        let bound = TEARDOWN_STOP_TIMEOUT * 2 + Duration::from_secs(5);
+        let supervisor = test_supervisor();
+
+        let (delete_socket, release_delete, delete_server) = hung_vmm_socket();
+        let deleted = Uuid::new_v4();
+        supervisor.install_test_control_runtime(deleted, delete_socket.clone());
+        let started = Instant::now();
+        supervisor.stop_vm(deleted).unwrap();
+        let delete_elapsed = started.elapsed();
+        release_delete.send(()).unwrap();
+        let delete_stops = delete_server.join().unwrap();
+
+        let (shutdown_socket, release_shutdown, shutdown_server) = hung_vmm_socket();
+        let shut_down = Uuid::new_v4();
+        supervisor.install_test_control_runtime(shut_down, shutdown_socket.clone());
+        let started = Instant::now();
+        let summary = supervisor.stop_all().unwrap();
+        let shutdown_elapsed = started.elapsed();
+        release_shutdown.send(()).unwrap();
+        let shutdown_stops = shutdown_server.join().unwrap();
+
+        let _ = std::fs::remove_file(&delete_socket);
+        let _ = std::fs::remove_file(&shutdown_socket);
+        assert!(
+            delete_elapsed < bound,
+            "delete of a hung VMM took {delete_elapsed:?}"
+        );
+        assert!(
+            shutdown_elapsed < bound,
+            "shutdown of a hung VMM took {shutdown_elapsed:?}"
+        );
+        assert!(delete_stops >= 1, "delete sent no Stop to the hung VMM");
+        assert!(shutdown_stops >= 1, "shutdown sent no Stop to the hung VMM");
+        assert!(!supervisor.is_running(deleted));
+        assert!(!supervisor.is_running(shut_down));
+        assert!(summary.running_ids.contains(&shut_down));
     }
 
     #[test]
