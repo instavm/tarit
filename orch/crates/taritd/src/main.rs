@@ -238,6 +238,10 @@ async fn run_server(
         reap_on_shutdown = config.reap_on_shutdown,
         "starting taritd"
     );
+    if let Some(warning) = config::insecure_peer_http_warning(&config) {
+        tracing::warn!("{warning}");
+        eprintln!("WARNING: {warning}");
+    }
 
     // Bind every configured listener before startup begins. Dropping this local
     // releases all sockets if any subsequent setup step fails.
