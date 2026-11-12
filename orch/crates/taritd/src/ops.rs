@@ -5218,10 +5218,11 @@ mod tests {
             // Tests have no host networking, so the update itself is refused;
             // only that it was never queued behind tenant A matters here.
             assert!(egress.is_err());
-            let gates = state.activation_gates.lock().unwrap();
-            assert_eq!(gates.len(), 1);
-            assert!(gates.contains_key(&tenant_a));
-            drop(gates);
+            {
+                let gates = state.activation_gates.lock().unwrap();
+                assert_eq!(gates.len(), 1);
+                assert!(gates.contains_key(&tenant_a));
+            }
             blocked.abort();
             let _ = blocked.await;
             assert!(state.activation_gates.lock().unwrap().is_empty());
