@@ -523,7 +523,19 @@ Response `200`:
 ]
 ```
 
-Status codes: `200`, `401`.
+In cluster mode the list covers every node that holds one of the caller's
+snapshots. A node that cannot answer (down, unhealthy, stale, deregistered, or
+running a version without the peer snapshot route) does not fail the request:
+the response is still `200` with the snapshots every other node returned, and
+carries the header `X-Tarit-Unavailable-Hosts: <n>`, the number of nodes holding
+some of the caller's snapshots that could not be asked. The header is absent
+when the list is complete, so a client that needs the full list should retry
+while it is present. It counts only nodes that hold the caller's own snapshots,
+and node ids are not exposed (the server log names them). The body stays a
+plain array so existing clients keep working.
+
+Status codes: `200` (complete, or partial with `X-Tarit-Unavailable-Hosts`),
+`401`, `503` (fleet store unavailable).
 
 ### `DELETE /v1/snapshots/{id}`
 
