@@ -475,8 +475,9 @@ fn live_snapshot_phase_failures_resume_source_and_remove_artifacts() {
         "integrity_published",
     ];
 
+    // SAFETY: geteuid has no preconditions.
     let runtime_dir = std::env::temp_dir()
-        .join(".vmm-runtime")
+        .join(format!(".vmm-runtime-{}", unsafe { libc::geteuid() }))
         .join(format!("vmm-{}", std::process::id()));
     let overlay_dir = std::env::var_os("VMM_TEST_OVERLAY_DIR")
         .map(PathBuf::from)
@@ -489,6 +490,9 @@ fn live_snapshot_phase_failures_resume_source_and_remove_artifacts() {
             .create_live(agent_vm_config(256))
             .unwrap_or_else(|error| panic!("create source for {phase}: {error}"));
         assert_guest_exec(&controller, "printf before-failure", "before-failure");
+        // Create made the runtime directory; without it the leak check below
+        // would count nothing and pass vacuously.
+        assert!(runtime_dir.is_dir(), "missing {}", runtime_dir.display());
         let runtime_before = regular_file_count(&runtime_dir);
         let overlay_before = regular_file_count(&overlay_dir);
 

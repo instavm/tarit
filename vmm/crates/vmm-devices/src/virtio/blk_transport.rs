@@ -1146,7 +1146,16 @@ impl MmioDevice for VirtioBlkMmio {
         Ok(val as u64)
     }
 
-    fn mmio_write(&self, off: u64, val: u64, _len: u8) -> MmioWriteResult {
+    fn mmio_write(&self, off: u64, val: u64, len: u8) -> MmioWriteResult {
+        // Virtio MMIO control registers require aligned 32-bit accesses
+        // (Virtio 1.2, 4.2.2.2). KVM's u32 ioeventfd routes only that width
+        // of the queue-0 kick to the block worker; any other width reaches
+        // the confined vCPU thread, where servicing a request would issue
+        // file I/O its seccomp profile kills, with the queue locks held.
+        // Reject before acquiring queue locks or changing transport state.
+        if len != 4 || !off.is_multiple_of(4) {
+            return Err(MmioError::Device);
+        }
         let val = val as u32;
         log::debug!("BLK-W off=0x{off:x} val=0x{val:x}");
         if self.is_failed() && !(off == reg::STATUS && val == 0) {
@@ -1247,6 +1256,13 @@ impl MmioDevice for VirtioBlkMmio {
                 }
             }
             reg::QUEUE_NOTIFY => {
+                // Queue 0 is the only queue. Its kick is routed to the block
+                // worker by ioeventfd (datamatch 0); a notification naming any
+                // other queue traps to the vCPU thread and must not service
+                // queue 0 there (Virtio 1.2, 4.2.3.3: ignore unknown queues).
+                if val != 0 {
+                    return Ok(());
+                }
                 // THE CRITICAL PATH: guest kicked the queue — process I/O.
                 self.notify_count.fetch_add(1, Ordering::Relaxed);
                 return self.process_queue(val);
@@ -1487,6 +1503,90 @@ mod tests {
         let dev = VirtioBlkMmio::new_stub(5, 2);
         // Should not panic even without guest memory set.
         dev.mmio_write(reg::QUEUE_NOTIFY, 0, 4).unwrap();
+    }
+
+    #[test]
+    fn malformed_notify_writes_leave_pending_request_for_the_worker() {
+        let (backend, path) = new_test_backend("blk-malformed-notify");
+        let mem = new_test_mem();
+        let dev = VirtioBlkMmio::new(5, backend);
+        configure_test_blk_queue(&dev, mem.clone());
+        setup_blk_out_requests(&mem, 1);
+
+        for width in [0, 1, 2, 3, 5, 8, 16] {
+            assert!(dev.mmio_write(reg::QUEUE_NOTIFY, 0, width).is_err());
+            assert!(dev.mmio_write(reg::STATUS, 0, width).is_err());
+        }
+        assert!(dev.mmio_write(reg::QUEUE_NOTIFY + 1, 0, 4).is_err());
+        // A 32-bit kick naming a queue that does not exist is ignored.
+        for queue in [1, 2, u32::MAX] {
+            dev.mmio_write(reg::QUEUE_NOTIFY, u64::from(queue), 4)
+                .unwrap();
+        }
+        assert_eq!(used_idx(&mem), 0, "malformed kicks serviced the request");
+        assert_eq!(dev.notify_count.load(Ordering::Relaxed), 0);
+        assert!(Persist::try_save(&dev).is_ok());
+
+        // The valid queue-0 kick still services exactly the preserved request.
+        dev.mmio_write(reg::QUEUE_NOTIFY, 0, 4).unwrap();
+        assert_eq!(used_idx(&mem), 1);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn malformed_notify_survives_real_vcpu_seccomp_and_preserves_request() {
+        const CHILD_ENV: &str = "VMM_BLK_MMIO_SECCOMP_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "virtio::blk_transport::tests::malformed_notify_survives_real_vcpu_seccomp_and_preserves_request",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success(), "seccomp child failed: {status}");
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    let _ = child.wait();
+                    panic!("malformed notify killed or wedged the confined vCPU");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        let (backend, path) = new_test_backend("blk-malformed-notify-seccomp");
+        let mem = new_test_mem();
+        let dev = Arc::new(VirtioBlkMmio::new(5, backend));
+        configure_test_blk_queue(&dev, mem.clone());
+        setup_blk_out_requests(&mem, 1);
+        let confined = Arc::clone(&dev);
+        std::thread::spawn(move || {
+            vmm_jailer::seccomp::SeccompProfile::vcpu()
+                .install()
+                .unwrap();
+            for width in [1, 2, 8] {
+                assert!(confined.mmio_write(reg::QUEUE_NOTIFY, 0, width).is_err());
+            }
+            confined.mmio_write(reg::QUEUE_NOTIFY, 1, 4).unwrap();
+        })
+        .join()
+        .unwrap();
+        assert!(
+            Persist::try_save(dev.as_ref()).is_ok(),
+            "queue locks remain usable"
+        );
+        assert_eq!(used_idx(&mem), 0);
+        // The block worker's (unconfined here) pass services the request.
+        dev.process_queue(0).unwrap();
+        assert_eq!(used_idx(&mem), 1);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

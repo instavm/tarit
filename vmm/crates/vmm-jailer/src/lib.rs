@@ -23,3 +23,20 @@ pub use executor::{jail, launch_pid_namespace, PidNamespaceRole};
 pub use jailer::Jailer;
 pub use profile::{audit_profile, VmmSeccompProfiles};
 pub use seccomp::{SeccompProfile, ThreadKind};
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static ENTERED_JAIL: AtomicBool = AtomicBool::new(false);
+
+/// Whether this process confined itself with `jail` (chroot, namespaces,
+/// privilege drop all succeeded). Then `/` is the jail root that the
+/// privileged launcher chose and prepared before starting the VMM. Only
+/// `jail` sets this; nothing outside the process (environment, files) can.
+pub fn entered_jail() -> bool {
+    ENTERED_JAIL.load(Ordering::Acquire)
+}
+
+#[cfg(target_os = "linux")]
+fn mark_entered_jail() {
+    ENTERED_JAIL.store(true, Ordering::Release);
+}

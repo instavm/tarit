@@ -3941,31 +3941,185 @@ fn suspend_vm_in_place(vm: &mut VmInstance) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn private_runtime_dir() -> Result<PathBuf> {
-    // Use the system temp dir (disk-backed, large enough for multi-hundred-MB
-    // snapshots), under a private per-process 0700 subdir. Never the CWD/source
-    // tree, and never a small runtime tmpfs like XDG_RUNTIME_DIR (/run/user),
-    // which fills up when large snapshots are written to it.
-    let dir = std::env::temp_dir()
-        .join(".vmm-runtime")
-        .join(format!("vmm-{}", std::process::id()));
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| VmmError::Snapshot(format!("create runtime dir {}: {e}", dir.display())))?;
+fn runtime_namespace_name() -> String {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let metadata = std::fs::symlink_metadata(&dir)
-            .map_err(|e| VmmError::Snapshot(format!("stat runtime dir {}: {e}", dir.display())))?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(VmmError::Snapshot(format!(
-                "runtime path is not a directory: {}",
-                dir.display()
-            )));
+        // SAFETY: geteuid has no preconditions.
+        format!(".vmm-runtime-{}", unsafe { libc::geteuid() })
+    }
+    #[cfg(not(unix))]
+    {
+        ".vmm-runtime".into()
+    }
+}
+
+/// Ownership and type of one runtime path component, as `lstat` reports it.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy)]
+struct RuntimePathMeta {
+    uid: u32,
+    mode: u32,
+    is_dir: bool,
+    is_symlink: bool,
+}
+
+#[cfg(unix)]
+fn runtime_path_meta(path: &Path, what: &str) -> Result<RuntimePathMeta> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(path)
+        .map_err(|error| VmmError::Snapshot(format!("stat {what} {}: {error}", path.display())))?;
+    Ok(RuntimePathMeta {
+        uid: meta.uid(),
+        mode: meta.mode(),
+        is_dir: meta.is_dir(),
+        is_symlink: meta.file_type().is_symlink(),
+    })
+}
+
+/// The namespace and per-process directories must be real directories owned
+/// by `euid` with mode exactly 0700.
+#[cfg(unix)]
+fn runtime_directory_is_private(meta: RuntimePathMeta, euid: u32) -> bool {
+    meta.is_dir && !meta.is_symlink && meta.uid == euid && meta.mode & 0o777 == 0o700
+}
+
+/// Whether an ancestor of the runtime base may hold our private directories:
+/// owned by root or `euid`, and not group/world writable unless root-owned
+/// sticky. See `first_untrusted_runtime_ancestor` for the one exception,
+/// the root of a jail this process entered.
+#[cfg(unix)]
+fn runtime_ancestor_is_trusted(meta: RuntimePathMeta, euid: u32, allow_symlinks: bool) -> bool {
+    let trusted_owner = meta.uid == 0 || meta.uid == euid;
+    // Symlink permissions have no meaning. Trusted selectors such as macOS
+    // /var are allowed, but their containing directories are checked too.
+    let trusted_symlink = allow_symlinks && meta.is_symlink && trusted_owner;
+    // Root-owned sticky directories protect our user-owned child against
+    // other users' rename/removal, including after these checks.
+    let root_sticky = meta.uid == 0 && meta.mode & 0o1000 != 0;
+    trusted_symlink || (meta.is_dir && trusted_owner && (meta.mode & 0o022 == 0 || root_sticky))
+}
+
+#[cfg(unix)]
+fn verify_private_runtime_directory(path: &Path) -> Result<()> {
+    let meta = runtime_path_meta(path, "runtime directory")?;
+    // SAFETY: geteuid has no preconditions.
+    let uid = unsafe { libc::geteuid() };
+    if !runtime_directory_is_private(meta, uid) {
+        return Err(VmmError::Snapshot(format!(
+            "runtime directory is not private and owned by this user: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// The root of a jail this process entered (`vmm serve --jail`): a real
+/// directory that is not group/world writable, whoever owns it.
+///
+/// The privileged launcher chose and prepared that directory before starting
+/// us, so its owner is already trusted with everything in the jail (it made
+/// `/dev/kvm`, `/tmp` and the disks there). InstaVM leaves it owned by its
+/// service user (uid 800), which is neither root nor the jail uid. Requiring
+/// it not to be group/world writable still keeps the jail uid and everyone
+/// else from replacing `/tmp` under us.
+#[cfg(unix)]
+fn jail_root_is_trusted(meta: RuntimePathMeta) -> bool {
+    meta.is_dir && !meta.is_symlink && meta.mode & 0o022 == 0
+}
+
+/// Checks `base` and each of its ancestors with `meta_of`; returns the first
+/// one that is not trusted. With `in_jail`, `/` is the jail root and may be
+/// owned by anyone (`jail_root_is_trusted`); every other component keeps the
+/// strict `runtime_ancestor_is_trusted` rule.
+#[cfg(unix)]
+fn first_untrusted_runtime_ancestor(
+    base: &Path,
+    euid: u32,
+    allow_symlinks: bool,
+    in_jail: bool,
+    mut meta_of: impl FnMut(&Path) -> Result<RuntimePathMeta>,
+) -> Result<Option<&Path>> {
+    for ancestor in base.ancestors() {
+        let meta = meta_of(ancestor)?;
+        let jail_root = in_jail && ancestor == Path::new("/") && jail_root_is_trusted(meta);
+        if !jail_root && !runtime_ancestor_is_trusted(meta, euid, allow_symlinks) {
+            return Ok(Some(ancestor));
         }
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-            .map_err(|e| VmmError::Snapshot(format!("chmod runtime dir {}: {e}", dir.display())))?;
+    }
+    Ok(None)
+}
+
+#[cfg(unix)]
+fn verify_runtime_ancestors(base: &Path, allow_symlinks: bool) -> Result<()> {
+    // SAFETY: geteuid has no preconditions.
+    let uid = unsafe { libc::geteuid() };
+    let untrusted = first_untrusted_runtime_ancestor(
+        base,
+        uid,
+        allow_symlinks,
+        vmm_jailer::entered_jail(),
+        |ancestor| runtime_path_meta(ancestor, "runtime ancestor"),
+    )?;
+    if let Some(ancestor) = untrusted {
+        return Err(VmmError::Snapshot(format!(
+            "untrusted runtime ancestor: {}",
+            ancestor.display()
+        )));
+    }
+    Ok(())
+}
+
+fn private_runtime_dir_in(base: &Path, pid: u32) -> Result<PathBuf> {
+    let base = if base.is_absolute() {
+        base.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(base)
+    };
+    // Validate selectors before canonicalization: resolving first could bless
+    // an attacker-controlled symlink through an otherwise unsafe directory.
+    #[cfg(unix)]
+    verify_runtime_ancestors(&base, true)?;
+    // Return a canonical path so TMPDIR symlinks cannot redirect later uses.
+    let base = std::fs::canonicalize(&base).map_err(|error| {
+        VmmError::Snapshot(format!("resolve runtime base {}: {error}", base.display()))
+    })?;
+    #[cfg(unix)]
+    verify_runtime_ancestors(&base, false)?;
+    let namespace = base.join(runtime_namespace_name());
+    let dir = namespace.join(format!("vmm-{pid}"));
+    for path in [&namespace, &dir] {
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match builder.create(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(VmmError::Snapshot(format!(
+                    "create runtime directory {}: {error}",
+                    path.display()
+                )))
+            }
+        }
+        #[cfg(unix)]
+        verify_private_runtime_directory(path)?;
     }
     Ok(dir)
+}
+
+/// This process's private runtime directory,
+/// `<temp dir>/.vmm-runtime-<euid>/vmm-<pid>` (mode 0700).
+///
+/// The temp dir (`TMPDIR`, else `/tmp`, as seen after any chroot) must already
+/// exist: it is never created, and it and each of its ancestors must be owned
+/// by root or this user and not group/world writable unless root-owned sticky.
+/// In a jail this process entered, the jail's `/` may have any owner but must
+/// still not be group/world writable (InstaVM's is its service user's, 0755).
+pub(crate) fn private_runtime_dir() -> Result<PathBuf> {
+    private_runtime_dir_in(&std::env::temp_dir(), std::process::id())
 }
 
 #[cfg(test)]
@@ -3981,8 +4135,14 @@ fn cleanup_private_runtime_dir() {
     use std::io::ErrorKind;
 
     let dir = std::env::temp_dir()
-        .join(".vmm-runtime")
+        .join(runtime_namespace_name())
         .join(format!("vmm-{}", std::process::id()));
+    #[cfg(unix)]
+    if verify_private_runtime_directory(dir.parent().expect("runtime namespace")).is_err()
+        || verify_private_runtime_directory(&dir).is_err()
+    {
+        return;
+    }
     let metadata = match std::fs::symlink_metadata(&dir) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == ErrorKind::NotFound => return,
@@ -8341,7 +8501,7 @@ fn build_running_vm(
     let serial = Arc::new(serial_dev);
     irq_evts.push(serial_evt);
 
-    // virtio-net: mirror create_live — irqfd + TX ioeventfd + host<->tap loop
+    // virtio-net: mirror create_live — irqfd + RX/TX ioeventfd + host<->tap loop
     // per device, kept alive (loop before fds) in the returned RunningVm.
     let mut net_io_loops = Vec::new();
     let mut taps = Vec::new();
@@ -11053,6 +11213,245 @@ mod tests {
         remove_owned_scratch_file(&output);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn runtime_namespace_rejects_symlink_and_writable_ancestors_without_chmod() {
+        use std::os::unix::{
+            fs::MetadataExt,
+            fs::{symlink, PermissionsExt},
+        };
+        let base = tempfile::tempdir().unwrap();
+        let victim = tempfile::tempdir().unwrap();
+        let selector_parent = tempfile::tempdir().unwrap();
+        let selector = selector_parent.path().join("selected-temp");
+        symlink(base.path(), &selector).unwrap();
+        let selected = private_runtime_dir_in(&selector, 122).unwrap();
+        assert_eq!(
+            selected,
+            std::fs::canonicalize(base.path())
+                .unwrap()
+                .join(runtime_namespace_name())
+                .join("vmm-122")
+        );
+        std::fs::set_permissions(
+            selector_parent.path(),
+            std::fs::Permissions::from_mode(0o777),
+        )
+        .unwrap();
+        assert!(private_runtime_dir_in(&selector, 121).is_err());
+        assert!(!base
+            .path()
+            .join(runtime_namespace_name())
+            .join("vmm-121")
+            .exists());
+        std::fs::set_permissions(
+            selector_parent.path(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        std::fs::remove_dir(&selected).unwrap();
+        std::fs::remove_dir(selected.parent().unwrap()).unwrap();
+        let namespace = base.path().join(runtime_namespace_name());
+        symlink(victim.path(), &namespace).unwrap();
+        let before = std::fs::metadata(victim.path()).unwrap().mode();
+        assert!(private_runtime_dir_in(base.path(), 123).is_err());
+        assert_eq!(std::fs::metadata(victim.path()).unwrap().mode(), before);
+        assert!(!victim.path().join("vmm-123").exists());
+        std::fs::remove_file(&namespace).unwrap();
+        std::fs::create_dir(&namespace).unwrap();
+        std::fs::set_permissions(&namespace, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(private_runtime_dir_in(base.path(), 123).is_err());
+        assert_eq!(std::fs::metadata(&namespace).unwrap().mode() & 0o777, 0o777);
+        std::fs::set_permissions(&namespace, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let dir = private_runtime_dir_in(base.path(), 123).unwrap();
+        assert_eq!(std::fs::metadata(&dir).unwrap().mode() & 0o777, 0o700);
+        assert_eq!(private_runtime_dir_in(base.path(), 123).unwrap(), dir);
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(private_runtime_dir_in(base.path(), 124).is_err());
+        assert!(!namespace.join("vmm-124").exists());
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+        symlink(victim.path(), &dir).unwrap();
+        assert!(private_runtime_dir_in(base.path(), 123).is_err());
+        assert_eq!(std::fs::metadata(victim.path()).unwrap().mode(), before);
+    }
+
+    /// InstaVM's `vmm serve --jail <root> --uid <jail uid>`: after chroot and
+    /// the uid drop, the runtime base is `/tmp` (jail uid, 0700) and its only
+    /// ancestor is the jail's `/`, which InstaVM's `prepare_jail` chmods to
+    /// 0755 but does not chown: on a worker it belongs to InstaVM's service
+    /// user (uid 800), neither root nor the jail uid. A rule that refuses
+    /// this fails every InstaVM create.
+    #[cfg(unix)]
+    #[test]
+    fn instavm_jail_layout_is_accepted() {
+        const JAIL_UID: u32 = 10_123;
+        const SERVICE_UID: u32 = 800;
+        let dir = |uid: u32, mode: u32| RuntimePathMeta {
+            uid,
+            mode: 0o40000 | mode, // S_IFDIR | permission bits
+            is_dir: true,
+            is_symlink: false,
+        };
+        // First untrusted component of `base` for a filesystem given as
+        // (path, meta) pairs.
+        let check = |base: &str, layout: &[(&str, RuntimePathMeta)], in_jail: bool| {
+            let found = [true, false].map(|allow_symlinks| {
+                first_untrusted_runtime_ancestor(
+                    Path::new(base),
+                    JAIL_UID,
+                    allow_symlinks,
+                    in_jail,
+                    |path| {
+                        Ok(layout
+                            .iter()
+                            .find(|(p, _)| Path::new(p) == path)
+                            .unwrap_or_else(|| panic!("no fake meta for {}", path.display()))
+                            .1)
+                    },
+                )
+                .unwrap()
+                .map(|path| path.display().to_string())
+            });
+            let [with_symlinks, without_symlinks] = found;
+            assert_eq!(with_symlinks, without_symlinks, "symlink pass differs");
+            with_symlinks
+        };
+        let jail_tmp = dir(JAIL_UID, 0o700);
+        let with_root = |root: RuntimePathMeta| [("/", root), ("/tmp", jail_tmp)];
+        let refused_at = |path: &str| Some(path.to_string());
+
+        // Root-owned or jail-uid-owned roots: accepted, in a jail or not.
+        for root in [dir(0, 0o755), dir(JAIL_UID, 0o755)] {
+            for in_jail in [true, false] {
+                assert_eq!(check("/tmp", &with_root(root), in_jail), None);
+            }
+        }
+        // InstaVM's real root (service user, 0755): accepted only as the
+        // root of a jail this process entered.
+        let service_root = dir(SERVICE_UID, 0o755);
+        assert_eq!(check("/tmp", &with_root(service_root), true), None);
+        assert_eq!(
+            check("/tmp", &with_root(service_root), false),
+            refused_at("/")
+        );
+        // A group- or world-writable root is refused whoever owns it, in a
+        // jail too (only a root-owned sticky root stays allowed, as before).
+        for owner in [0, JAIL_UID, SERVICE_UID] {
+            for mode in [0o775, 0o757, 0o777, 0o770] {
+                for in_jail in [true, false] {
+                    assert_eq!(
+                        check("/tmp", &with_root(dir(owner, mode)), in_jail),
+                        refused_at("/"),
+                        "owner {owner} mode {mode:o} in_jail {in_jail}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            check("/tmp", &with_root(dir(SERVICE_UID, 0o1777)), true),
+            refused_at("/")
+        );
+        assert_eq!(check("/tmp", &with_root(dir(0, 0o1777)), true), None);
+        // Only `/` is relaxed: a third-party-owned directory below it is
+        // refused even in a jail, and so is a third-party-owned temp dir.
+        let deep = [
+            ("/", service_root),
+            ("/var", dir(SERVICE_UID, 0o755)),
+            ("/var/tmp", jail_tmp),
+        ];
+        assert_eq!(check("/var/tmp", &deep, true), refused_at("/var"));
+        let deep_root_owned = [
+            ("/", service_root),
+            ("/var", dir(0, 0o755)),
+            ("/var/tmp", jail_tmp),
+        ];
+        assert_eq!(check("/var/tmp", &deep_root_owned, true), None);
+        let foreign_tmp = [("/", service_root), ("/tmp", dir(SERVICE_UID, 0o755))];
+        assert_eq!(check("/tmp", &foreign_tmp, true), refused_at("/tmp"));
+        let shared_tmp = [("/", service_root), ("/tmp", dir(JAIL_UID, 0o1777))];
+        assert_eq!(check("/tmp", &shared_tmp, true), refused_at("/tmp"));
+
+        // The namespace and per-process directories it then creates keep the
+        // strict rule: the jail uid's, mode exactly 0700.
+        assert!(runtime_directory_is_private(dir(JAIL_UID, 0o700), JAIL_UID));
+        assert!(!runtime_directory_is_private(
+            dir(JAIL_UID, 0o755),
+            JAIL_UID
+        ));
+        assert!(!runtime_directory_is_private(
+            dir(SERVICE_UID, 0o700),
+            JAIL_UID
+        ));
+    }
+
+    /// The real InstaVM sequence on a real filesystem. InstaVM's
+    /// `prepare_jail` (sandbox `app/domain/firecracker/tarit_driver.py`)
+    /// chmods the jail's `/` to 0755 but does not chown it: on a worker it is
+    /// owned by InstaVM's service user (uid 800), neither root nor the jail
+    /// uid, with group = the jail gid. `/tmp` is the jail uid's, 0700. The
+    /// child enters it through `vmm_jailer::jail`, as `vmm serve --jail` does
+    /// (chroot, then drop to the jail uid), and resolves the runtime
+    /// directory. Needs root (chroot, chown, setuid).
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs root: chroot + setuid into an InstaVM-shaped jail"]
+    fn instavm_jail_layout_is_accepted_after_chroot_and_uid_drop() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        const CHILD_ENV: &str = "VMM_RUNTIME_JAIL_CHILD";
+        const JAIL_UID: u32 = 10_123;
+        const JAIL_GID: u32 = 10_123;
+        // The service user that prepares the jail: neither root nor the jail uid.
+        const LAUNCHER_UID: u32 = 10_800;
+        if let Some(jail) = std::env::var_os(CHILD_ENV) {
+            vmm_jailer::jail(&vmm_jailer::jailer::JailerConfig {
+                chroot_dir: jail.into_string().unwrap(),
+                uid: JAIL_UID,
+                gid: JAIL_GID,
+                cgroup: String::new(),
+                cgroup_limits: None,
+                rlimit_nofile: 4096,
+                rlimit_as: 0,
+                netns: String::new(),
+                isolate_network: true,
+            })
+            .expect("enter the jail as vmm serve --jail does");
+            std::env::remove_var("TMPDIR");
+            let dir = private_runtime_dir().expect("InstaVM jail layout refused");
+            assert_eq!(
+                dir,
+                PathBuf::from(format!("/tmp/.vmm-runtime-{JAIL_UID}"))
+                    .join(format!("vmm-{}", std::process::id()))
+            );
+            for path in [dir.parent().unwrap(), dir.as_path()] {
+                let meta = std::fs::symlink_metadata(path).unwrap();
+                assert_eq!(meta.uid(), JAIL_UID, "{}", path.display());
+                assert_eq!(meta.mode() & 0o777, 0o700, "{}", path.display());
+            }
+            return;
+        }
+        // SAFETY: geteuid has no preconditions.
+        assert_eq!(unsafe { libc::geteuid() }, 0, "run this test as root");
+        let jail = tempfile::tempdir().unwrap();
+        let tmp = jail.path().join("tmp");
+        std::fs::create_dir(&tmp).unwrap();
+        std::os::unix::fs::chown(jail.path(), Some(LAUNCHER_UID), Some(JAIL_GID)).unwrap();
+        std::fs::set_permissions(jail.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::chown(&tmp, Some(JAIL_UID), Some(JAIL_GID)).unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "controller::tests::instavm_jail_layout_is_accepted_after_chroot_and_uid_drop",
+                "--include-ignored",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, jail.path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "jailed child failed: {status}");
+    }
+
     #[test]
     fn suspend_image_path_is_process_local_and_private() {
         let path = PathBuf::from(unique_suspend_snapshot_path().unwrap());
@@ -11061,7 +11460,9 @@ mod tests {
         assert!(name.starts_with(".vmm-suspend-"));
         assert!(name.ends_with(".snap"));
         assert!(path.is_absolute());
-        assert!(path.components().any(|c| c.as_os_str() == ".vmm-runtime"));
+        assert!(path
+            .components()
+            .any(|c| c.as_os_str() == runtime_namespace_name().as_str()));
     }
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]

@@ -960,19 +960,13 @@ impl KvmVm {
 fn write_private_guest_memory_dump(slice: &[u8]) -> std::io::Result<std::path::PathBuf> {
     use std::io::Write;
     #[cfg(unix)]
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::OpenOptionsExt;
 
-    // Mirror controller::private_runtime_dir: a private 0700 subdir under the
-    // system temp dir (disk-backed), never the CWD/source tree or a small
-    // runtime tmpfs like XDG_RUNTIME_DIR.
-    let dir = std::env::temp_dir()
-        .join(".vmm-runtime")
-        .join(format!("vmm-{}", std::process::id()));
-    std::fs::create_dir_all(&dir)?;
-    #[cfg(unix)]
-    {
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
-    }
+    // The controller's private runtime directory: a per-user, per-process
+    // 0700 subdir of the system temp dir whose ancestors and ownership are
+    // verified, never the CWD/source tree or a small runtime tmpfs.
+    let dir = crate::controller::private_runtime_dir()
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -1014,5 +1008,18 @@ mod tests {
         normalize_restored_clock(&mut clock);
         assert_eq!(clock.flags & kvm_bindings::KVM_CLOCK_REALTIME, 0);
         assert_ne!(clock.flags & preserved_flag, 0);
+    }
+
+    /// The diagnostic dump goes into the verified per-user runtime directory,
+    /// not the old shared `.vmm-runtime` name that is created without checks.
+    #[test]
+    fn guest_memory_dump_lands_in_private_runtime_directory() {
+        use std::os::unix::fs::MetadataExt;
+        let path = super::write_private_guest_memory_dump(b"guest-memory").unwrap();
+        let runtime = crate::controller::private_runtime_dir().unwrap();
+        assert_eq!(path.parent(), Some(runtime.as_path()));
+        assert_eq!(std::fs::read(&path).unwrap(), b"guest-memory");
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        std::fs::remove_file(&path).unwrap();
     }
 }
