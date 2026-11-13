@@ -4371,14 +4371,26 @@ impl VmmSupervisor {
         }
     }
 
-    /// Drain local runtime failures for the durable lifecycle reconciler. The
+    /// Inspect local runtime failures without withdrawing their retry ownership. The
     /// process watcher already removed runtime resources and released capacity;
     /// callers must persist an Error/Stopped observed state for these VM ids.
-    pub(crate) fn take_unexpected_exits(&self) -> Vec<UnexpectedVmmExit> {
+    pub(crate) fn pending_unexpected_exits(&self) -> Vec<UnexpectedVmmExit> {
         self.unexpected_exits
             .lock()
-            .map(|mut exits| exits.drain(..).collect())
+            .map(|exits| exits.iter().cloned().collect())
             .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn enqueue_unexpected_exit_for_test(&self, exit: UnexpectedVmmExit) {
+        self.unexpected_exits.lock().unwrap().push_back(exit);
+    }
+
+    /// Acknowledge only after a retryable lifecycle intent owns this exit.
+    pub(crate) fn acknowledge_unexpected_exit(&self, exit: &UnexpectedVmmExit) {
+        if let Ok(mut exits) = self.unexpected_exits.lock() {
+            exits.retain(|pending| pending != exit);
+        }
     }
 
     /// Build `vmm serve` cgroup arguments from the exact scheduler reservation.
@@ -14335,7 +14347,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(2);
         let exit = loop {
             supervisor.scan_for_exited_processes();
-            if let Some(exit) = supervisor.take_unexpected_exits().into_iter().next() {
+            if let Some(exit) = supervisor.pending_unexpected_exits().into_iter().next() {
                 break exit;
             }
             assert!(Instant::now() < deadline, "exit scan did not reconcile");
@@ -14344,6 +14356,11 @@ mod tests {
         assert_eq!(exit.id, id);
         assert_eq!(exit.pid, pid);
         assert!(exit.status.contains('7'));
+        assert_eq!(supervisor.pending_unexpected_exits(), vec![exit.clone()]);
+        supervisor.scan_for_exited_processes();
+        assert_eq!(supervisor.pending_unexpected_exits(), vec![exit.clone()]);
+        supervisor.acknowledge_unexpected_exit(&exit);
+        assert!(supervisor.pending_unexpected_exits().is_empty());
         assert!(!supervisor.is_running(id));
         assert_eq!(supervisor.scheduler.usage(), Default::default());
     }
