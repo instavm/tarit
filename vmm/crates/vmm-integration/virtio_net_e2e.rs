@@ -46,6 +46,17 @@ fn tap_up(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Keep the host kernel's own IPv6 traffic (MLD reports, router
+/// solicitations, duplicate address detection) off a test tap. The ingress
+/// test reads exactly the first frame the tap delivers, and an MLD report sent
+/// when the link comes up can arrive before the injected frame.
+fn disable_ipv6(name: &str) {
+    let path = format!("/proc/sys/net/ipv6/conf/{name}/disable_ipv6");
+    if std::path::Path::new(&path).exists() {
+        std::fs::write(&path, "1").unwrap_or_else(|e| panic!("disable IPv6 on {name}: {e}"));
+    }
+}
+
 fn tap_delete(name: &str) {
     let _ = Command::new("ip").args(["link", "delete", name]).status();
 }
@@ -265,6 +276,7 @@ fn net_ingress_through_real_tap() {
     let name = "vmt-ing";
     tap_delete(name);
     let tap = Tap::create(name).expect("Tap::create");
+    disable_ipv6(name);
     assert!(tap_up(name), "ip link up {name}");
     let idx = ifindex(name).expect("ifindex");
 
