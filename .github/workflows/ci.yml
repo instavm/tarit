@@ -44,6 +44,18 @@ jobs:
           cargo zigbuild --locked --target x86_64-unknown-linux-musl
           -p vmm --features boot
 
+  guest-agent:
+    name: guest agent build / worker supervision tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Build agent and test worker supervision
+        run: make -C vmm/guest/agent all test CFLAGS='-O2 -Wall -Wextra -pedantic -Werror'
+      - name: Run the root-only agent tests (serial hangup, PID 1 signals)
+        run: |
+          sudo python3 vmm/guest/agent/test_serial_hangup.py vmm/guest/agent/vmm-agent
+          sudo python3 vmm/guest/agent/test_pid1_signals.py vmm/guest/agent/vmm-agent
+
   sdk:
     name: generate / type-check / test (SDKs)
     runs-on: ubuntu-latest

@@ -275,6 +275,15 @@ fn parse_cgroup_io_max(value: &str) -> std::result::Result<String, String> {
     Ok(normalized.join("\n"))
 }
 
+/// Describes the subcommand for the startup log line without the text of an
+/// `exec` command, which can carry customer secrets.
+fn cmd_for_log(cmd: &Cmd) -> String {
+    match cmd {
+        Cmd::Exec { timeout, .. } => format!("Exec {{ timeout: {timeout} }}"),
+        other => format!("{other:?}"),
+    }
+}
+
 #[derive(Subcommand, Debug)]
 enum Cmd {
     /// Boot a fresh VM from a kernel image.
@@ -636,7 +645,7 @@ fn main() -> Result<()> {
         .format_timestamp_millis()
         .try_init();
 
-    log::info!("vmm {} — {:?}", vmm_core::VERSION, cli.cmd);
+    log::info!("vmm {} — {}", vmm_core::VERSION, cmd_for_log(&cli.cmd));
 
     match cli.cmd {
         Cmd::Run {
@@ -1815,6 +1824,18 @@ fn send_raw(socket: &str, body: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_log_omits_exec_command_text() {
+        let cli = Cli::try_parse_from(["vmm", "exec", "echo TOKEN=abc", "--timeout", "7"]).unwrap();
+        let line = cmd_for_log(&cli.cmd);
+        assert!(!line.contains("TOKEN"), "{line}");
+        assert!(line.contains("Exec"), "{line}");
+        assert!(line.contains('7'), "{line}");
+
+        let cli = Cli::try_parse_from(["vmm", "status"]).unwrap();
+        assert_eq!(cmd_for_log(&cli.cmd), "Status");
+    }
 
     #[test]
     fn restore_socket_probe_distinguishes_live_stale_and_regular_paths() {
