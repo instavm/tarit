@@ -43,6 +43,8 @@ jobs:
           test -c /dev/kvm && test -r /dev/kvm && test -w /dev/kvm
           sudo -n true
           findmnt -n -o FSTYPE /mnt/reflink | grep -qx xfs
+          # Where the VMM's snapshot and suspend files go (TMPDIR, else /tmp).
+          echo "/tmp: $(findmnt -n -o SOURCE,FSTYPE --target "${TMPDIR:-/tmp}")"
 
       - name: Build release VMM
         working-directory: vmm
@@ -101,18 +103,34 @@ jobs:
           VMM_TEST_KERNEL: /tmp/vmlinux.microvm
           VMM_TEST_ROOTFS: /tmp/vsock-rootfs.ext4
           VMM_TEST_OVERLAY_DIR: /mnt/reflink
-          # Per-machine-class ceiling (needs #178). This runner (Azure
-          # D4ds_v6, TMPDIR on its local NVMe) measured the debug-build
-          # snapshot p50 at 196-218 ms; the 200 ms default assumes faster
-          # storage (85 ms on tmpfs on the same host).
-          VMM_PERF_SNAPSHOT_P50_GATE_MS: "250"
+        # The latency gate runs alone in the next step: here it would share
+        # the host with the other KVM tests the harness runs in parallel.
         run: |
           sudo -E env "PATH=$HOME/.cargo/bin:$PATH" cargo test --locked --workspace --no-fail-fast \
             --features vmm-core/kvm \
             --features vmm-core/boot \
             --features vmm-memory-backend/kvm \
             --features vmm-integration/kvm \
-            -- --include-ignored
+            -- --include-ignored --skip perf_gates_comprehensive
+
+      - name: Enforce in-process snapshot and restore latency gate
+        working-directory: vmm
+        env:
+          VMM_TEST_KERNEL: /tmp/vmlinux.microvm
+          VMM_TEST_ROOTFS: /tmp/vsock-rootfs.ext4
+          VMM_TEST_OVERLAY_DIR: /mnt/reflink
+          # Per-machine-class ceiling (needs #178). This runner (Azure
+          # D4ds_v6, TMPDIR on its local NVMe) measured the debug-build
+          # snapshot p50 at 196-218 ms; the 200 ms default assumes faster
+          # storage (85 ms on tmpfs on the same host).
+          VMM_PERF_SNAPSHOT_P50_GATE_MS: "250"
+        run: |
+          sudo -E env "PATH=$HOME/.cargo/bin:$PATH" cargo test --locked --workspace \
+            --features vmm-core/kvm \
+            --features vmm-core/boot \
+            --features vmm-memory-backend/kvm \
+            --features vmm-integration/kvm \
+            -- --include-ignored --exact perf_gates_comprehensive --nocapture
 
       - name: Prove orchestrated cold create-to-exec path
         env:
