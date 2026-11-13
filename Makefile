@@ -1,9 +1,9 @@
 # Tarit build. See README.md for the quickstart.
 #
 #   make              build both binaries (vmm + taritd) and the guest agent
-#   sudo make install build, then install both binaries to $(BINDIR)
+#   make build && sudo make install  build as your user, then install to $(BINDIR)
 #   make vmm          build only the VMM (and the guest agent)
-#   sudo make install-vmm  install only the VMM
+#   make vmm && sudo make install-vmm  build as your user, then install the VMM
 #
 # Install location (override e.g. `make install PREFIX=$HOME/.local`):
 PREFIX  ?= /usr/local
@@ -39,7 +39,10 @@ guest:
 	./scripts/setup-guest.sh
 
 # Install host binaries plus the guest-only agent (use sudo for /usr/local).
-install: build
+install:
+	@for binary in vmm/target/release/vmm orch/target/release/taritd vmm/guest/agent/vmm-agent; do \
+		test -x "$$binary" || { echo "missing $$binary; run make build as your regular user first" >&2; exit 1; }; \
+	done
 	install -d "$(DESTDIR)$(BINDIR)"
 	install -d "$(DESTDIR)$(LIBEXECDIR)"
 	install -m755 vmm/target/release/vmm     "$(DESTDIR)$(BINDIR)/vmm"
@@ -49,7 +52,8 @@ install: build
 	@echo "installed guest agent to $(DESTDIR)$(LIBEXECDIR)/vmm-agent"
 
 # Install only the VMM.
-install-vmm: vmm
+install-vmm:
+	@test -x vmm/target/release/vmm || { echo "missing vmm/target/release/vmm; run make vmm as your regular user first" >&2; exit 1; }
 	install -d "$(DESTDIR)$(BINDIR)"
 	install -m755 vmm/target/release/vmm "$(DESTDIR)$(BINDIR)/vmm"
 	@echo "installed vmm to $(DESTDIR)$(BINDIR)"
