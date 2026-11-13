@@ -171,23 +171,34 @@ if [ "$actual_pgid" != "$TARITD_PGID" ]; then
   exit 1
 fi
 
+# taritd labels a warm class "<vcpus>vcpu_<mib>mib_<identity hash>", the hash
+# covering kernel, rootfs, cmdline and read-only mode. This benchmark configures
+# exactly one class, so match its shape with or without the hash.
 warm_depth() {
   curl -fsS --max-time 2 -H 'X-API-Key: test-key' "http://127.0.0.1:$PORT/metrics" |
-    awk -v class="${VCPUS}vcpu_${MEM}mib" '
-      $1 == "taritd_warm_pool_depth{class=\"" class "\"}" { print int($2); found=1 }
-      END { if (!found) exit 1 }
+    awk -v prefix="taritd_warm_pool_depth{class=\"${VCPUS}vcpu_${MEM}mib" '
+      index($1, prefix) == 1 {
+        rest = substr($1, length(prefix) + 1)
+        if (rest == "\"}" || rest ~ /^_[0-9a-f]+"}$/) { depth += int($2); found = 1 }
+      }
+      END { if (!found) exit 1; print depth }
     '
 }
 wait_warm() {
   [ "$MODE" = direct ] && return
-  local depth=0
+  local depth=unreported
   for _ in $(seq 1 240); do
-    depth=$(warm_depth 2>/dev/null || echo 0)
-    [ "$depth" -ge "$TARGET" ] && return
+    depth=$(warm_depth 2>/dev/null || echo unreported)
+    [ "$depth" != unreported ] && [ "$depth" -ge "$TARGET" ] && return
     kill -0 "$TARITD_PID" 2>/dev/null || break
     sleep 1
   done
   echo "warm pool failed to reach target $TARGET (reported depth $depth)" >&2
+  if [ "$depth" = unreported ]; then
+    echo "no taritd_warm_pool_depth sample for ${VCPUS}vcpu_${MEM}mib; taritd reports:" >&2
+    curl -fsS --max-time 2 -H 'X-API-Key: test-key' "http://127.0.0.1:$PORT/metrics" |
+      grep '^taritd_warm_pool_depth' >&2 || true
+  fi
   tail -80 "$LOG" >&2 || true
   return 1
 }

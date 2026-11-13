@@ -249,6 +249,9 @@ pub(crate) fn spawn_replenisher(
     Some(Replenisher {
         handle: tokio::spawn(async move {
             let mut filling = HashMap::<VmSpawnConfig, bool>::new();
+            // Why replenishment is paused. A pause that lasts is logged once,
+            // and again when it ends, so an empty pool is never silent.
+            let mut paused: Option<Pause> = None;
             'replenish: loop {
                 worker_children.reap_finished().await;
                 if worker_cancelled.load(Ordering::Acquire) || shutdown_pending(&shutdown_rx) {
@@ -257,6 +260,14 @@ pub(crate) fn spawn_replenisher(
                 }
                 match sup.refresh_disk_pressure() {
                     Ok(state) if state.pressured => {
+                        let roots = state
+                            .roots
+                            .iter()
+                            .filter(|root| root.pressured)
+                            .map(|root| root.path.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        note_pause(&mut paused, format!("node disk pressure on {roots}"));
                         tokio::select! {
                             _ = tokio::time::sleep(Duration::from_secs(1)) => {}
                             _ = wait_for_shutdown(&mut shutdown_rx) => {
@@ -282,6 +293,10 @@ pub(crate) fn spawn_replenisher(
                 // Creates waiting for capacity come first; refilling now would
                 // take the slots they wait for.
                 if sup.creates_waiting_for_capacity() {
+                    note_pause(
+                        &mut paused,
+                        "creates are waiting for host capacity".to_string(),
+                    );
                     tokio::select! {
                         _ = tokio::time::sleep(Duration::from_millis(150)) => {}
                         _ = wait_for_shutdown(&mut shutdown_rx) => {
@@ -290,6 +305,13 @@ pub(crate) fn spawn_replenisher(
                         }
                     }
                     continue;
+                }
+                if let Some(pause) = paused.take().filter(|pause| pause.logged) {
+                    tracing::info!(
+                        reason = %pause.reason,
+                        paused_secs = pause.since.elapsed().as_secs(),
+                        "warm-pool replenishment resumed"
+                    );
                 }
                 let mut classes = configured.clone();
                 classes.extend(sup.learned_warm_classes(config.warm_pool.learn.idle));
@@ -519,6 +541,42 @@ pub(crate) fn spawn_replenisher(
     })
 }
 
+/// How long replenishment must stay paused for one reason before it is
+/// logged. Creates waiting for capacity pause it briefly all the time under
+/// load; only a pause that lasts explains an empty pool.
+const PAUSE_LOG_AFTER: Duration = Duration::from_secs(5);
+
+struct Pause {
+    reason: String,
+    since: std::time::Instant,
+    logged: bool,
+}
+
+/// Record that replenishment is paused for `reason`; log it once it has
+/// lasted `PAUSE_LOG_AFTER`. Returns whether this call logged it.
+fn note_pause(paused: &mut Option<Pause>, reason: String) -> bool {
+    if paused.as_ref().is_none_or(|pause| pause.reason != reason) {
+        *paused = Some(Pause {
+            reason,
+            since: std::time::Instant::now(),
+            logged: false,
+        });
+    }
+    let Some(pause) = paused.as_mut() else {
+        return false;
+    };
+    if pause.logged || pause.since.elapsed() < PAUSE_LOG_AFTER {
+        return false;
+    }
+    pause.logged = true;
+    tracing::warn!(
+        reason = %pause.reason,
+        paused_secs = pause.since.elapsed().as_secs(),
+        "warm-pool replenishment paused"
+    );
+    true
+}
+
 const GOLDEN_RETRY_FIRST: Duration = Duration::from_secs(1);
 const GOLDEN_RETRY_MAX: Duration = Duration::from_secs(60);
 
@@ -614,6 +672,28 @@ mod tests {
     };
     use std::time::Duration;
     use tokio::sync::{oneshot, watch};
+
+    #[test]
+    fn a_lasting_replenishment_pause_is_logged_once() {
+        use super::{note_pause, PAUSE_LOG_AFTER};
+
+        let mut paused = None;
+        assert!(!note_pause(&mut paused, "disk".into()), "too early to log");
+        let pause = paused.as_mut().expect("pause recorded");
+        pause.since = pause
+            .since
+            .checked_sub(PAUSE_LOG_AFTER)
+            .expect("monotonic clock");
+        assert!(
+            note_pause(&mut paused, "disk".into()),
+            "lasting pause is logged"
+        );
+        assert!(!note_pause(&mut paused, "disk".into()), "logged only once");
+        assert!(paused.as_ref().is_some_and(|pause| pause.logged));
+        // A new reason starts a new pause.
+        assert!(!note_pause(&mut paused, "capacity".into()));
+        assert!(paused.as_ref().is_some_and(|pause| !pause.logged));
+    }
 
     #[test]
     fn a_failing_golden_backs_off_up_to_a_minute() {
