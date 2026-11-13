@@ -715,6 +715,12 @@ impl VmmController {
             .as_mut()
             .ok_or_else(|| VmmError::InvalidConfig("no VM (boot first)".into()))?;
 
+        if vm.state == VmState::Stopped {
+            return Err(VmmError::InvalidConfig(
+                "cannot snapshot a stopped VM".into(),
+            ));
+        }
+
         let path_buf = unique_scratch_snapshot_path("vmm-snap")?;
         let path = path_buf.to_string_lossy().into_owned();
         let mut owned_snapshot = staged_owned_output(&path_buf)?;
@@ -1042,18 +1048,24 @@ impl VmmController {
         };
         #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
         let resume_result = match io_resume_result {
-            Ok(()) if paused_here && state_before == VmState::Running => resume_running_vcpus(vm),
+            Ok(()) if paused_here && state_before == VmState::Running => {
+                resume_running_vcpus_or_stop(vm)
+            }
             Ok(()) => Ok(()),
             Err(error) => Err(error),
         };
 
         #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
         {
-            vm.state = if resume_result.is_ok() {
-                state_before
-            } else {
-                VmState::Paused
-            };
+            // An unconfirmed vCPU resume has already stopped the VM. An I/O
+            // release failure leaves every vCPU held at this snapshot's pause.
+            if vm.state != VmState::Stopped {
+                vm.state = if resume_result.is_ok() {
+                    state_before
+                } else {
+                    VmState::Paused
+                };
+            }
         }
         #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
         {
@@ -1686,14 +1698,17 @@ impl VmmController {
                 capture_live_state_blob(&running, &base_blob)
             },
         );
-        let source_vcpus_paused = running
-            .vcpu_thread
-            .paused
-            .load(std::sync::atomic::Ordering::Acquire)
-            || running
-                .ap_threads
-                .iter()
-                .any(|thread| thread.paused.load(std::sync::atomic::Ordering::Acquire));
+        let source_vcpus = live_source_vcpus(
+            std::iter::once(&running.vcpu_thread)
+                .chain(running.ap_threads.iter())
+                .map(|thread| {
+                    (
+                        thread.control.load(std::sync::atomic::Ordering::Acquire),
+                        thread.paused.load(std::sync::atomic::Ordering::Acquire),
+                        thread.is_exited(),
+                    )
+                }),
+        );
 
         // Put the VM back only if the slot still holds the same instance. A
         // concurrent stop + create would otherwise get this VM's threads and
@@ -1703,10 +1718,8 @@ impl VmmController {
             let mut slot = self.lock();
             match slot.as_mut() {
                 Some(vm) if vm.generation == generation && vm.running.is_none() => {
-                    if source_vcpus_paused {
-                        vm.state = VmState::Paused;
-                    }
                     vm.running = reclaimed.take();
+                    settle_live_snapshot_source(vm, source_vcpus);
                 }
                 _ => {
                     log::warn!("live_snapshot: VM replaced during the snapshot; discarding it");
@@ -2326,6 +2339,11 @@ impl VmmController {
         let vm = slot
             .as_mut()
             .ok_or_else(|| VmmError::InvalidConfig("no VM".into()))?;
+        if vm.state == VmState::Stopped {
+            return Err(VmmError::InvalidConfig(
+                "cannot suspend a stopped VM".into(),
+            ));
+        }
         vm.base_identity = None;
         vm.restore_base = None;
 
@@ -3328,58 +3346,188 @@ fn stop_running_vm(vm: &mut VmInstance) {
     }
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-fn pause_running_vcpus(vm: &mut VmInstance) -> Result<bool> {
-    if let Some(r) = vm.running.as_ref() {
-        let vcpu_threads = std::iter::once(&r.vcpu_thread)
-            .chain(r.ap_threads.iter())
-            .collect::<Vec<_>>();
-        if vcpu_threads.is_empty() {
-            return Ok(false);
-        }
-        for vcpu_thread in &vcpu_threads {
-            if let Err(error) = vcpu_thread.request_snapshot_pause() {
-                let (error, rollback_confirmed) = rollback_failed_vcpu_pause(vcpu_threads, error);
-                if !rollback_confirmed {
-                    vm.state = VmState::Paused;
-                }
-                return Err(error);
-            }
-        }
-        for vcpu_thread in &vcpu_threads {
-            if let Err(error) = vcpu_thread.wait_snapshot_paused() {
-                let (error, rollback_confirmed) = rollback_failed_vcpu_pause(vcpu_threads, error);
-                if !rollback_confirmed {
-                    vm.state = VmState::Paused;
-                }
-                return Err(error);
-            }
-        }
-        Ok(true)
-    } else {
-        Ok(false)
-    }
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
+trait SnapshotPauseTarget {
+    fn request_pause(&self) -> Result<()>;
+    fn wait_paused(&self) -> Result<()>;
+    fn resume_target(&self);
+    fn wait_resumed(&self) -> Result<()>;
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-fn rollback_failed_vcpu_pause(
-    vcpu_threads: Vec<&crate::vcpu_thread::VcpuThread>,
-    primary: VmmError,
-) -> (VmmError, bool) {
-    for vcpu_thread in &vcpu_threads {
-        vcpu_thread.resume();
+impl SnapshotPauseTarget for crate::vcpu_thread::VcpuThread {
+    fn request_pause(&self) -> Result<()> {
+        self.request_snapshot_pause()
     }
-    let rollback = vcpu_threads
-        .iter()
-        .try_for_each(|vcpu_thread| vcpu_thread.wait_snapshot_resumed());
-    match rollback {
-        Ok(()) => (primary, true),
-        Err(resume_error) => (
-            VmmError::Snapshot(format!(
-                "{primary}; failed to confirm vCPU rollback: {resume_error}"
+    fn wait_paused(&self) -> Result<()> {
+        self.wait_snapshot_paused()
+    }
+    fn resume_target(&self) {
+        self.resume();
+    }
+    fn wait_resumed(&self) -> Result<()> {
+        self.wait_snapshot_resumed()
+    }
+}
+
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
+fn pause_vcpu_group<T: SnapshotPauseTarget>(
+    targets: &[&T],
+) -> std::result::Result<(), (VmmError, bool)> {
+    let result = (|| {
+        for target in targets {
+            target.request_pause()?;
+        }
+        for target in targets {
+            target.wait_paused()?;
+        }
+        Ok(())
+    })();
+    if let Err(primary) = result {
+        // Some requests may have succeeded even when another
+        // request/acknowledgement failed, so roll back every target.
+        return match resume_vcpu_group(targets) {
+            Ok(()) => Err((primary, true)),
+            Err(resume_error) => Err((
+                VmmError::Snapshot(format!(
+                    "{primary}; failed to confirm vCPU rollback: {resume_error}"
+                )),
+                false,
             )),
-            false,
-        ),
+        };
+    }
+    Ok(())
+}
+
+/// Release every target before waiting on any one, so one slow
+/// acknowledgement does not keep the others paused.
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
+fn resume_vcpu_group<T: SnapshotPauseTarget>(targets: &[&T]) -> Result<()> {
+    for target in targets {
+        target.resume_target();
+    }
+    targets.iter().try_for_each(|target| target.wait_resumed())
+}
+
+/// Once vCPU resume has been requested, an unconfirmed acknowledgement leaves
+/// no coherent state: some vCPUs may be running guest code while another is
+/// still parked or gone. Recording Paused would let a later pause() succeed
+/// without pausing and a later snapshot publish vCPU captures older than
+/// memory, so stop the VM, as for an unconfirmed pause rollback.
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
+fn resolve_vcpu_resume(vm: &mut VmInstance, result: Result<()>) -> Result<()> {
+    if result.is_err() {
+        stop_after_uncertain_pause(vm);
+    }
+    result
+}
+
+/// Where a live snapshot left the source VM's vCPUs.
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveSourceVcpus {
+    /// Every vCPU left its pause: the VM keeps its state.
+    Released,
+    /// Every vCPU still holds the requested pause with this attempt's
+    /// capture, because an I/O worker could not be released: the VM is
+    /// fenced Paused for explicit recovery, as before.
+    Held,
+    /// Some vCPU was released but did not confirm, or its thread exited.
+    Uncertain,
+}
+
+/// Classify a live snapshot's source from each vCPU's (pause still
+/// requested, parked, thread exited).
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
+fn live_source_vcpus(vcpus: impl IntoIterator<Item = (bool, bool, bool)>) -> LiveSourceVcpus {
+    let (mut any_parked, mut all_held) = (false, true);
+    for (pause_requested, parked, exited) in vcpus {
+        any_parked |= parked || exited;
+        all_held &= pause_requested && parked && !exited;
+    }
+    if !any_parked {
+        LiveSourceVcpus::Released
+    } else if all_held {
+        LiveSourceVcpus::Held
+    } else {
+        LiveSourceVcpus::Uncertain
+    }
+}
+
+/// Record the source's state after a live snapshot. Main recorded Paused
+/// whenever any vCPU was still parked, including after a rollback that
+/// could not be confirmed; that is the uncertain pause #154 stops.
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
+fn settle_live_snapshot_source(vm: &mut VmInstance, vcpus: LiveSourceVcpus) {
+    match vcpus {
+        LiveSourceVcpus::Released => {}
+        LiveSourceVcpus::Held => vm.state = VmState::Paused,
+        LiveSourceVcpus::Uncertain => stop_after_uncertain_pause(vm),
+    }
+}
+
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
+fn stop_after_uncertain_pause(vm: &mut VmInstance) {
+    // No coherent Paused/Running state was established. Stop every producer
+    // before publishing a terminal state; stale captures must never be reused.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    stop_running_vm(vm);
+    vm.state = VmState::Stopped;
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn pause_running_vcpus(vm: &mut VmInstance) -> Result<bool> {
+    let result = if let Some(running) = vm.running.as_ref() {
+        let targets = std::iter::once(&running.vcpu_thread)
+            .chain(running.ap_threads.iter())
+            .collect::<Vec<_>>();
+        pause_vcpu_group(&targets)
+    } else {
+        return Ok(false);
+    };
+    resolve_vcpu_pause(vm, result)
+}
+
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
+fn resolve_vcpu_pause(
+    vm: &mut VmInstance,
+    result: std::result::Result<(), (VmmError, bool)>,
+) -> Result<bool> {
+    match result {
+        Ok(()) => Ok(true),
+        Err((error, rollback_confirmed)) => {
+            if !rollback_confirmed {
+                stop_after_uncertain_pause(vm);
+            }
+            Err(error)
+        }
     }
 }
 
@@ -3490,20 +3638,14 @@ fn resume_running_io(vm: &VmInstance) -> Result<()> {
     Ok(())
 }
 
-/// Resume a Paused or Suspended VM: I/O workers first, then vCPUs. On
-/// failure the I/O workers are parked again and the VM stays paused.
+/// Resume a Paused or Suspended VM: I/O workers first, then vCPUs. If the
+/// I/O workers cannot be released, the vCPUs stay paused and so does the VM.
+/// If the vCPUs were released but not all confirmed, the VM is stopped (see
+/// [`resolve_vcpu_resume`]).
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 fn resume_paused_vm(vm: &mut VmInstance) -> Result<()> {
     resume_running_io(vm)?;
-    if let Err(error) = resume_running_vcpus(vm) {
-        let rollback = pause_running_io(vm).err();
-        return Err(match rollback {
-            Some(rollback) => VmmError::Device(format!(
-                "resume vCPUs: {error}; failed to re-quiesce I/O workers: {rollback}"
-            )),
-            None => error,
-        });
-    }
+    resume_running_vcpus_or_stop(vm)?;
     vm.state = VmState::Running;
     Ok(())
 }
@@ -3514,14 +3656,15 @@ fn resume_running_vcpus(vm: &VmInstance) -> Result<()> {
         let vcpu_threads = std::iter::once(&r.vcpu_thread)
             .chain(r.ap_threads.iter())
             .collect::<Vec<_>>();
-        for vcpu_thread in &vcpu_threads {
-            vcpu_thread.resume();
-        }
-        for vcpu_thread in &vcpu_threads {
-            vcpu_thread.wait_snapshot_resumed()?;
-        }
+        resume_vcpu_group(&vcpu_threads)?;
     }
     Ok(())
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn resume_running_vcpus_or_stop(vm: &mut VmInstance) -> Result<()> {
+    let result = resume_running_vcpus(vm);
+    resolve_vcpu_resume(vm, result)
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
@@ -3772,7 +3915,9 @@ fn suspend_vm_in_place(vm: &mut VmInstance) -> Result<()> {
             Ok(())
         };
         let resume_result = match io_resume_result {
-            Ok(()) if paused_here && state_before == VmState::Running => resume_running_vcpus(vm),
+            Ok(()) if paused_here && state_before == VmState::Running => {
+                resume_running_vcpus_or_stop(vm)
+            }
             Ok(()) => Ok(()),
             Err(error) => Err(error),
         };
@@ -3782,7 +3927,11 @@ fn suspend_vm_in_place(vm: &mut VmInstance) -> Result<()> {
                 Err(error)
             }
             Err(resume) => {
-                vm.state = VmState::Paused;
+                // An unconfirmed vCPU resume has already stopped the VM. An
+                // I/O release failure leaves every vCPU held at this pause.
+                if vm.state != VmState::Stopped {
+                    vm.state = VmState::Paused;
+                }
                 Err(VmmError::Snapshot(format!(
                     "{error}; failed to restore running state after suspend failure: {resume}"
                 )))
@@ -8520,18 +8669,16 @@ fn build_running_vm(
         // safety hint, not a reason to discard an otherwise valid restore.
         log::warn!("restored BSP clock notification unavailable: {error}");
     }
-    let vcpu_thread = VcpuThread::spawn(
-        crate::vcpu::VcpuId(0),
-        vcpu,
-        kvm_vm.mmio_bus.clone(),
-        serial.clone(),
-    )?;
+    // Install every saved BSP/AP state before constructing any runnable
+    // thread. BSP execution can otherwise send IPIs to an absent AP or race
+    // the later LAPIC restore, overwriting guest-visible state.
+    let mut restored_vcpus = Vec::with_capacity(restored.aps.len() + 1);
+    restored_vcpus.push((crate::vcpu::VcpuId(0), vcpu));
 
     // SMP restore (phase B): recreate each AP (id 1..N) and re-apply its captured
     // state (which includes its RUNNABLE MP_STATE + LAPIC), so the restored VM
     // comes back with all vCPUs online. Per-AP CPUID (with its APIC id) is set
     // before the saved state, matching create_live.
-    let mut ap_threads = Vec::with_capacity(restored.aps.len());
     for (i, ap_state) in restored.aps.iter().enumerate() {
         let id = (i + 1) as u8;
         let ap = kvm_vm.create_vcpu(id)?;
@@ -8541,13 +8688,35 @@ fn build_running_vm(
         if let Err(error) = kvm_vm.notify_restored_clock(&ap) {
             log::warn!("restored AP {id} clock notification unavailable: {error}");
         }
-        ap_threads.push(VcpuThread::spawn(
-            crate::vcpu::VcpuId(id),
+        restored_vcpus.push((crate::vcpu::VcpuId(id), ap));
+    }
+
+    // A failed thread spawn or sandbox install cancels the unreleased gate;
+    // no CPU can reach KVM_RUN until every worker is ready. Parked-thread Drop
+    // also observes stop without relying on the controller releasing the gate.
+    let start = crate::vcpu_start::VcpuStartGate::new(restored_vcpus.len());
+    let mut restored_vcpus = restored_vcpus.into_iter();
+    let (bsp_id, bsp) = restored_vcpus.next().expect("restored BSP was staged");
+    let vcpu_thread = VcpuThread::spawn_parked(
+        bsp_id,
+        bsp,
+        kvm_vm.mmio_bus.clone(),
+        serial.clone(),
+        start.participant(),
+    )?;
+    let mut ap_threads = Vec::with_capacity(restored.aps.len());
+    for (id, ap) in restored_vcpus {
+        ap_threads.push(VcpuThread::spawn_parked(
+            id,
             ap,
             kvm_vm.mmio_bus.clone(),
             serial.clone(),
+            start.participant(),
         )?);
     }
+    start
+        .release_when_ready(std::time::Duration::from_secs(5))
+        .map_err(VmmError::Kvm)?;
 
     // The target was staged before vCPUs started. Signal only after every saved
     // LAPIC is installed, so restore cannot overwrite an injected config IRQ.
@@ -9325,6 +9494,227 @@ mod tests {
             runtime_dir: RuntimeDirUse::acquire(),
         });
         controller
+    }
+
+    #[test]
+    fn pause_group_rolls_back_every_target_and_reports_uncertainty() {
+        struct Target {
+            id: usize,
+            fail_request: bool,
+            fail_pause: bool,
+            fail_resume: bool,
+            log: Arc<Mutex<Vec<(usize, &'static str)>>>,
+        }
+        impl Target {
+            fn step(&self, name: &'static str, fail: bool) -> Result<()> {
+                self.log.lock().unwrap().push((self.id, name));
+                if fail {
+                    Err(VmmError::Snapshot(format!("injected {name}")))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        impl SnapshotPauseTarget for Target {
+            fn request_pause(&self) -> Result<()> {
+                self.step("request", self.fail_request)
+            }
+            fn wait_paused(&self) -> Result<()> {
+                self.step("pause", self.fail_pause)
+            }
+            fn resume_target(&self) {
+                self.step("resume", false).unwrap();
+            }
+            fn wait_resumed(&self) -> Result<()> {
+                self.step("rollback", self.fail_resume)
+            }
+        }
+        for request_failure in [true, false] {
+            for rollback_failure in [true, false] {
+                let log = Arc::new(Mutex::new(Vec::new()));
+                let targets = (0..3)
+                    .map(|id| Target {
+                        id,
+                        fail_request: request_failure && id == 1,
+                        fail_pause: !request_failure && id == 1,
+                        fail_resume: rollback_failure && id == 2,
+                        log: log.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                let refs = targets.iter().collect::<Vec<_>>();
+                let (error, confirmed) = pause_vcpu_group(&refs).unwrap_err();
+                assert_eq!(confirmed, !rollback_failure);
+                let controller = controller_in_state(VmState::Running);
+                let mut slot = controller.lock();
+                let vm = slot.as_mut().unwrap();
+                let error = resolve_vcpu_pause(vm, Err((error, confirmed))).unwrap_err();
+                assert_eq!(
+                    vm.state,
+                    if confirmed {
+                        VmState::Running
+                    } else {
+                        VmState::Stopped
+                    }
+                );
+                drop(slot);
+                assert!(error.to_string().contains(if request_failure {
+                    "injected request"
+                } else {
+                    "injected pause"
+                }));
+                assert_eq!(
+                    error.to_string().contains("failed to confirm"),
+                    rollback_failure
+                );
+                let log = log.lock().unwrap();
+                let resume_start = log.iter().position(|(_, step)| *step == "resume").unwrap();
+                assert_eq!(
+                    &log[resume_start..],
+                    &[
+                        (0, "resume"),
+                        (1, "resume"),
+                        (2, "resume"),
+                        (0, "rollback"),
+                        (1, "rollback"),
+                        (2, "rollback")
+                    ]
+                );
+                if !request_failure {
+                    assert_eq!(&log[..3], &[(0, "request"), (1, "request"), (2, "request")]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unconfirmed_vcpu_resume_stops_instead_of_recording_paused() {
+        struct Target {
+            id: usize,
+            fail_resume: bool,
+            log: Arc<Mutex<Vec<(usize, &'static str)>>>,
+        }
+        impl SnapshotPauseTarget for Target {
+            fn request_pause(&self) -> Result<()> {
+                unreachable!("resume only")
+            }
+            fn wait_paused(&self) -> Result<()> {
+                unreachable!("resume only")
+            }
+            fn resume_target(&self) {
+                self.log.lock().unwrap().push((self.id, "resume"));
+            }
+            fn wait_resumed(&self) -> Result<()> {
+                self.log.lock().unwrap().push((self.id, "confirm"));
+                if self.fail_resume {
+                    Err(VmmError::Snapshot("injected resume timeout".into()))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        for unconfirmed in [false, true] {
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let targets = (0..3)
+                .map(|id| Target {
+                    id,
+                    fail_resume: unconfirmed && id == 1,
+                    log: log.clone(),
+                })
+                .collect::<Vec<_>>();
+            let refs = targets.iter().collect::<Vec<_>>();
+            let controller = controller_in_state(VmState::Paused);
+            let mut slot = controller.lock();
+            let vm = slot.as_mut().unwrap();
+            let result = resolve_vcpu_resume(vm, resume_vcpu_group(&refs));
+            assert_eq!(result.is_err(), unconfirmed);
+            // Success leaves the state to the caller; failure is terminal.
+            assert_eq!(
+                vm.state,
+                if unconfirmed {
+                    VmState::Stopped
+                } else {
+                    VmState::Paused
+                }
+            );
+            drop(slot);
+            assert_eq!(
+                &log.lock().unwrap()[..3],
+                &[(0, "resume"), (1, "resume"), (2, "resume")],
+                "every vCPU is released before any acknowledgement is awaited"
+            );
+            if unconfirmed {
+                assert!(controller.pause().is_err());
+                assert!(controller
+                    .snapshot(false)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("stopped"));
+                assert!(controller
+                    .suspend()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("stopped"));
+            }
+        }
+    }
+
+    #[test]
+    fn live_snapshot_source_is_paused_only_while_every_vcpu_holds_its_pause() {
+        // (pause still requested, parked, thread exited)
+        let running = (false, false, false);
+        let held = (true, true, false);
+        let unconfirmed = (false, true, false);
+        let exited = (false, true, true);
+        assert_eq!(
+            live_source_vcpus([running, running]),
+            LiveSourceVcpus::Released
+        );
+        assert_eq!(live_source_vcpus([held, held]), LiveSourceVcpus::Held);
+        // Main recorded Paused for each of these.
+        let uncertain: [&[(bool, bool, bool)]; 4] = [
+            &[running, unconfirmed],
+            &[unconfirmed, unconfirmed],
+            &[held, exited],
+            &[exited],
+        ];
+        for vcpus in uncertain {
+            assert_eq!(
+                live_source_vcpus(vcpus.iter().copied()),
+                LiveSourceVcpus::Uncertain
+            );
+        }
+
+        for (vcpus, expected) in [
+            (LiveSourceVcpus::Released, VmState::Running),
+            (LiveSourceVcpus::Held, VmState::Paused),
+            (LiveSourceVcpus::Uncertain, VmState::Stopped),
+        ] {
+            let controller = controller_in_state(VmState::Running);
+            settle_live_snapshot_source(controller.lock().as_mut().unwrap(), vcpus);
+            assert_eq!(controller.lock().as_ref().unwrap().state, expected);
+        }
+    }
+
+    #[test]
+    fn uncertain_pause_is_terminal_and_rejects_state_capture() {
+        let controller = controller_in_state(VmState::Running);
+        stop_after_uncertain_pause(controller.lock().as_mut().unwrap());
+        assert_eq!(controller.lock().as_ref().unwrap().state, VmState::Stopped);
+        assert!(controller.pause().is_err());
+        assert!(controller.resume().is_err());
+        assert!(controller
+            .snapshot(false)
+            .unwrap_err()
+            .to_string()
+            .contains("stopped"));
+        assert!(controller
+            .suspend()
+            .unwrap_err()
+            .to_string()
+            .contains("stopped"));
+        assert_eq!(controller.lock().as_ref().unwrap().state, VmState::Stopped);
+        controller.stop().unwrap();
+        assert!(controller.lock().is_none());
     }
 
     fn net(tap: &str, mac: &str, ip: &str) -> NetConfig {

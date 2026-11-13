@@ -5,7 +5,7 @@
 #![cfg(all(feature = "kvm", target_arch = "x86_64", target_os = "linux"))]
 
 use crate::error::{Result, VmmError};
-use crate::vcpu::VcpuId;
+use crate::vcpu::{drain_pending_io, PendingIo, VcpuId, PENDING_IO_REENTRY_BUDGET};
 use kvm_ioctls::{VcpuExit, VcpuFd};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -13,6 +13,12 @@ use std::thread::{self, JoinHandle};
 use vmm_devices::bus::MmioBus;
 
 const SNAPSHOT_VCPU_TRANSITION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long a stopping vCPU may keep ignoring stop and repeated kicks. A
+/// healthy one leaves within microseconds; past this it is blocked in the
+/// kernel or in a device handler that does not return.
+const VCPU_EXIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+/// Process exit status when a vCPU thread never leaves after stop.
+const STUCK_VCPU_EXIT_STATUS: i32 = 79;
 
 /// Commands the control thread sends to the vCPU thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,9 +68,37 @@ impl VcpuThread {
     /// that runs KVM_RUN in a loop.
     pub fn spawn(
         id: VcpuId,
+        vcpu: VcpuFd,
+        mmio_bus: Arc<MmioBus>,
+        serial: Arc<vmm_devices::serial::Serial>,
+    ) -> Result<Self> {
+        Self::spawn_with_start_gate(id, vcpu, mmio_bus, serial, None, PENDING_IO_REENTRY_BUDGET)
+    }
+
+    pub(crate) fn spawn_parked(
+        id: VcpuId,
+        vcpu: VcpuFd,
+        mmio_bus: Arc<MmioBus>,
+        serial: Arc<vmm_devices::serial::Serial>,
+        start: crate::vcpu_start::VcpuStartToken,
+    ) -> Result<Self> {
+        Self::spawn_with_start_gate(
+            id,
+            vcpu,
+            mmio_bus,
+            serial,
+            Some(start),
+            PENDING_IO_REENTRY_BUDGET,
+        )
+    }
+
+    fn spawn_with_start_gate(
+        id: VcpuId,
         mut vcpu: VcpuFd,
         mmio_bus: Arc<MmioBus>,
         serial: Arc<vmm_devices::serial::Serial>,
+        start: Option<crate::vcpu_start::VcpuStartToken>,
+        pending_io_budget: usize,
     ) -> Result<Self> {
         let control = Arc::new(AtomicBool::new(false));
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -133,7 +167,13 @@ impl VcpuThread {
                 paused: paus.clone(),
                 exited: exited_for_thread.clone(),
             };
+            if let Some(start) = start {
+                if !start.wait(&stop_for_thread) {
+                    return Ok(());
+                }
+            }
             let result = (|| -> Result<()> {
+                let mut pending_io = false;
                 loop {
                     // Stop requested — exit cleanly (no error).
                     if stop_for_thread.load(Ordering::Relaxed) {
@@ -142,6 +182,28 @@ impl VcpuThread {
                     }
                     // Check control channel.
                     if ctrl.load(Ordering::Relaxed) {
+                        let mut io_complete = true;
+                        if pending_io {
+                            match complete_pending_io(
+                                &mut vcpu,
+                                &mmio_bus,
+                                &serial_for_thread,
+                                &stop_for_thread,
+                                pending_io_budget,
+                            )? {
+                                PendingIo::Completed => pending_io = false,
+                                PendingIo::Stopped => return Ok(()),
+                                PendingIo::Incomplete => io_complete = false,
+                            }
+                        }
+                        // Cancellation/stop can race completion. Never publish a
+                        // capture after stop, or park after pause was withdrawn.
+                        if stop_for_thread.load(Ordering::Acquire) {
+                            return Ok(());
+                        }
+                        if !ctrl.load(Ordering::Acquire) {
+                            continue;
+                        }
                         // Tell KVM that userspace deliberately paused this
                         // vCPU. A kvm-clock guest consumes the flag to avoid a
                         // false watchdog soft-lockup after a long pause. The
@@ -155,18 +217,33 @@ impl VcpuThread {
                         // the futex (Mutex), and the allocation (mmap/brk) used
                         // below are in the vCPU seccomp allow-list, so this is
                         // safe under the installed filter.
-                        match crate::vcpu_setup::capture_vcpu_full_state(&vcpu) {
-                            Ok(st) => match postcard::to_allocvec(&st) {
-                                Ok(bytes) => {
-                                    *captured_for_thread
-                                        .lock()
-                                        .unwrap_or_else(|e| e.into_inner()) = Some(bytes);
-                                }
-                                Err(e) => log::warn!("serialize vCPU state: {e}"),
-                            },
-                            Err(e) => log::warn!("capture vCPU state: {e}"),
+                        if io_complete {
+                            match crate::vcpu_setup::capture_vcpu_full_state(&vcpu) {
+                                Ok(st) => match postcard::to_allocvec(&st) {
+                                    Ok(bytes) => {
+                                        *captured_for_thread
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner()) = Some(bytes);
+                                    }
+                                    Err(e) => log::warn!("serialize vCPU state: {e}"),
+                                },
+                                Err(e) => log::warn!("capture vCPU state: {e}"),
+                            }
+                        } else {
+                            // The instruction is still in flight, so registers
+                            // would not match memory. Publish no capture: the
+                            // waiting pause fails and its rollback resumes this
+                            // thread, which stays alive; KVM finishes the
+                            // instruction on the next ordinary entry.
+                            *captured_for_thread
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner()) = None;
+                            log::warn!(
+                                "vCPU pause: in-flight I/O did not complete within \
+                                 {pending_io_budget} re-entries; this pause captures no state"
+                            );
                         }
-                        paus.store(true, Ordering::Relaxed);
+                        paus.store(true, Ordering::Release);
                         log::info!("vCPU thread pausing");
                         // Wait for control to clear (resume) or for stop.
                         // Adaptive backoff: a live-snapshot final stop resumes
@@ -197,40 +274,16 @@ impl VcpuThread {
 
                     match vcpu.run() {
                         Ok(VcpuExit::Hlt) => {
+                            pending_io = false;
                             // With in-kernel IRQCHIP, HLT should be handled
                             // by KVM internally (no exit to userspace). If we
                             // DO get a HLT exit, the kernel is idle — yield
                             // to let other threads (serial, net) run.
                             std::thread::yield_now();
                         }
-                        Ok(VcpuExit::MmioWrite(addr, data)) => {
-                            let mut val: u64 = 0;
-                            for (i, &b) in data.iter().enumerate().take(8) {
-                                val |= (b as u64) << (i * 8);
-                            }
-                            let _ = mmio_bus.write(addr, val, data.len() as u8);
-                        }
-                        Ok(VcpuExit::MmioRead(addr, data)) => {
-                            if let Ok(val) = mmio_bus.read(addr, data.len() as u8) {
-                                let bytes = val.to_le_bytes();
-                                for (i, slot) in data.iter_mut().enumerate().take(8) {
-                                    *slot = bytes[i];
-                                }
-                            }
-                        }
-                        Ok(VcpuExit::IoOut(port, data)) => {
-                            if (0x3f8..=0x3ff).contains(&port) {
-                                serial_for_thread.write((port - 0x3f8) as u8, data[0]);
-                            }
-                        }
-                        Ok(VcpuExit::IoIn(port, data)) => {
-                            if (0x3f8..=0x3ff).contains(&port) {
-                                data[0] = serial_for_thread.read((port - 0x3f8) as u8);
-                            }
-                        }
-                        Ok(other) => {
-                            log::warn!("vCPU exit {other:?} — stopping");
-                            return Err(VmmError::Kvm(format!("unhandled exit: {other:?}")));
+                        Ok(exit) => {
+                            handle_io_exit(exit, &mmio_bus, &serial_for_thread)?;
+                            pending_io = true;
                         }
                         Err(e) => {
                             // EINTR = a control-thread tgkill(SIGALRM) fired
@@ -240,6 +293,11 @@ impl VcpuThread {
                             // bringup state machine — it is retryable, not
                             // fatal. Anything else is fatal.
                             let errno = e.errno();
+                            // KVM completes a previous I/O operation before
+                            // checking signals. EAGAIN makes no such promise.
+                            if errno == libc::EINTR {
+                                pending_io = false;
+                            }
                             if errno != libc::EINTR && errno != libc::EAGAIN {
                                 return Err(VmmError::Kvm(format!("KVM_RUN: {e}")));
                             }
@@ -473,6 +531,29 @@ impl VcpuThread {
         Ok(())
     }
 
+    /// Wait for this stopping vCPU's thread to leave, failing closed if it
+    /// never does. Returning would let the caller free guest memory the stuck
+    /// thread can still reach (and a later VM in this process could be mapped
+    /// at the same address); waiting forever would hold the controller lock
+    /// and hang every later request to this VMM. The process owns one VM,
+    /// which is already being torn down, so exit and let the kernel destroy
+    /// it, as the userfaultfd handler does when it dies.
+    fn wait_for_exit_or_terminate(&self, handle: &JoinHandle<Result<()>>) {
+        if let Err(waited) = crate::vcpu::wait_for_vcpu_exit(
+            handle,
+            || self.vcpu_alive(),
+            || self.signal_vcpu(),
+            VCPU_EXIT_DEADLINE,
+        ) {
+            let name = handle.thread().name().unwrap_or("vcpu");
+            eprintln!("FATAL: {name} did not exit {waited:?} after stop; terminating VMM");
+            log::error!("{name} did not exit {waited:?} after stop; terminating VMM");
+            // SAFETY: `_exit` ends the process without running destructors
+            // that could unmap guest memory the stuck vCPU can still reach.
+            unsafe { libc::_exit(STUCK_VCPU_EXIT_STATUS) }
+        }
+    }
+
     /// Stop the vCPU permanently (joins the thread).
     pub fn stop(mut self) -> Result<()> {
         // Order matters: set stop *before* control so the pause spin-loop
@@ -482,6 +563,7 @@ impl VcpuThread {
         // Wake the vCPU out of any blocking KVM_RUN so it observes the flags.
         self.signal_vcpu();
         if let Some(handle) = self.handle.take() {
+            self.wait_for_exit_or_terminate(&handle);
             // A thread terminated by a signal (e.g. a seccomp SIGSYS) cannot be
             // joined cleanly — the std thread lifecycle panics on join. Isolate
             // the join with catch_unwind and treat an unwinding join as an
@@ -500,24 +582,554 @@ impl Drop for VcpuThread {
     fn drop(&mut self) {
         self.stop_flag.store(true, Ordering::Relaxed);
         self.control.store(true, Ordering::Relaxed);
-        // Best-effort signal so a Drop in error paths doesn't hang the
-        // process when the vCPU is mid-KVM_RUN.
-        let tid = self.tid.load(Ordering::SeqCst);
-        if tid != 0 {
-            // SAFETY: getpid has no preconditions and cannot invalidate memory.
-            let pid = unsafe { libc::getpid() };
-            // SAFETY: tgkill targets the published vCPU TID with SIGALRM to wake
-            // KVM_RUN during Drop; the result is intentionally ignored.
-            unsafe {
-                libc::syscall(libc::SYS_tgkill, pid, tid, libc::SIGALRM);
-            }
-        }
+        // Repeated kicks below cover both a missed signal and startup before
+        // the worker publishes its TID. Never detach while VM memory is live.
         if let Some(handle) = self.handle.take() {
+            self.wait_for_exit_or_terminate(&handle);
             // Never panic in Drop — a panic during an unwind aborts the whole
             // process. Joining a signal-killed thread panics, so isolate it.
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _ = handle.join();
             }));
         }
+    }
+}
+
+/// Finish the instruction that caused the last userspace I/O exit before any
+/// KVM_GET_* capture. KVM API §5 guarantees immediate_exit completes pending
+/// operations without executing further guest instructions. Only this vCPU
+/// thread accesses kvm_run; device handlers run without holding controller locks.
+fn complete_pending_io(
+    vcpu: &mut VcpuFd,
+    bus: &MmioBus,
+    serial: &vmm_devices::serial::Serial,
+    stop: &AtomicBool,
+    budget: usize,
+) -> Result<PendingIo> {
+    vcpu.set_kvm_immediate_exit(1);
+    let result = drain_pending_io(stop, budget, || match vcpu.run() {
+        Err(error) if error.errno() == libc::EINTR => Ok(true),
+        Err(error) if error.errno() == libc::EAGAIN => Ok(false),
+        Err(error) => Err(VmmError::Snapshot(format!(
+            "complete pending vCPU I/O: {error}"
+        ))),
+        // One instruction may need multiple exits (e.g. split MMIO). Service
+        // those with immediate_exit still set, until KVM confirms completion.
+        Ok(exit) => {
+            handle_io_exit(exit, bus, serial)?;
+            Ok(false)
+        }
+    });
+    vcpu.set_kvm_immediate_exit(0);
+    result
+}
+
+fn handle_io_exit(
+    exit: VcpuExit<'_>,
+    bus: &MmioBus,
+    serial: &vmm_devices::serial::Serial,
+) -> Result<()> {
+    match exit {
+        VcpuExit::MmioWrite(addr, data) => {
+            let mut bytes = [0; 8];
+            for (dst, src) in bytes.iter_mut().zip(data.iter()) {
+                *dst = *src;
+            }
+            let _ = bus.write(addr, u64::from_le_bytes(bytes), data.len() as u8);
+        }
+        VcpuExit::MmioRead(addr, data) => {
+            if let Ok(value) = bus.read(addr, data.len() as u8) {
+                for (dst, src) in data.iter_mut().zip(value.to_le_bytes()) {
+                    *dst = src;
+                }
+            }
+        }
+        VcpuExit::IoOut(port, data) => {
+            if (0x3f8..=0x3ff).contains(&port) {
+                serial.write((port - 0x3f8) as u8, data[0]);
+            }
+        }
+        VcpuExit::IoIn(port, data) => {
+            if (0x3f8..=0x3ff).contains(&port) {
+                data[0] = serial.read((port - 0x3f8) as u8);
+            }
+        }
+        other => {
+            log::warn!("vCPU exit {other:?} — stopping");
+            return Err(VmmError::Kvm(format!("unhandled exit: {other:?}")));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Requires real KVM: explicitly ignored by ordinary unit runs rather than
+    // silently counting an unavailable /dev/kvm as passing execution evidence.
+    #[test]
+    #[ignore = "requires /dev/kvm; run explicitly on the KVM fixture host"]
+    fn kvm_pending_pio_mmio_complete_without_executing_next_instruction() {
+        let kvm = kvm_ioctls::Kvm::new().unwrap();
+        assert!(kvm.check_extension(kvm_ioctls::Cap::ImmediateExit));
+        for code in [
+            vec![0xe4, 0x80], // in al, 0x80
+            vec![0xe6, 0x80], // out 0x80, al
+            // Real-mode DS has a 64 KiB limit. Use an unmapped hole above
+            // our 16 KiB RAM slot, but within that architectural limit.
+            vec![0xa0, 0x00, 0x80], // mov al, byte [0x8000]
+            vec![0xa2, 0x00, 0x80], // mov byte [0x8000], al
+        ] {
+            let vm = kvm.create_vm().unwrap();
+            // Match production VM setup before entering real mode on VMX.
+            vm.set_tss_address(0xfffbd000).unwrap();
+            let mem = vmm_memory_backend::GuestMemory::new(0x4000).unwrap();
+            mem.register(&vm, 0).unwrap();
+            let mut program = code.clone();
+            program.extend_from_slice(&[0xb0, 0xcc, 0xf4]); // mov al,0xcc; hlt
+            mem.write_phys(0x1000, &program).unwrap();
+            let mut vcpu = vm.create_vcpu(0).unwrap();
+            let mut sregs = vcpu.get_sregs().unwrap();
+            sregs.cs.base = 0;
+            sregs.cs.selector = 0;
+            vcpu.set_sregs(&sregs).unwrap();
+            let mut regs = vcpu.get_regs().unwrap();
+            regs.rip = 0x1000;
+            regs.rflags = 2;
+            regs.rax = 0x5a;
+            vcpu.set_regs(&regs).unwrap();
+            match vcpu.run().unwrap() {
+                VcpuExit::IoIn(_, data) | VcpuExit::MmioRead(_, data) => data[0] = 0x5a,
+                VcpuExit::IoOut(_, _) | VcpuExit::MmioWrite(_, _) => {}
+                VcpuExit::InternalError => {
+                    // SAFETY: this union member is selected by INTERNAL_ERROR.
+                    let internal = unsafe { vcpu.get_kvm_run().__bindgen_anon_1.internal };
+                    panic!("first KVM_RUN internal error: code={code:02x?} suberror={} data={:x?} regs={:?} sregs={:?}",
+                        internal.suberror, &internal.data[..(internal.ndata as usize).min(internal.data.len())],
+                        vcpu.get_regs().unwrap(), vcpu.get_sregs().unwrap());
+                }
+                other => panic!("expected first I/O exit for {code:02x?}: {other:?}"),
+            }
+            let bus = MmioBus::new();
+            let serial = vmm_devices::serial::Serial::new(
+                vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK).unwrap(),
+            );
+            assert_eq!(
+                complete_pending_io(
+                    &mut vcpu,
+                    &bus,
+                    &serial,
+                    &AtomicBool::new(false),
+                    PENDING_IO_REENTRY_BUDGET
+                )
+                .unwrap(),
+                PendingIo::Completed
+            );
+            let regs = vcpu.get_regs().unwrap();
+            assert_eq!(regs.rip, 0x1000 + code.len() as u64);
+            assert_eq!(regs.rax & 0xff, 0x5a, "next mov must not execute");
+            assert_eq!(vcpu.get_kvm_run().immediate_exit, 0);
+            assert!(matches!(vcpu.run().unwrap(), VcpuExit::Hlt));
+            assert_eq!(vcpu.get_regs().unwrap().rax & 0xff, 0xcc);
+        }
+    }
+
+    /// 16 KiB of real-mode RAM at 0 holding `program` at 0x1000. Addresses
+    /// from 0x4000 up to the 64 KiB segment limit are an MMIO hole.
+    fn real_mode_vm(
+        kvm: &kvm_ioctls::Kvm,
+        program: &[u8],
+    ) -> (kvm_ioctls::VmFd, vmm_memory_backend::GuestMemory) {
+        let vm = kvm.create_vm().unwrap();
+        // Match production VM setup before entering real mode on VMX.
+        vm.set_tss_address(0xfffbd000).unwrap();
+        let mem = vmm_memory_backend::GuestMemory::new(0x4000).unwrap();
+        mem.register(&vm, 0).unwrap();
+        mem.write_phys(0x1000, program).unwrap();
+        (vm, mem)
+    }
+
+    fn real_mode_vcpu(vm: &kvm_ioctls::VmFd) -> VcpuFd {
+        let vcpu = vm.create_vcpu(0).unwrap();
+        let mut sregs = vcpu.get_sregs().unwrap();
+        sregs.cs.base = 0;
+        sregs.cs.selector = 0;
+        vcpu.set_sregs(&sregs).unwrap();
+        let mut regs = vcpu.get_regs().unwrap();
+        regs.rip = 0x1000;
+        regs.rflags = 2;
+        vcpu.set_regs(&regs).unwrap();
+        vcpu
+    }
+
+    fn test_serial() -> Arc<vmm_devices::serial::Serial> {
+        Arc::new(vmm_devices::serial::Serial::new(
+            vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK).unwrap(),
+        ))
+    }
+
+    /// Records warnings logged on the calling thread while `f` runs. Records
+    /// from other threads are dropped, so parallel tests do not interfere.
+    fn capture_warnings<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
+        struct ThreadWarnings;
+        std::thread_local! {
+            static WARNINGS: std::cell::RefCell<Option<Vec<String>>> =
+                const { std::cell::RefCell::new(None) };
+        }
+        impl log::Log for ThreadWarnings {
+            fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+                metadata.level() <= log::Level::Warn
+            }
+            fn log(&self, record: &log::Record<'_>) {
+                if self.enabled(record.metadata()) {
+                    WARNINGS.with(|warnings| {
+                        if let Some(lines) = warnings.borrow_mut().as_mut() {
+                            lines.push(record.args().to_string());
+                        }
+                    });
+                }
+            }
+            fn flush(&self) {}
+        }
+        static LOGGER: ThreadWarnings = ThreadWarnings;
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            log::set_logger(&LOGGER).expect("no other logger in the vmm-core tests");
+            log::set_max_level(log::LevelFilter::Warn);
+        });
+        WARNINGS.with(|warnings| *warnings.borrow_mut() = Some(Vec::new()));
+        let value = f();
+        let lines = WARNINGS.with(|warnings| warnings.borrow_mut().take().unwrap_or_default());
+        (value, lines)
+    }
+
+    /// Main logged every exit the run loop cannot handle before the vCPU
+    /// stopped; #124's shared handler had dropped that line. Needs the `kvm`
+    /// feature on Linux, not /dev/kvm.
+    #[test]
+    fn unhandled_exit_is_logged_before_the_vcpu_stops() {
+        let serial = test_serial();
+        let (result, warnings) =
+            capture_warnings(|| handle_io_exit(VcpuExit::Shutdown, &MmioBus::new(), &serial));
+        assert!(result.is_err());
+        assert!(
+            warnings
+                .iter()
+                .any(|line| line.contains("Shutdown") && line.contains("stopping")),
+            "{warnings:?}"
+        );
+    }
+
+    /// #126: a vCPU thread started with `spawn_parked` runs no guest
+    /// instruction until the start gate is released. The controller releases
+    /// it only after every BSP/AP saved state is installed; the second gate
+    /// participant here stands in for an AP still being restored.
+    #[test]
+    #[ignore = "requires /dev/kvm; run explicitly on the KVM fixture host"]
+    fn kvm_parked_vcpu_runs_no_guest_code_before_release() {
+        let kvm = kvm_ioctls::Kvm::new().unwrap();
+        // mov byte [0x3000], 1; jmp $
+        let (vm, mem) = real_mode_vm(&kvm, &[0xc6, 0x06, 0x00, 0x30, 0x01, 0xeb, 0xfe]);
+        let marker = || {
+            let mut byte = [0u8];
+            mem.read_phys(0x3000, &mut byte).unwrap();
+            byte[0]
+        };
+        let gate = crate::vcpu_start::VcpuStartGate::new(2);
+        let thread = VcpuThread::spawn_parked(
+            VcpuId(0),
+            real_mode_vcpu(&vm),
+            Arc::new(MmioBus::new()),
+            test_serial(),
+            gate.participant(),
+        )
+        .unwrap();
+        let ap = gate.participant();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(marker(), 0, "parked vCPU ran guest code before release");
+        assert!(!thread.is_exited());
+        let ap_ready = std::thread::spawn(move || ap.wait(&AtomicBool::new(false)));
+        gate.release_when_ready(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert!(ap_ready.join().unwrap());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while marker() != 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "released vCPU did not run"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        thread.stop().unwrap();
+    }
+
+    /// Child half of `kvm_vcpu_that_never_leaves_terminates_the_vmm`: a vCPU
+    /// blocked in a device handler ignores stop and every kick, so `stop()`
+    /// must end the process rather than return or wait forever.
+    #[test]
+    #[ignore = "requires /dev/kvm; run by kvm_vcpu_that_never_leaves_terminates_the_vmm"]
+    fn kvm_stuck_vcpu_child() {
+        if std::env::var_os("TARIT_TEST_STUCK_VCPU_CHILD").is_none() {
+            return;
+        }
+        struct NeverReturns;
+        impl vmm_devices::bus::MmioDevice for NeverReturns {
+            fn mmio_read(&self, _: u64, _: u8) -> vmm_devices::bus::MmioReadResult {
+                loop {
+                    std::thread::park();
+                }
+            }
+            fn mmio_write(&self, _: u64, _: u64, _: u8) -> vmm_devices::bus::MmioWriteResult {
+                Ok(())
+            }
+        }
+        let kvm = kvm_ioctls::Kvm::new().unwrap();
+        // mov al, byte [0x8000]; hlt
+        let (vm, _mem) = real_mode_vm(&kvm, &[0xa0, 0x00, 0x80, 0xf4]);
+        let mut bus = MmioBus::new();
+        bus.insert(
+            vmm_devices::bus::MmioRange::new(0x8000, 0x1000),
+            Box::new(NeverReturns),
+        )
+        .unwrap();
+        let thread =
+            VcpuThread::spawn(VcpuId(0), real_mode_vcpu(&vm), Arc::new(bus), test_serial())
+                .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let _ = thread.stop();
+        // Reaching here means stop() gave up the stuck thread.
+        std::process::exit(0);
+    }
+
+    #[test]
+    #[ignore = "requires /dev/kvm; run explicitly on the KVM fixture host"]
+    fn kvm_vcpu_that_never_leaves_terminates_the_vmm() {
+        let started = std::time::Instant::now();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "vcpu_thread::tests::kvm_stuck_vcpu_child",
+                "--include-ignored",
+                "--nocapture",
+            ])
+            .env("TARIT_TEST_STUCK_VCPU_CHILD", "1")
+            .status()
+            .unwrap();
+        let took = started.elapsed();
+        assert_eq!(status.code(), Some(STUCK_VCPU_EXIT_STATUS), "{status:?}");
+        assert!(
+            took >= VCPU_EXIT_DEADLINE
+                && took < VCPU_EXIT_DEADLINE + std::time::Duration::from_secs(10),
+            "terminated after {took:?}"
+        );
+    }
+
+    /// `rep movsb` from MMIO exits once per byte, and KVM reaches its
+    /// immediate-exit check only at each 1,024-iteration boundary. Finishing
+    /// it needs hundreds of re-entries: the production budget must cover
+    /// that, and a budget that runs out must leave the vCPU consistent and
+    /// runnable rather than failed.
+    #[test]
+    #[ignore = "requires /dev/kvm; run explicitly on the KVM fixture host"]
+    fn kvm_rep_mmio_string_completes_within_budget_and_exhaustion_is_not_fatal() {
+        let kvm = kvm_ioctls::Kvm::new().unwrap();
+        for budget in [PENDING_IO_REENTRY_BUDGET, 64] {
+            // rep movsb (DS:SI in the MMIO hole, ES:DI in RAM); mov al,0xcc; hlt
+            let (vm, _mem) = real_mode_vm(&kvm, &[0xf3, 0xa4, 0xb0, 0xcc, 0xf4]);
+            let mut vcpu = real_mode_vcpu(&vm);
+            let mut regs = vcpu.get_regs().unwrap();
+            regs.rsi = 0x8000;
+            regs.rdi = 0x2000;
+            regs.rcx = 3000;
+            regs.rax = 0x5a;
+            vcpu.set_regs(&regs).unwrap();
+            assert!(matches!(vcpu.run().unwrap(), VcpuExit::MmioRead(..)));
+            let bus = MmioBus::new();
+            let serial = test_serial();
+            let outcome =
+                complete_pending_io(&mut vcpu, &bus, &serial, &AtomicBool::new(false), budget)
+                    .unwrap();
+            assert_eq!(vcpu.get_kvm_run().immediate_exit, 0);
+            if budget == PENDING_IO_REENTRY_BUDGET {
+                assert_eq!(outcome, PendingIo::Completed);
+                let regs = vcpu.get_regs().unwrap();
+                assert!(
+                    regs.rcx < 3000 && regs.rcx.is_multiple_of(1024),
+                    "completion should stop at a 1,024-iteration boundary: rcx={}",
+                    regs.rcx
+                );
+                assert_eq!(regs.rax & 0xff, 0x5a, "next mov must not execute");
+            } else {
+                // Registers are not consistent mid-instruction; only the
+                // outcome and the run below are checked.
+                assert_eq!(outcome, PendingIo::Incomplete);
+            }
+            loop {
+                match vcpu.run() {
+                    Ok(VcpuExit::Hlt) => break,
+                    Ok(exit) => handle_io_exit(exit, &bus, &serial).unwrap(),
+                    Err(error) if error.errno() == libc::EINTR => {}
+                    Err(error) => panic!("KVM_RUN after completion: {error}"),
+                }
+            }
+            let regs = vcpu.get_regs().unwrap();
+            assert_eq!(regs.rcx, 0, "the copy must finish");
+            assert_eq!(regs.rax & 0xff, 0xcc);
+        }
+    }
+
+    /// A pause that lands inside a long MMIO string instruction and cannot
+    /// finish it fails that pause only: no state is captured, the vCPU
+    /// acknowledges and resumes, and its thread stays alive for the next
+    /// pause. With the production budget every such pause succeeds, and each
+    /// capture holds registers that match memory, never a half-done copy.
+    ///
+    /// The vCPU is prepared the way the controller prepares one before its
+    /// thread can capture: an in-kernel irqchip (the capture reads the LAPIC)
+    /// and `setup_cpuid`, which also caches the snapshot MSR list that the
+    /// seccomp-confined vCPU thread cannot read from /dev/kvm. Without them
+    /// every capture fails, so every pause is refused whatever the budget.
+    #[test]
+    #[ignore = "requires /dev/kvm; run explicitly on the KVM fixture host"]
+    fn kvm_pause_that_cannot_finish_io_fails_without_killing_the_vcpu() {
+        let kvm = kvm_ioctls::Kvm::new().unwrap();
+        // l: mov cx,4000; mov si,0x8000; mov di,0x2000; rep movsb; jmp l
+        let program: [u8; 13] = [
+            0xb9, 0xa0, 0x0f, 0xbe, 0x00, 0x80, 0xbf, 0x00, 0x20, 0xf3, 0xa4, 0xeb, 0xf3,
+        ];
+        const REP_RIP: u64 = 0x1009;
+        const COUNT: u64 = 4000;
+        for budget in [4, PENDING_IO_REENTRY_BUDGET] {
+            let (vm, _mem) = real_mode_vm(&kvm, &program);
+            vm.create_irq_chip().unwrap();
+            let vcpu = real_mode_vcpu(&vm);
+            crate::vcpu_setup::setup_cpuid(&vcpu).unwrap();
+            crate::vcpu_setup::capture_vcpu_full_state(&vcpu)
+                .expect("the test vCPU must allow a full capture");
+            let thread = VcpuThread::spawn_with_start_gate(
+                VcpuId(0),
+                vcpu,
+                Arc::new(MmioBus::new()),
+                test_serial(),
+                None,
+                budget,
+            )
+            .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let mut refused = 0;
+            let mut inside_rep = 0;
+            for _ in 0..20 {
+                thread.request_snapshot_pause().unwrap();
+                match thread.wait_snapshot_paused() {
+                    Ok(()) => {
+                        let bytes = thread
+                            .captured_state
+                            .lock()
+                            .unwrap()
+                            .clone()
+                            .expect("a confirmed pause holds a capture");
+                        let state: crate::vcpu_setup::VcpuFullState =
+                            postcard::from_bytes(&bytes).unwrap();
+                        let regs = state.regs;
+                        if regs.rip == REP_RIP {
+                            // KVM leaves an emulated `rep` only when cx is a
+                            // multiple of 1,024, including 0 (the guest then
+                            // runs the rep with nothing left). Any other count
+                            // is a mid-instruction capture. Real mode: 16-bit.
+                            let left = regs.rcx & 0xffff;
+                            assert!(
+                                left == COUNT || left.is_multiple_of(1024),
+                                "budget {budget}: captured inside rep movsb, cx={left}"
+                            );
+                            let done = COUNT - left;
+                            assert_eq!(regs.rsi & 0xffff, 0x8000 + done, "budget {budget}");
+                            assert_eq!(regs.rdi & 0xffff, 0x2000 + done, "budget {budget}");
+                            if left < COUNT {
+                                inside_rep += 1;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        assert!(
+                            error.to_string().contains("did not capture state"),
+                            "budget {budget}: {error}"
+                        );
+                        refused += 1;
+                    }
+                }
+                assert!(!thread.is_exited(), "budget {budget}: vCPU thread exited");
+                thread.resume();
+                thread.wait_snapshot_resumed().unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            if budget == PENDING_IO_REENTRY_BUDGET {
+                assert_eq!(refused, 0, "the production budget must finish rep I/O");
+                assert!(inside_rep > 0, "no pause landed inside the rep instruction");
+            } else {
+                assert!(refused > 0, "no pause landed inside the rep instruction");
+            }
+            assert!(!thread.is_exited());
+            thread.stop().unwrap();
+        }
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+
+    /// Exercise actual KVM_RUN and the production stop/Drop paths. Keep the
+    /// overall test bounded even if a regression leaves a worker blocked.
+    #[test]
+    #[ignore = "requires /dev/kvm; explicitly run on the KVM fixture host"]
+    fn kvm_busy_vcpus_stop_and_drop_during_startup_and_execution() {
+        let (send, recv) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let kvm = kvm_ioctls::Kvm::new().unwrap();
+            for stop_explicitly in [true, false] {
+                for allow_startup in [true, false] {
+                    for _ in 0..8 {
+                        let vm = kvm.create_vm().unwrap();
+                        vm.set_tss_address(0xfffbd000).unwrap();
+                        let mem = vmm_memory_backend::GuestMemory::new(0x4000).unwrap();
+                        mem.register(&vm, 0).unwrap();
+                        mem.write_phys(0x1000, &[0xeb, 0xfe]).unwrap(); // jmp $
+                        let vcpu = vm.create_vcpu(0).unwrap();
+                        let mut sregs = vcpu.get_sregs().unwrap();
+                        sregs.cs.base = 0;
+                        sregs.cs.selector = 0;
+                        vcpu.set_sregs(&sregs).unwrap();
+                        let mut regs = vcpu.get_regs().unwrap();
+                        regs.rip = 0x1000;
+                        regs.rflags = 2;
+                        vcpu.set_regs(&regs).unwrap();
+                        let serial = Arc::new(vmm_devices::serial::Serial::new(
+                            vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK).unwrap(),
+                        ));
+                        let thread =
+                            VcpuThread::spawn(VcpuId(0), vcpu, Arc::new(MmioBus::new()), serial)
+                                .unwrap();
+                        let exited = thread.exited.clone();
+                        if allow_startup {
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                        }
+                        if stop_explicitly {
+                            thread.stop().unwrap();
+                        } else {
+                            drop(thread);
+                        }
+                        assert!(
+                            exited.load(Ordering::Acquire),
+                            "stop/Drop must join before VM memory is released"
+                        );
+                    }
+                }
+            }
+            send.send(()).unwrap();
+        });
+        recv.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("vCPU shutdown exceeded 10 seconds");
+        worker.join().unwrap();
     }
 }
