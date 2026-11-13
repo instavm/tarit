@@ -2838,7 +2838,6 @@ pub async fn recover_hibernated_on_stale_owner(
             id,
             &state.config.host_id,
             state.config.host_session_id,
-            Utc::now() - chrono::Duration::seconds(15),
         )
         .await
         .map_err(|error| match error {

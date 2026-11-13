@@ -17,6 +17,28 @@ use tarit_types::{
 use tokio_postgres_rustls::MakeRustlsConnect;
 use uuid::Uuid;
 
+/// Common fleet heartbeat window. `now` must come from the registry database
+/// when evaluating a PostgreSQL host row. Keep the existing five-second future
+/// guard for legacy rows and database clock adjustments; writers use DB time.
+pub fn host_heartbeat_is_fresh(last_heartbeat: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    let age = now - last_heartbeat;
+    age >= -chrono::Duration::seconds(5) && age < chrono::Duration::seconds(15)
+}
+
+fn row_to_host(row: &tokio_postgres::Row) -> HostRecord {
+    HostRecord {
+        host_id: row.get(0),
+        boot_session_id: row.get(1),
+        peer_certificate_sha256: row.get(2),
+        rpc_addr: row.get(3),
+        sandbox_count: row.get::<_, i64>(4) as usize,
+        free_vcpus: row.get::<_, i64>(5) as u64,
+        free_memory_mib: row.get::<_, i64>(6) as u64,
+        healthy: row.get(7),
+        last_heartbeat: row.get(8),
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum FleetError {
     #[error("postgres: {0}")]
@@ -149,13 +171,15 @@ impl PostgresFleet {
                         WHERE replica.status = 'available'
                           AND replica.verified_at IS NOT NULL
                           AND host.healthy = TRUE
-                          AND host.last_heartbeat >= NOW() - INTERVAL '15 seconds'
+                          AND host.last_heartbeat > statement_timestamp() - INTERVAL '15 seconds'
+                          AND host.last_heartbeat <= statement_timestamp() + INTERVAL '5 seconds'
                       ) AS available,
                       COUNT(DISTINCT replica.failure_domain) FILTER (
                         WHERE replica.status = 'available'
                           AND replica.verified_at IS NOT NULL
                           AND host.healthy = TRUE
-                          AND host.last_heartbeat >= NOW() - INTERVAL '15 seconds'
+                          AND host.last_heartbeat > statement_timestamp() - INTERVAL '15 seconds'
+                          AND host.last_heartbeat <= statement_timestamp() + INTERVAL '5 seconds'
                       ) AS failure_domains
                  FROM fleet_artifacts artifact
                  LEFT JOIN fleet_artifact_replicas replica
@@ -192,7 +216,7 @@ impl PostgresFleet {
         client
             .execute(
                 "INSERT INTO fleet_hosts (host_id, boot_session_id, peer_certificate_sha256, rpc_addr, sandbox_count, free_vcpus, free_memory_mib, healthy, last_heartbeat)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,statement_timestamp())
                  ON CONFLICT (host_id) DO UPDATE SET
                    boot_session_id = EXCLUDED.boot_session_id,
                    peer_certificate_sha256 = EXCLUDED.peer_certificate_sha256,
@@ -211,7 +235,6 @@ impl PostgresFleet {
                     &(host.free_vcpus as i64),
                     &(host.free_memory_mib as i64),
                     &host.healthy,
-                    &host.last_heartbeat,
                 ],
             )
             .await?;
@@ -219,28 +242,31 @@ impl PostgresFleet {
     }
 
     pub async fn list_hosts(&self) -> Result<Vec<HostRecord>, FleetError> {
+        self.list_hosts_with_clock().await.map(|(_, hosts)| hosts)
+    }
+
+    /// Observe membership and its freshness clock in the same database query.
+    pub async fn list_hosts_with_clock(
+        &self,
+    ) -> Result<(DateTime<Utc>, Vec<HostRecord>), FleetError> {
         let client = self.pool.get().await?;
         let rows = client
             .query(
-                "SELECT host_id, boot_session_id, peer_certificate_sha256, rpc_addr, sandbox_count, free_vcpus, free_memory_mib, healthy, last_heartbeat
-                 FROM fleet_hosts ORDER BY host_id",
+                "SELECT host_id, boot_session_id, peer_certificate_sha256, rpc_addr,
+                    sandbox_count, free_vcpus, free_memory_mib, healthy, last_heartbeat,
+                    statement_timestamp()
+               FROM (SELECT 1) clock LEFT JOIN fleet_hosts ON TRUE ORDER BY host_id",
                 &[],
             )
             .await?;
-        Ok(rows
-            .into_iter()
-            .map(|row| HostRecord {
-                host_id: row.get(0),
-                boot_session_id: row.get(1),
-                peer_certificate_sha256: row.get(2),
-                rpc_addr: row.get(3),
-                sandbox_count: row.get::<_, i64>(4) as usize,
-                free_vcpus: row.get::<_, i64>(5) as u64,
-                free_memory_mib: row.get::<_, i64>(6) as u64,
-                healthy: row.get(7),
-                last_heartbeat: row.get(8),
-            })
-            .collect())
+        // The left join returns the clock even when the registry is empty.
+        let now = rows[0].get(9);
+        let hosts = rows
+            .iter()
+            .filter(|row| row.get::<_, Option<String>>(0).is_some())
+            .map(row_to_host)
+            .collect();
+        Ok((now, hosts))
     }
 
     /// Atomically claim a VM id or update the same resource incarnation.
@@ -392,7 +418,6 @@ impl PostgresFleet {
         id: Uuid,
         target_host_id: &str,
         target_boot_session_id: Uuid,
-        stale_before: DateTime<Utc>,
     ) -> Result<VmRecord, FleetError> {
         let mut client = self.pool.get().await?;
         let tx = client.transaction().await?;
@@ -417,8 +442,10 @@ impl PostgresFleet {
             .query_opt(
                 "SELECT 1 FROM fleet_hosts
                   WHERE host_id = $1 AND boot_session_id = $2
-                    AND healthy = TRUE AND last_heartbeat >= $3",
-                &[&target_host_id, &target_boot_session_id, &stale_before],
+                    AND healthy = TRUE
+                    AND last_heartbeat > statement_timestamp() - INTERVAL '15 seconds'
+                    AND last_heartbeat <= statement_timestamp() + INTERVAL '5 seconds'",
+                &[&target_host_id, &target_boot_session_id],
             )
             .await?
             .is_some();
@@ -431,8 +458,10 @@ impl PostgresFleet {
             let prior_still_live = tx
                 .query_opt(
                     "SELECT 1 FROM fleet_hosts
-                      WHERE host_id = $1 AND healthy = TRUE AND last_heartbeat >= $2",
-                    &[&vm.host_id, &stale_before],
+                      WHERE host_id = $1 AND healthy = TRUE
+                        AND last_heartbeat > statement_timestamp() - INTERVAL '15 seconds'
+                        AND last_heartbeat <= statement_timestamp() + INTERVAL '5 seconds'",
+                    &[&vm.host_id],
                 )
                 .await?
                 .is_some();
@@ -493,25 +522,26 @@ impl PostgresFleet {
 
     /// Fetch a single host record (used to resolve an owner's peer RPC address).
     pub async fn get_host(&self, host_id: &str) -> Result<Option<HostRecord>, FleetError> {
+        self.get_host_with_clock(host_id)
+            .await
+            .map(|row| row.map(|(_, host)| host))
+    }
+
+    pub async fn get_host_with_clock(
+        &self,
+        host_id: &str,
+    ) -> Result<Option<(DateTime<Utc>, HostRecord)>, FleetError> {
         let client = self.pool.get().await?;
         let row = client
             .query_opt(
-                "SELECT host_id, boot_session_id, peer_certificate_sha256, rpc_addr, sandbox_count, free_vcpus, free_memory_mib, healthy, last_heartbeat
-                 FROM fleet_hosts WHERE host_id = $1",
+                "SELECT host_id, boot_session_id, peer_certificate_sha256, rpc_addr,
+                    sandbox_count, free_vcpus, free_memory_mib, healthy, last_heartbeat,
+                    statement_timestamp()
+               FROM fleet_hosts WHERE host_id = $1",
                 &[&host_id],
             )
             .await?;
-        Ok(row.map(|row| HostRecord {
-            host_id: row.get(0),
-            boot_session_id: row.get(1),
-            peer_certificate_sha256: row.get(2),
-            rpc_addr: row.get(3),
-            sandbox_count: row.get::<_, i64>(4) as usize,
-            free_vcpus: row.get::<_, i64>(5) as u64,
-            free_memory_mib: row.get::<_, i64>(6) as u64,
-            healthy: row.get(7),
-            last_heartbeat: row.get(8),
-        }))
+        Ok(row.map(|row| (row.get(9), row_to_host(&row))))
     }
 
     /// Publish the private locator for an opaque snapshot handle. This table is
@@ -948,7 +978,8 @@ impl PostgresFleet {
                         .query_opt(
                             "SELECT 1 FROM fleet_hosts
                              WHERE host_id = $1 AND healthy = TRUE
-                               AND last_heartbeat >= NOW() - INTERVAL '15 seconds'",
+                               AND last_heartbeat > statement_timestamp() - INTERVAL '15 seconds'
+                    AND last_heartbeat <= statement_timestamp() + INTERVAL '5 seconds'",
                             &[&artifact.host_id],
                         )
                         .await?
@@ -1100,7 +1131,8 @@ impl PostgresFleet {
                    AND replica.status = 'available'
                    AND replica.verified_at IS NOT NULL
                    AND host.healthy = TRUE
-                   AND host.last_heartbeat >= NOW() - INTERVAL '15 seconds'",
+                   AND host.last_heartbeat > statement_timestamp() - INTERVAL '15 seconds'
+                          AND host.last_heartbeat <= statement_timestamp() + INTERVAL '5 seconds'",
                 &[&replica.artifact_id, &replica.owner_key],
             )
             .await?;
@@ -1152,10 +1184,7 @@ impl PostgresFleet {
     /// Recompute logical readiness from replicas whose host heartbeat is both
     /// healthy and fresh. Durable rows on a dead node remain useful for repair
     /// diagnostics but cannot satisfy the active failure-domain policy.
-    pub async fn refresh_artifact_replication_health(
-        &self,
-        stale_before: DateTime<Utc>,
-    ) -> Result<u64, FleetError> {
+    pub async fn refresh_artifact_replication_health(&self) -> Result<u64, FleetError> {
         let client = self.pool.get().await?;
         let changed = client
             .execute(
@@ -1165,13 +1194,15 @@ impl PostgresFleet {
                             WHERE replica.status = 'available'
                               AND replica.verified_at IS NOT NULL
                               AND host.healthy = TRUE
-                              AND host.last_heartbeat >= $3
+                              AND host.last_heartbeat > statement_timestamp() - INTERVAL '15 seconds'
+                              AND host.last_heartbeat <= statement_timestamp() + INTERVAL '5 seconds'
                           ) AS available,
                           COUNT(DISTINCT replica.failure_domain) FILTER (
                             WHERE replica.status = 'available'
                               AND replica.verified_at IS NOT NULL
                               AND host.healthy = TRUE
-                              AND host.last_heartbeat >= $3
+                              AND host.last_heartbeat > statement_timestamp() - INTERVAL '15 seconds'
+                              AND host.last_heartbeat <= statement_timestamp() + INTERVAL '5 seconds'
                           ) AS failure_domains
                      FROM fleet_artifacts artifact
                      LEFT JOIN fleet_artifact_replicas replica
@@ -1198,7 +1229,6 @@ impl PostgresFleet {
                 &[
                     &u64_to_sql_i64(self.min_artifact_replicas)?,
                     &u64_to_sql_i64(self.min_artifact_failure_domains)?,
-                    &stale_before,
                 ],
             )
             .await?;
@@ -1246,7 +1276,8 @@ impl PostgresFleet {
             .query_opt(
                 "SELECT 1 FROM fleet_hosts
                   WHERE host_id = $1 AND boot_session_id = $2 AND healthy = TRUE
-                    AND last_heartbeat >= NOW() - INTERVAL '15 seconds'",
+                    AND last_heartbeat > statement_timestamp() - INTERVAL '15 seconds'
+                    AND last_heartbeat <= statement_timestamp() + INTERVAL '5 seconds'",
                 &[&host_id, &boot_session_id],
             )
             .await?
@@ -1288,7 +1319,8 @@ impl PostgresFleet {
                   WHERE replica.artifact_id = $1
                     AND replica.status = 'available' AND replica.verified_at IS NOT NULL
                     AND host.healthy = TRUE
-                    AND host.last_heartbeat >= NOW() - INTERVAL '15 seconds'",
+                    AND host.last_heartbeat > statement_timestamp() - INTERVAL '15 seconds'
+                          AND host.last_heartbeat <= statement_timestamp() + INTERVAL '5 seconds'",
                 &[&artifact_id, &failure_domain],
             )
             .await?;
@@ -3874,6 +3906,83 @@ mod tests {
         url
     }
 
+    #[test]
+    fn signed_heartbeat_window_accepts_small_future_skew_and_rejects_stale_rows() {
+        let now = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        for offset_ms in [-14_999, 0, 500, 5_000] {
+            assert!(host_heartbeat_is_fresh(
+                now + chrono::Duration::milliseconds(offset_ms),
+                now
+            ));
+        }
+        for offset_ms in [-15_000, -60_000, 5_001, 60_000] {
+            assert!(!host_heartbeat_is_fresh(
+                now + chrono::Duration::milliseconds(offset_ms),
+                now
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_heartbeat_uses_registry_clock_for_writes_reads_and_replica_health(
+    ) -> Result<(), FleetError> {
+        let Some(url) = postgres_test_database_url() else {
+            return Ok(());
+        };
+        let _database_guard = POSTGRES_TEST_LOCK.lock().await;
+        let fleet = PostgresFleet::connect_with_replication_policy(&url, 1, 1).await?;
+        let suffix = Uuid::new_v4();
+        let host_id = format!("clock-host-{suffix}");
+        let owner = format!("clock-owner-{suffix}");
+        let mut host = host_record_from_capacity(
+            &host_id,
+            Uuid::new_v4(),
+            None,
+            Some("https://clock.invalid".into()),
+            0,
+            8,
+            8192,
+        );
+        let artifact = test_artifact(&owner, &host_id, suffix);
+        let result = async {
+            for skew in [-24, 24] {
+                host.last_heartbeat = Utc::now() + chrono::Duration::hours(skew);
+                fleet.upsert_host(&host).await?;
+                let (now, stored) = fleet.get_host_with_clock(&host_id).await?.unwrap();
+                assert!(host_heartbeat_is_fresh(stored.last_heartbeat, now));
+                assert!((now - stored.last_heartbeat).num_milliseconds().abs() < 5_000);
+                let (list_now, hosts) = fleet.list_hosts_with_clock().await?;
+                let listed = hosts.iter().find(|h| h.host_id == host_id).unwrap();
+                assert!(host_heartbeat_is_fresh(listed.last_heartbeat, list_now));
+            }
+            fleet.insert_artifact(&artifact).await?;
+            assert_eq!(fleet.get_artifact(&owner, artifact.artifact_id).await?.replication_state, ArtifactReplicationState::Ready);
+            let client = fleet.pool.get().await?;
+            for offset in [-60_i64, 60] {
+                client.execute("UPDATE fleet_hosts SET last_heartbeat = statement_timestamp() + $2::BIGINT * INTERVAL '1 second' WHERE host_id = $1", &[&host_id, &offset]).await?;
+                let (now, stored) = fleet.get_host_with_clock(&host_id).await?.unwrap();
+                assert!(!host_heartbeat_is_fresh(stored.last_heartbeat, now));
+                fleet.refresh_artifact_replication_health().await?;
+                assert_eq!(fleet.get_artifact(&owner, artifact.artifact_id).await?.replication_state, ArtifactReplicationState::Pending);
+                fleet.upsert_host(&host).await?;
+                fleet.refresh_artifact_replication_health().await?;
+                assert_eq!(fleet.get_artifact(&owner, artifact.artifact_id).await?.replication_state, ArtifactReplicationState::Ready);
+            }
+            Ok::<(), FleetError>(())
+        }.await;
+        let client = fleet.pool.get().await?;
+        client
+            .execute(
+                "DELETE FROM fleet_artifacts WHERE artifact_id = $1",
+                &[&artifact.artifact_id],
+            )
+            .await?;
+        client
+            .execute("DELETE FROM fleet_hosts WHERE host_id = $1", &[&host_id])
+            .await?;
+        result
+    }
+
     #[tokio::test]
     async fn postgres_execution_retention_is_batched_terminal_only_and_ownership_is_immutable(
     ) -> Result<(), FleetError> {
@@ -4636,7 +4745,6 @@ mod tests {
                         vm_id,
                         &host_b,
                         session_b,
-                        Utc::now() - chrono::Duration::seconds(15),
                     )
                     .await,
                 Err(FleetError::Conflict(_))
@@ -4652,7 +4760,6 @@ mod tests {
                         vm_id,
                         &host_b,
                         session_b,
-                        Utc::now() - chrono::Duration::seconds(15),
                     )
                     .await,
                 Err(FleetError::NotFound)
@@ -4730,13 +4837,15 @@ mod tests {
             fleet
                 .release_artifact_repair_lease(first.artifact_id, &host_c, session_c, lease)
                 .await?;
+            client.execute("UPDATE fleet_hosts SET last_heartbeat = statement_timestamp() + INTERVAL '1 hour' WHERE host_id = $1", &[&host_b]).await?;
+            assert!(matches!(fleet.claim_hibernated_vm(&owner, vm_id, &host_b, session_b).await, Err(FleetError::Conflict(_))));
+            client.execute("UPDATE fleet_hosts SET last_heartbeat = statement_timestamp() WHERE host_id = $1", &[&host_b]).await?;
             let claimed = fleet
                 .claim_hibernated_vm(
                     &owner,
                     vm_id,
                     &host_b,
                     session_b,
-                    Utc::now() - chrono::Duration::seconds(15),
                 )
                 .await?;
             if claimed.host_id != host_b || claimed.status != VmStatus::Hibernated {
@@ -4751,7 +4860,6 @@ mod tests {
                         vm_id,
                         &host_b,
                         Uuid::new_v4(),
-                        Utc::now() - chrono::Duration::seconds(15),
                     )
                     .await,
                 Err(FleetError::Conflict(_))
@@ -4786,9 +4894,7 @@ mod tests {
                     8192,
                 ))
                 .await?;
-            fleet
-                .refresh_artifact_replication_health(Utc::now() - chrono::Duration::seconds(15))
-                .await?;
+            fleet.refresh_artifact_replication_health().await?;
             if fleet
                 .get_artifact(&owner, first.artifact_id)
                 .await?
