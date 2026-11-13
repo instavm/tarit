@@ -6,7 +6,6 @@
 //! cross-node placement when the local host is at capacity, and keeps the
 //! ownership map in sync. Single-host mode degrades to the local store.
 
-use std::time::Duration;
 use uuid::Uuid;
 
 use crate::api::AppState;
@@ -18,12 +17,6 @@ use std::{
     collections::HashMap,
     sync::{Mutex, OnceLock},
 };
-
-/// A host is a placement/routing candidate only if its heartbeat is fresher
-/// than this. 3x the 5s heartbeat interval tolerates a missed beat without
-/// flapping a node out of the cluster.
-const HOST_STALE_AFTER: Duration = Duration::from_secs(15);
-const HOST_FUTURE_SKEW: chrono::Duration = chrono::Duration::seconds(5);
 
 /// Where a VM lives relative to this node.
 pub enum Owner {
@@ -85,14 +78,14 @@ pub async fn resolve_owner(state: &AppState, id: Uuid) -> Result<Owner, OrchErro
         if host_id == state.config.host_id {
             return Ok(Owner::Local);
         }
-        let host = fleet
-            .get_host(&host_id)
+        let (now, host) = fleet
+            .get_host_with_clock(&host_id)
             .await
             .map_err(|error| OrchError::Internal(format!("fleet get_host: {error}")))?
             .ok_or_else(|| {
                 OrchError::Unavailable(format!("owner host {host_id} is not registered"))
             })?;
-        ensure_routable_host(&host, "VM owner")?;
+        ensure_routable_host(&host, now, "VM owner")?;
         let boot_session_id = host.boot_session_id.ok_or_else(|| {
             OrchError::Unavailable(format!("owner host {host_id} has no boot session"))
         })?;
@@ -149,11 +142,9 @@ pub async fn place_candidates(state: &AppState, vcpus: u8, mem_mib: u64) -> Vec<
     let Some(fleet) = state.fleet.as_ref() else {
         return Vec::new();
     };
-    let Ok(hosts) = fleet.list_hosts().await else {
+    let Ok((now, hosts)) = fleet.list_hosts_with_clock().await else {
         return Vec::new();
     };
-    let now = chrono::Utc::now();
-
     let mut candidates: Vec<_> = hosts
         .into_iter()
         .filter(|h| {
@@ -161,10 +152,7 @@ pub async fn place_candidates(state: &AppState, vcpus: u8, mem_mib: u64) -> Vec<
                 && h.healthy
                 && h.rpc_addr.is_some()
                 && h.boot_session_id.is_some()
-                && (now - h.last_heartbeat)
-                    .to_std()
-                    .map(|d| d < HOST_STALE_AFTER)
-                    .unwrap_or(false)
+                && tarit_fleet::host_heartbeat_is_fresh(h.last_heartbeat, now)
                 && h.free_vcpus >= vcpus as u64
                 && h.free_memory_mib >= mem_mib
         })
@@ -194,9 +182,9 @@ pub async fn peer_rpc(state: &AppState, host_id: &str) -> Result<Option<PeerTarg
     let Some(fleet) = state.fleet.as_ref() else {
         return Ok(None);
     };
-    match fleet.get_host(host_id).await {
-        Ok(Some(h)) => {
-            ensure_routable_host(&h, "snapshot owner")?;
+    match fleet.get_host_with_clock(host_id).await {
+        Ok(Some((now, h))) => {
+            ensure_routable_host(&h, now, "snapshot owner")?;
             let boot_session_id = h.boot_session_id.ok_or_else(|| {
                 OrchError::Unavailable(format!("snapshot owner host {host_id} has no boot session"))
             })?;
@@ -221,13 +209,12 @@ pub async fn peer_rpc(state: &AppState, host_id: &str) -> Result<Option<PeerTarg
     }
 }
 
-fn ensure_routable_host(host: &HostRecord, purpose: &str) -> Result<(), OrchError> {
-    let age = chrono::Utc::now() - host.last_heartbeat;
-    // Compare signed durations: converting a slightly-future (negative) age
-    // through to_std() fails and would reject healthy owners on any skew.
-    let stale_after = chrono::Duration::from_std(HOST_STALE_AFTER)
-        .expect("stale-after constant fits chrono range");
-    let fresh = age >= -HOST_FUTURE_SKEW && age < stale_after;
+fn ensure_routable_host(
+    host: &HostRecord,
+    now: chrono::DateTime<chrono::Utc>,
+    purpose: &str,
+) -> Result<(), OrchError> {
+    let fresh = tarit_fleet::host_heartbeat_is_fresh(host.last_heartbeat, now);
     if !host.healthy || !fresh {
         return Err(OrchError::Unavailable(format!(
             "{purpose} host {} is unhealthy or its heartbeat is stale",
@@ -295,21 +282,30 @@ mod tests {
 
     #[test]
     fn routing_rejects_stale_unhealthy_and_far_future_hosts() {
-        assert!(ensure_routable_host(&host(chrono::Utc::now(), true), "owner").is_ok());
+        assert!(
+            ensure_routable_host(&host(chrono::Utc::now(), true), chrono::Utc::now(), "owner")
+                .is_ok()
+        );
         assert!(matches!(
             ensure_routable_host(
                 &host(chrono::Utc::now() - chrono::Duration::seconds(16), true),
+                chrono::Utc::now(),
                 "owner",
             ),
             Err(OrchError::Unavailable(_))
         ));
         assert!(matches!(
-            ensure_routable_host(&host(chrono::Utc::now(), false), "owner"),
+            ensure_routable_host(
+                &host(chrono::Utc::now(), false),
+                chrono::Utc::now(),
+                "owner"
+            ),
             Err(OrchError::Unavailable(_))
         ));
         assert!(matches!(
             ensure_routable_host(
                 &host(chrono::Utc::now() + chrono::Duration::seconds(6), true),
+                chrono::Utc::now(),
                 "owner",
             ),
             Err(OrchError::Unavailable(_))

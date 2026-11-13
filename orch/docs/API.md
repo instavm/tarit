@@ -500,9 +500,13 @@ support snapshots), `500`.
 
 ### `GET /v1/snapshots`
 
-List the caller's snapshots held by this node, oldest first. Snapshots owned
+List the caller's snapshots, oldest first. Snapshots owned
 by a fork or used as a hibernated VM's wake image are managed by that VM and
 are not listed.
+
+Snapshots are always scoped to the caller's own tenant, for `admin` keys too:
+unlike VMs and shares, an admin key cannot list another tenant's snapshots
+(owner decision, 2026-11-13).
 
 Response `200`:
 
@@ -519,7 +523,22 @@ Response `200`:
 ]
 ```
 
-Status codes: `200`, `401`.
+In cluster mode the list covers every node that holds one of the caller's
+snapshots. A node that cannot answer (down, unhealthy, stale, deregistered, or
+running a version without the peer snapshot route) does not fail the request:
+the response is still `200` with the snapshots every other node returned, and
+carries the header `X-Tarit-Unavailable-Hosts: <n>`, the number of nodes holding
+some of the caller's snapshots that could not be asked. The header is absent
+when the list is complete, so a client that needs the full list should retry
+while it is present. It counts only nodes that hold the caller's own snapshots,
+and node ids are not exposed (the server log names them). The body stays a
+plain array so existing clients keep working.
+A node that is retired for good (its `fleet_hosts` row removed) is not
+counted: its snapshot locators are dropped within about a minute, see
+[AUTOSCALING.md](AUTOSCALING.md#drain-and-scale-in-safety).
+
+Status codes: `200` (complete, or partial with `X-Tarit-Unavailable-Hosts`),
+`401`, `503` (fleet store unavailable).
 
 ### `DELETE /v1/snapshots/{id}`
 
@@ -528,6 +547,9 @@ that checkpoints often should delete the ones it no longer needs; otherwise
 the node eventually reaches disk pressure and refuses new snapshots with `429`.
 A snapshot that a branch head references, a hibernated VM would wake from, or
 a fork owns is refused. Delete the branch first to release a branch head.
+
+Like listing, deletion is scoped to the caller's own tenant for `admin` keys
+too. Another tenant's snapshot answers exactly like one that does not exist.
 
 Status codes: `204`, `401`, `404` (unknown, or another tenant's), `409`
 (still referenced), `422` (held by another node), `503` (fleet store

@@ -57,8 +57,6 @@ const MAX_PEER_SOURCE_LEN: usize = 128;
 const MAX_TRACKED_NONCES_PER_SOURCE: usize = 65_536;
 const MAX_TRACKED_NONCES_TOTAL: usize = 262_144;
 const MAX_TRACKED_PEER_SOURCES: usize = 1_024;
-const MAX_PEER_SOURCE_HEARTBEAT_AGE_SECS: i64 = 15;
-const MAX_PEER_SOURCE_FUTURE_SKEW_SECS: i64 = 5;
 static USED_PEER_IDENTITY_NONCES: OnceLock<Mutex<ReplayCache>> = OnceLock::new();
 static USED_PEER_REQUEST_NONCES: OnceLock<Mutex<ReplayCache>> = OnceLock::new();
 
@@ -135,6 +133,11 @@ pub fn internal_router(state: AppState) -> Router {
     let max_body_bytes = state.config.api_max_body_bytes;
     Router::new()
         .route("/internal/v1/vms", post(internal_create))
+        .route("/internal/v1/snapshots", get(internal_list_snapshots))
+        .route(
+            "/internal/v1/snapshots/{id}",
+            axum::routing::delete(internal_delete_snapshot),
+        )
         .route("/internal/v1/restore", post(internal_restore))
         .route("/internal/v1/restore-memory-target", post(internal_restore))
         .route(
@@ -599,15 +602,25 @@ async fn verify_peer_request(
     }
     mac.verify_slice(&signature).ok()?;
     if let Some(fleet) = state.fleet.as_ref() {
-        let current_source = fleet.get_host(&source).await.ok().flatten()?;
-        let connection_certificate = request.extensions().get::<VerifiedPeerCertificate>()?;
-        if !current_peer_source(
-            &current_source,
-            &source,
-            source_session,
-            &connection_certificate.0,
-            Utc::now(),
-        ) {
+        let (registry_now, current_source) =
+            fleet.get_host_with_clock(&source).await.ok().flatten()?;
+        let authenticated = match request.extensions().get::<VerifiedPeerCertificate>() {
+            Some(certificate) => current_peer_source(
+                &current_source,
+                &source,
+                source_session,
+                &certificate.0,
+                registry_now,
+            ),
+            // The dedicated listener is plaintext only in this explicitly
+            // configured development mode. Production configuration requires
+            // TLS, and combining this flag with TLS is rejected at startup.
+            None if state.config.allow_insecure_peer_http && state.config.peer_tls.is_none() => {
+                current_peer_source_session(&current_source, &source, source_session, registry_now)
+            }
+            None => false,
+        };
+        if !authenticated {
             return None;
         }
     }
@@ -623,13 +636,20 @@ fn current_peer_source(
     peer_certificate_sha256: &str,
     now: chrono::DateTime<Utc>,
 ) -> bool {
-    let age = now - host.last_heartbeat;
+    host.peer_certificate_sha256.as_deref() == Some(peer_certificate_sha256)
+        && current_peer_source_session(host, source, session, now)
+}
+
+fn current_peer_source_session(
+    host: &HostRecord,
+    source: &str,
+    session: Uuid,
+    now: chrono::DateTime<Utc>,
+) -> bool {
     host.host_id == source
         && host.boot_session_id == Some(session)
-        && host.peer_certificate_sha256.as_deref() == Some(peer_certificate_sha256)
         && host.healthy
-        && age <= chrono::Duration::seconds(MAX_PEER_SOURCE_HEARTBEAT_AGE_SECS)
-        && age >= -chrono::Duration::seconds(MAX_PEER_SOURCE_FUTURE_SKEW_SECS)
+        && tarit_fleet::host_heartbeat_is_fresh(host.last_heartbeat, now)
 }
 
 async fn internal_share_proxy_root(
@@ -1096,6 +1116,26 @@ async fn internal_egress(
     Ok(Json(serde_json::json!({ "rules_applied": rules })))
 }
 
+async fn internal_list_snapshots(
+    State(state): State<AppState>,
+    identity: Option<Extension<ApiIdentity>>,
+) -> Result<Json<Vec<crate::api::PublicSnapshot>>, ApiError> {
+    let identity = require_peer_identity(identity.as_ref().map(|identity| &identity.0))?;
+    Ok(Json(crate::api::public_snapshots_local(&state, identity)?))
+}
+
+async fn internal_delete_snapshot(
+    State(state): State<AppState>,
+    identity: Option<Extension<ApiIdentity>>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    let identity = require_peer_identity(identity.as_ref().map(|identity| &identity.0))?;
+    // Admins are scoped to their own tenant here too (owner decision,
+    // 2026-11-13); a foreign snapshot answers exactly like a missing one.
+    ops::delete_snapshot_local(&state, Some(identity.tenant.as_str()), id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn internal_get_egress_policy(
     State(state): State<AppState>,
     identity: Option<Extension<ApiIdentity>>,
@@ -1140,6 +1180,167 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use tarit_types::VmStatus;
+
+    fn signed_test_request(
+        state: &AppState,
+        source: &str,
+        session: Uuid,
+        nonce: Uuid,
+    ) -> Request<Body> {
+        let path = "/internal/v1/vms/00000000-0000-0000-0000-000000000000";
+        let payload_hash = URL_SAFE_NO_PAD.encode(Sha256::digest(b""));
+        let timestamp = Utc::now().timestamp().to_string();
+        let session = session.to_string();
+        let target_session = state.config.host_session_id.to_string();
+        let nonce = nonce.to_string();
+        let mut mac = Hmac::<Sha256>::new_from_slice(state.config.peer_secret.as_bytes()).unwrap();
+        for value in [
+            REQUEST_SIGNATURE_VERSION,
+            "GET",
+            path,
+            &payload_hash,
+            &timestamp,
+            &nonce,
+            source,
+            &state.config.host_id,
+            &session,
+            &target_session,
+            "",
+        ] {
+            mac.update(value.as_bytes());
+            mac.update(b"\n");
+        }
+        let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+        Request::builder()
+            .uri(path)
+            .header("X-Tarit-Peer-Version", REQUEST_SIGNATURE_VERSION)
+            .header("X-Tarit-Peer-Source", source)
+            .header("X-Tarit-Peer-Target", &state.config.host_id)
+            .header("X-Tarit-Peer-Source-Session", session)
+            .header("X-Tarit-Peer-Target-Session", target_session)
+            .header("X-Tarit-Peer-Timestamp", timestamp)
+            .header("X-Tarit-Peer-Nonce", nonce)
+            .header("X-Tarit-Peer-Body-SHA256", payload_hash)
+            .header("X-Tarit-Peer-Signature", signature)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[test]
+    fn explicit_http_fleet_auth_preserves_signatures_sessions_replay_and_tls_defaults() {
+        let url = std::env::var("TARIT_TEST_DATABASE_URL")
+            .ok()
+            .filter(|s| !s.is_empty());
+        assert!(
+            url.is_some() || std::env::var("TARIT_REQUIRE_TEST_DATABASE").as_deref() != Ok("1"),
+            "TARIT_TEST_DATABASE_URL is required for PostgreSQL regressions"
+        );
+        let Some(url) = url else {
+            return;
+        };
+        let _guard = crate::api::tests::API_POSTGRES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut state = crate::api::tests::test_state();
+        state.config.allow_insecure_peer_http = true;
+        state.config.peer_tls = None;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let fleet =
+                std::sync::Arc::new(tarit_fleet::PostgresFleet::connect(&url).await.unwrap());
+            state.fleet = Some(fleet.clone());
+            let source = format!("http-auth-test-{}", Uuid::new_v4());
+            let session = Uuid::new_v4();
+            let mut host = tarit_fleet::host_record_from_capacity(
+                &source,
+                session,
+                None,
+                Some("http://127.0.0.1:1".into()),
+                0,
+                4,
+                4096,
+            );
+            fleet.upsert_host(&host).await.unwrap();
+            let nonce = Uuid::new_v4();
+            assert!(verify_peer_request(
+                signed_test_request(&state, &source, session, nonce),
+                &state
+            )
+            .await
+            .is_some());
+            assert!(
+                verify_peer_request(signed_test_request(&state, &source, session, nonce), &state)
+                    .await
+                    .is_none(),
+                "request replay is still rejected"
+            );
+            assert!(
+                verify_peer_request(
+                    signed_test_request(&state, &source, Uuid::new_v4(), Uuid::new_v4()),
+                    &state
+                )
+                .await
+                .is_none(),
+                "old process cannot use current host registration"
+            );
+            let mut tampered = signed_test_request(&state, &source, session, Uuid::new_v4());
+            *tampered.body_mut() = Body::from("tampered");
+            assert!(verify_peer_request(tampered, &state).await.is_none());
+            let mut unsigned = signed_test_request(&state, &source, session, Uuid::new_v4());
+            unsigned.headers_mut().remove("X-Tarit-Peer-Signature");
+            assert!(verify_peer_request(unsigned, &state).await.is_none());
+            state.config.allow_insecure_peer_http = false;
+            assert!(
+                verify_peer_request(
+                    signed_test_request(&state, &source, session, Uuid::new_v4()),
+                    &state
+                )
+                .await
+                .is_none(),
+                "default mode requires connection certificate"
+            );
+            state.config.allow_insecure_peer_http = true;
+            state.config.peer_tls = Some(crate::config::PeerTlsConfig {
+                certificate_chain: "unused.pem".into(),
+                private_key: "unused-key.pem".into(),
+                client_ca_bundle: "unused-ca.pem".into(),
+            });
+            assert!(
+                verify_peer_request(
+                    signed_test_request(&state, &source, session, Uuid::new_v4()),
+                    &state
+                )
+                .await
+                .is_none(),
+                "TLS configuration never falls back to plaintext"
+            );
+            state.config.peer_tls = None;
+            host.peer_certificate_sha256 = Some("certificate-a".into());
+            fleet.upsert_host(&host).await.unwrap();
+            let mut bad_certificate = signed_test_request(&state, &source, session, Uuid::new_v4());
+            bad_certificate
+                .extensions_mut()
+                .insert(VerifiedPeerCertificate("certificate-b".into()));
+            assert!(
+                verify_peer_request(bad_certificate, &state).await.is_none(),
+                "present certificate must match even in development mode"
+            );
+            host.healthy = false;
+            fleet.upsert_host(&host).await.unwrap();
+            assert!(
+                verify_peer_request(
+                    signed_test_request(&state, &source, session, Uuid::new_v4()),
+                    &state
+                )
+                .await
+                .is_none(),
+                "unhealthy registration remains fenced"
+            );
+        });
+    }
 
     #[test]
     fn signed_peer_requests_use_global_admission_and_reject_tampering() {
@@ -1230,6 +1431,115 @@ mod tests {
                 StatusCode::UNAUTHORIZED
             );
         });
+    }
+
+    #[test]
+    fn snapshot_peer_handlers_require_identity_and_enforce_tenant_visibility() {
+        let state = crate::api::tests::test_state();
+        let snapshot = crate::api::tests::snapshot_fixture(&state, "tenant-a", true);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let owner = state.config.api_keys.resolve("tenant-a-key").unwrap();
+        let foreign = state.config.api_keys.resolve("tenant-b-key").unwrap();
+        let admin = state.config.api_keys.resolve("admin-key").unwrap();
+        runtime.block_on(async {
+            // An admin identity forwarded to the owner is scoped to its own
+            // tenant like any other (owner decision, 2026-11-13), and a
+            // foreign snapshot answers exactly like a missing one.
+            assert!(
+                internal_list_snapshots(State(state.clone()), Some(Extension(admin.clone())))
+                    .await
+                    .unwrap_or_else(|error| panic!("{}", error.0))
+                    .0
+                    .is_empty()
+            );
+            let delete_as_admin = |id| {
+                let state = state.clone();
+                let admin = admin.clone();
+                async move {
+                    crate::api::tests::snapshot_error_response(
+                        internal_delete_snapshot(State(state), Some(Extension(admin)), Path(id))
+                            .await
+                            .err()
+                            .unwrap(),
+                    )
+                    .await
+                }
+            };
+            let missing_id = Uuid::new_v4();
+            let missing = delete_as_admin(missing_id).await;
+            assert_eq!(missing.0, StatusCode::NOT_FOUND);
+            let foreign_as_admin = delete_as_admin(snapshot.snapshot_id).await;
+            assert_eq!(foreign_as_admin.0, missing.0);
+            assert_eq!(
+                foreign_as_admin.1,
+                missing
+                    .1
+                    .replace(&missing_id.to_string(), &snapshot.snapshot_id.to_string()),
+                "the requested id is echoed, nothing else differs"
+            );
+            assert_eq!(
+                internal_list_snapshots(State(state.clone()), None)
+                    .await
+                    .err()
+                    .unwrap()
+                    .into_response()
+                    .status(),
+                StatusCode::UNAUTHORIZED
+            );
+            assert_eq!(
+                internal_delete_snapshot(State(state.clone()), None, Path(snapshot.snapshot_id))
+                    .await
+                    .err()
+                    .unwrap()
+                    .into_response()
+                    .status(),
+                StatusCode::UNAUTHORIZED
+            );
+            assert!(internal_list_snapshots(
+                State(state.clone()),
+                Some(Extension(foreign.clone()))
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{}", error.0))
+            .0
+            .is_empty());
+            assert_eq!(
+                internal_delete_snapshot(
+                    State(state.clone()),
+                    Some(Extension(foreign)),
+                    Path(snapshot.snapshot_id)
+                )
+                .await
+                .err()
+                .unwrap()
+                .into_response()
+                .status(),
+                StatusCode::NOT_FOUND
+            );
+            assert_eq!(
+                internal_delete_snapshot(
+                    State(state.clone()),
+                    Some(Extension(owner)),
+                    Path(snapshot.snapshot_id)
+                )
+                .await
+                .err()
+                .unwrap()
+                .into_response()
+                .status(),
+                StatusCode::CONFLICT
+            );
+        });
+        assert!(state
+            .store
+            .lock()
+            .unwrap()
+            .get_snapshot_by_id(snapshot.snapshot_id)
+            .unwrap()
+            .is_some());
     }
 
     #[test]
