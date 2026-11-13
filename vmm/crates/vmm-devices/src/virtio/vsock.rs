@@ -802,17 +802,33 @@ impl VirtioVsockMmio {
                         return None;
                     }
                 };
-                let packet = match packet {
+                let mut packet = match packet {
                     Some(packet) => packet,
                     None => return None,
                 };
-                let bytes = packet.to_bytes();
                 let Some(cap) = writable
                     .iter()
                     .try_fold(0usize, |acc, (_, len)| acc.checked_add(*len as usize))
                 else {
                     return Some(0);
                 };
+                // Linux posts receive buffers that include the transport header,
+                // and may be smaller than one host read. Stream RW payloads can
+                // span packets: retain the tail at the queue head until delivered.
+                let payload_len = if packet.header.op == op::RW && !packet.data.is_empty() {
+                    if cap <= VSOCK_HEADER_LEN {
+                        return Some(0);
+                    }
+                    packet.data.len().min(cap - VSOCK_HEADER_LEN)
+                } else {
+                    packet.data.len()
+                };
+                // `packet` is already this closure's own copy of the queue head,
+                // so truncate it in place rather than cloning it again.
+                let full_len = packet.data.len();
+                packet.data.truncate(payload_len);
+                packet.header.len = payload_len as u32;
+                let bytes = packet.to_bytes();
                 if cap < bytes.len() {
                     return Some(0);
                 }
@@ -821,7 +837,14 @@ impl VirtioVsockMmio {
                 }
                 match self.try_lock_state(&self.pending_rx, "pending_rx") {
                     Ok(mut pending) => {
-                        pending.pop_front();
+                        if payload_len < full_len {
+                            if let Some(remainder) = pending.front_mut() {
+                                remainder.data.drain(..payload_len);
+                                remainder.header.len = remainder.data.len() as u32;
+                            }
+                        } else {
+                            pending.pop_front();
+                        }
                     }
                     Err(_) => {
                         processing_failed = true;
@@ -830,7 +853,7 @@ impl VirtioVsockMmio {
                 }
                 self.rx_packets.fetch_add(1, Ordering::Relaxed);
                 self.rx_bytes
-                    .fetch_add(packet.data.len() as u64, Ordering::Relaxed);
+                    .fetch_add(payload_len as u64, Ordering::Relaxed);
                 Some(bytes.len() as u32)
             });
 
@@ -2038,6 +2061,58 @@ mod tests {
             assert_eq!(restored.mmio_read(reg::QUEUE_READY, 4).unwrap(), 1);
             assert_eq!(restored.mmio_read(reg::QUEUE_NUM, 4).unwrap(), size);
         }
+    }
+
+    #[test]
+    fn rx_splits_stream_payload_to_guest_capacity_without_losing_tail_or_order() {
+        let mem = new_mem();
+        let dev = VirtioVsockMmio::new(7, GUEST_CID);
+        let bufs = setup_queues(&dev, &mem, 4);
+        // Model Linux's sub-page RX buffers, including the 44-byte header.
+        for (i, buf) in bufs.iter().enumerate() {
+            mem.write_obj(
+                Descriptor {
+                    addr: *buf,
+                    len: 3000,
+                    flags: desc_flags::WRITE,
+                    next: 0,
+                },
+                GuestAddress(RX_DESC + i as u64 * std::mem::size_of::<Descriptor>() as u64),
+            )
+            .unwrap();
+        }
+        let key = ConnectionKey {
+            guest_cid: GUEST_CID,
+            guest_port: GUEST_PORT,
+            host_port: SERVICE_PORT,
+        };
+        let data: Vec<u8> = (0..8192).map(|i| i as u8).collect();
+        dev.enqueue_rx(host_packet(key, op::RW, 0, data.clone(), 123))
+            .unwrap();
+        dev.enqueue_rx(host_packet(key, op::CREDIT_UPDATE, 0, Vec::new(), 456))
+            .unwrap();
+        mem.write_obj(1u16, GuestAddress(RX_AVAIL + 2)).unwrap();
+        assert_eq!(dev.process_rx_queue().unwrap(), 1);
+        assert_eq!(
+            dev.pending_rx.lock().unwrap().front().unwrap().data.len(),
+            8192 - (3000 - VSOCK_HEADER_LEN)
+        );
+        mem.write_obj(4u16, GuestAddress(RX_AVAIL + 2)).unwrap();
+        assert_eq!(dev.process_rx_queue().unwrap(), 3);
+        let mut received = Vec::new();
+        for buf in &bufs[..3] {
+            let packet = read_rx_packet(&mem, *buf);
+            assert_eq!(packet.header.op, op::RW);
+            assert_eq!(packet.header.fwd_cnt, 123);
+            assert!(packet.data.len() <= 3000 - VSOCK_HEADER_LEN);
+            received.extend(packet.data);
+        }
+        assert_eq!(received, data);
+        let credit = read_rx_packet(&mem, bufs[3]);
+        assert_eq!(credit.header.op, op::CREDIT_UPDATE);
+        assert_eq!(credit.header.fwd_cnt, 456);
+        assert!(dev.pending_rx.lock().unwrap().is_empty());
+        assert_eq!(dev.rx_bytes.load(Ordering::Relaxed), 8192);
     }
 
     #[test]

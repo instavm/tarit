@@ -31,6 +31,7 @@
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <sys/vfs.h>
+#include "worker-supervisor.h"
 #endif
 
 #define EXEC_PREFIX "VMM_EXEC:"
@@ -517,14 +518,6 @@ static void setup_as_init(void) {
     }
 }
 #endif
-
-/* Reap any orphaned children we inherited as PID 1, without blocking. Called
- * between commands; the synchronous exec child is already waited for in
- * run_command, so this only collects double-forked strays. */
-static void reap_orphans(void) {
-    while (waitpid(-1, NULL, WNOHANG) > 0) {
-    }
-}
 
 static void make_raw(int fd) {
     struct termios tio;
@@ -2210,39 +2203,10 @@ static void serve_vsock_forever(void) {
 }
 #endif
 
-int main(void) {
-    signal(SIGPIPE, SIG_IGN);
-
-    /* When the kernel execs us directly as PID 1 (init=/usr/sbin/vmm-agent on
-     * an OCI-derived rootfs with no init system), bring up the pseudo-fs a real
-     * init would before touching /dev. When started as a systemd service on a
-     * distro rootfs we are not PID 1 and skip all of this. */
-    bool is_init = (getpid() == 1);
-    if (is_init) {
-        setup_as_init();
-        configure_boot_dns();
-    }
-
-#ifdef __linux__
-    /* Fork a dedicated vsock exec server; the parent keeps serving serial as a
-     * fallback. The host uses whichever channel it opened, so only one runs a
-     * given command. Fork a second vsock server for host-initiated PTY sessions
-     * on privileged port 1022, so interactive shells never affect exec/serial fallback. */
-    pid_t vsock_pid = fork();
-    if (vsock_pid == 0) {
-        serve_vsock_forever();
-        _exit(0);
-    }
-    pid_t pty_pid = fork();
-    if (pty_pid == 0) {
-        serve_pty_forever();
-        _exit(0);
-    }
-#endif
-
+static void serve_serial_forever(void) {
     int serial_fd = open_serial();
     if (serial_fd < 0) {
-        return 1;
+        return;
     }
 
     /* Readiness banner: lets the host know the agent is up and listening
@@ -2252,19 +2216,6 @@ int main(void) {
 
     char line[LINE_MAX_LEN];
     for (;;) {
-        if (is_init) {
-            reap_orphans();
-            /* Commands the host abandons leave orphans for init to reap, and
-             * commands mostly arrive over vsock, so wake at least once a
-             * second even while the serial line is idle. */
-            struct pollfd serial_pfd;
-            serial_pfd.fd = serial_fd;
-            serial_pfd.events = POLLIN;
-            serial_pfd.revents = 0;
-            if (poll(&serial_pfd, 1, 1000) == 0) {
-                continue;
-            }
-        }
         int rc = read_line(serial_fd, line, sizeof(line));
         if (rc < 0) {
             close(serial_fd);
@@ -2286,4 +2237,91 @@ int main(void) {
             run_guest_network_repair(serial_fd, line + REPAIR_NET_PREFIX_LEN);
         }
     }
+}
+
+#ifdef __linux__
+static uint64_t monotonic_ms(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) < 0) {
+        /* Continuing with a broken clock would remove the restart bound. */
+        _exit(1);
+    }
+    return (uint64_t)now.tv_sec * 1000U + (uint64_t)now.tv_nsec / 1000000U;
+}
+
+static int supervise_workers(bool is_init) {
+    struct agent_worker workers[] = {
+        {.name = "vsock exec", .serve = serve_vsock_forever},
+        {.name = "vsock PTY", .serve = serve_pty_forever},
+        {.name = "serial", .serve = serve_serial_forever},
+    };
+    const size_t count = sizeof(workers) / sizeof(workers[0]);
+    /* Sleep until a worker exits, an adopted orphan needs reaping, a restart
+     * falls due or (not as PID 1) we are told to stop. Blocking these signals
+     * first means none can arrive between the reap and the wait unseen. */
+    sigset_t wait_set;
+    sigset_t child_mask;
+    worker_wait_signals(&wait_set, is_init);
+    if (sigprocmask(SIG_BLOCK, &wait_set, &child_mask) < 0) {
+        return 1;
+    }
+    for (;;) {
+        uint64_t now = monotonic_ms();
+        int status;
+        pid_t pid;
+        while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+            if (worker_reaped(workers, count, pid, now)) {
+                fprintf(stderr, "vmm-agent: service worker %ld exited (status %d); restarting with backoff\n",
+                        (long)pid, status);
+            }
+        }
+        for (size_t i = 0; i < count; ++i) {
+            if (worker_start(&workers[i], now, fork, &child_mask) < 0) {
+                fprintf(stderr, "vmm-agent: fork %s: %s; retrying with backoff\n",
+                        workers[i].name, strerror(errno));
+            }
+        }
+        int64_t wait_ms = worker_next_wait_ms(workers, count, monotonic_ms());
+        int sig;
+        if (wait_ms < 0) {
+            sig = sigwaitinfo(&wait_set, NULL);
+        } else {
+            struct timespec timeout;
+            timeout.tv_sec = (time_t)(wait_ms / 1000);
+            timeout.tv_nsec = (long)(wait_ms % 1000) * 1000000L;
+            sig = sigtimedwait(&wait_set, NULL, &timeout);
+        }
+        if (sig == SIGTERM || sig == SIGINT) {
+            break;
+        }
+    }
+    /* Termination is bounded even if a worker is stuck serving a command.
+     * PID 1 also keeps reaping adopted command/session orphans while running. */
+    for (size_t i = 0; i < count; ++i) {
+        if (workers[i].pid > 0) (void)kill(workers[i].pid, SIGTERM);
+    }
+    sleep_us(100000U);
+    for (size_t i = 0; i < count; ++i) {
+        if (workers[i].pid > 0) {
+            (void)kill(workers[i].pid, SIGKILL);
+            while (waitpid(workers[i].pid, NULL, 0) < 0 && errno == EINTR) {}
+        }
+    }
+    return 0;
+}
+#endif
+
+int main(void) {
+    signal(SIGPIPE, SIG_IGN);
+    bool is_init = (getpid() == 1);
+    if (is_init) {
+        setup_as_init();
+        configure_boot_dns();
+    }
+#ifdef __linux__
+    return supervise_workers(is_init);
+#else
+    serve_serial_forever();
+    return 1;
+#endif
 }
