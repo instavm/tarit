@@ -22,9 +22,24 @@ const GUEST_RAM_DIR: &str = "/run/livesnap";
 /// making a cold boot seconds instead of tens of ms). Those two gates are only
 /// enforced when `VMM_PERF_STRICT=1` (i.e. on a bare-metal CI runner); on a
 /// nested dev/test host they are reported as informational. Hardware-cost-
-/// independent gates (snapshot/restore/memory) are always enforced.
+/// independent gates (snapshot/restore/memory) are always enforced; the snapshot
+/// ceiling can be set per runner with `VMM_PERF_SNAPSHOT_P50_GATE_MS`.
 fn perf_strict() -> bool {
     std::env::var("VMM_PERF_STRICT").is_ok()
+}
+
+/// A perf ceiling in milliseconds: `default` unless the environment names
+/// another one. The snapshot gate writes guest memory to `TMPDIR`, so its
+/// latency follows the host's storage as much as the VMM; a runner whose
+/// storage is slower than the default assumes sets its own ceiling
+/// explicitly rather than the default being raised for everyone.
+fn perf_gate_ms(name: &str, default: u128) -> u128 {
+    match std::env::var(name) {
+        Ok(raw) => raw.parse().unwrap_or_else(|_| {
+            panic!("{name} must be a whole number of milliseconds, got {raw:?}")
+        }),
+        Err(_) => default,
+    }
 }
 
 fn retain_snapshot(controller: &VmmController, path: &str) {
@@ -825,18 +840,21 @@ fn perf_gates_comprehensive() {
     // Boot and restore include a successful guest command. Snapshot measures
     // only the state capture itself.
     const BOOT_GATE_MS: u128 = 5_000;
-    const SNAP_GATE_MS: u128 = 200; // bare-metal <30ms; nested ~73ms.
+    // bare-metal <30ms; nested ~73ms. Measured 2026-11-13 on 4-vCPU Azure
+    // v6 hosts (nested), by where TMPDIR lives: tmpfs 85ms, local NVMe
+    // (D4ds_v6) 196-218ms, Premium SSD P10 283ms, Standard SSD 589ms.
+    let snap_gate_ms = perf_gate_ms("VMM_PERF_SNAPSHOT_P50_GATE_MS", 200);
     const RESTORE_GATE_MS: u128 = 5_000;
 
     eprintln!("=== PERF GATES ===");
     eprintln!("Cold boot p50: {boot_p50}ms (gate <{BOOT_GATE_MS}ms)");
     eprintln!("Cold boot p99: {boot_p99}ms");
-    eprintln!("Snapshot p50: {snap_p50}ms (gate <{SNAP_GATE_MS}ms)");
+    eprintln!("Snapshot p50: {snap_p50}ms (gate <{snap_gate_ms}ms)");
     eprintln!("Restore-to-exec p50: {restore_p50}ms (gate <{RESTORE_GATE_MS}ms)");
 
     assert!(
-        snap_p50 < SNAP_GATE_MS,
-        "snapshot p50 {snap_p50}ms exceeds {SNAP_GATE_MS}ms gate"
+        snap_p50 < snap_gate_ms,
+        "snapshot p50 {snap_p50}ms exceeds {snap_gate_ms}ms gate"
     );
     assert!(
         restore_p50 < RESTORE_GATE_MS,
