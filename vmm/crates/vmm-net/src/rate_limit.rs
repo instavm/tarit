@@ -1,4 +1,5 @@
-//! Token-bucket rate limiter — used on both net (tap) and block (IOPS/BW).
+//! Standalone token-bucket limiter. Active device data paths currently use
+//! `vmm-devices::rate_limit`, not this exported scaffold.
 //!
 //! A token-bucket rate limiter on IOPS/bandwidth per device,
 //! configured per microVM.
@@ -18,6 +19,10 @@ pub struct TokenBucket {
     pub tokens: u64,
     /// Last refill timestamp (nanos since some epoch).
     pub last_refill_ns: u64,
+    /// Fractional token credit, in billionths of a token. Missing remainder
+    /// fields in legacy map-based encodings default to zero credit.
+    #[serde(default)]
+    refill_remainder: u64,
 }
 
 impl TokenBucket {
@@ -27,6 +32,7 @@ impl TokenBucket {
             refill_per_sec,
             tokens: capacity,
             last_refill_ns: 0,
+            refill_remainder: 0,
         }
     }
 
@@ -40,8 +46,18 @@ impl TokenBucket {
             return;
         }
         let elapsed_ns = now_ns - self.last_refill_ns;
-        let added = (elapsed_ns as u128 * self.refill_per_sec as u128 / 1_000_000_000) as u64;
-        self.tokens = self.tokens.saturating_add(added).min(self.capacity);
+        // Keep fractional credit across calls, including unsuccessful consume
+        // attempts. Narrow only after capping: a large elapsed/rate product can
+        // otherwise wrap the u64 token count before the capacity check.
+        let credit =
+            elapsed_ns as u128 * self.refill_per_sec as u128 + self.refill_remainder as u128;
+        let tokens = self.tokens as u128 + credit / 1_000_000_000;
+        self.tokens = tokens.min(self.capacity as u128) as u64;
+        self.refill_remainder = if tokens >= self.capacity as u128 {
+            0 // A full bucket cannot bank credit beyond its burst capacity.
+        } else {
+            (credit % 1_000_000_000) as u64
+        };
         self.last_refill_ns = now_ns;
     }
 
@@ -82,6 +98,49 @@ mod tests {
         let mut b = TokenBucket::new(100, 0);
         b.tokens = 0;
         assert!(!b.consume(1, 1_000_000_000));
+    }
+
+    #[test]
+    fn frequent_failed_consumes_preserve_fractional_refill() {
+        let mut bucket = TokenBucket::new(100, 3);
+        assert!(bucket.consume(100, 0));
+        let mut consumed = 0;
+        for now in 1..=1000 {
+            if bucket.consume(1, now * 10_000_000) {
+                consumed += 1;
+            }
+        }
+        assert_eq!(consumed, 30, "polling must not erase fractional tokens");
+    }
+
+    #[test]
+    fn fractional_credit_survives_serialization_and_old_buckets_default_to_zero() {
+        let mut bucket = TokenBucket::new(1, 1);
+        assert!(bucket.consume(1, 0));
+        assert!(!bucket.consume(1, 600_000_000));
+        let encoded = serde_json::to_string(&bucket).unwrap();
+        let mut restored: TokenBucket = serde_json::from_str(&encoded).unwrap();
+        assert!(restored.consume(1, 1_000_000_000));
+        let mut legacy: TokenBucket = serde_json::from_str(
+            r#"{"capacity":1,"refill_per_sec":1,"tokens":0,"last_refill_ns":0}"#,
+        )
+        .unwrap();
+        assert!(legacy.consume(1, 1_000_000_000));
+    }
+
+    #[test]
+    fn full_bucket_discards_excess_credit_and_large_refills_do_not_wrap() {
+        let mut bucket = TokenBucket::new(1, 1);
+        assert!(bucket.consume(1, 0));
+        bucket.refill(1_500_000_000);
+        assert!(bucket.consume(1, 1_500_000_000));
+        assert!(!bucket.consume(1, 2_000_000_000));
+        assert!(bucket.consume(1, 2_500_000_000));
+        let mut huge = TokenBucket::new(u64::MAX, u64::MAX);
+        huge.tokens = 0;
+        huge.refill(u64::MAX);
+        assert_eq!(huge.tokens, u64::MAX);
+        assert_eq!(huge.refill_remainder, 0);
     }
 
     #[test]

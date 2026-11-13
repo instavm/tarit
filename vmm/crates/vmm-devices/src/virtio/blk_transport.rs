@@ -925,21 +925,8 @@ impl VirtioBlkMmio {
             Ok(progress.budget_exhausted)
         }
     }
-}
 
-impl Persist for VirtioBlkMmio {
-    type State = VirtioBlkMmioState;
-
-    fn save(&self) -> Self::State {
-        self.snapshot_state()
-            .expect("virtio-blk state is unavailable")
-    }
-
-    fn try_save(&self) -> Result<Self::State, PersistError> {
-        self.snapshot_state()
-    }
-
-    fn restore(&mut self, state: Self::State) {
+    fn apply_state(&self, state: VirtioBlkMmioState) {
         self.status.store(state.status, Ordering::Relaxed);
         self.queue_sel.store(state.queue_sel, Ordering::Relaxed);
         self.host_features_sel
@@ -966,6 +953,23 @@ impl Persist for VirtioBlkMmio {
     }
 }
 
+impl Persist for VirtioBlkMmio {
+    type State = VirtioBlkMmioState;
+
+    fn save(&self) -> Self::State {
+        self.snapshot_state()
+            .expect("virtio-blk state is unavailable")
+    }
+
+    fn try_save(&self) -> Result<Self::State, PersistError> {
+        self.snapshot_state()
+    }
+
+    fn restore(&mut self, state: Self::State) {
+        self.apply_state(state);
+    }
+}
+
 impl Persist for std::sync::Arc<VirtioBlkMmio> {
     type State = VirtioBlkMmioState;
 
@@ -978,29 +982,7 @@ impl Persist for std::sync::Arc<VirtioBlkMmio> {
     }
 
     fn restore(&mut self, state: Self::State) {
-        self.status.store(state.status, Ordering::Relaxed);
-        self.queue_sel.store(state.queue_sel, Ordering::Relaxed);
-        self.host_features_sel
-            .store(state.host_features_sel, Ordering::Relaxed);
-        self.guest_features_sel
-            .store(state.guest_features_sel, Ordering::Relaxed);
-        self.guest_features_low
-            .store(state.guest_features_low, Ordering::Relaxed);
-        self.guest_features_high
-            .store(state.guest_features_high, Ordering::Relaxed);
-        *self.lock_state(&self.queues, "queues") = state.queues;
-        self.activated.store(state.activated, Ordering::Relaxed);
-        self.interrupt_status
-            .store(state.interrupt_status, Ordering::SeqCst);
-        let config = self
-            .lock_state(&self.queues, "queues")
-            .first()
-            .map(VirtioBlkMmio::queue_config_from_state)
-            .unwrap_or_default();
-        *self.lock_state(&self.processor, "processor") = state
-            .processor
-            .map(|p| VirtQueueProcessor::from_state(config, p));
-        self.lock_state(&self.host_flush, "host_flush").forget();
+        self.apply_state(state);
     }
 }
 
@@ -2313,7 +2295,7 @@ mod tests {
         mem.read_slice(&mut ram, GuestAddress(0)).unwrap();
         restored_mem.write_slice(&ram, GuestAddress(0)).unwrap();
         let mut restored = VirtioBlkMmio::new(5, BlkBackend::open(&path, false).unwrap());
-        restored.restore(state);
+        restored.restore(state.clone());
         restored.set_guest_memory(restored_mem.clone());
         assert!(!restored.process_queue_pass().unwrap());
         assert_eq!(used_idx(&restored_mem), 1);
@@ -2325,8 +2307,16 @@ mod tests {
             assert_eq!(request_status(&restored_mem, request), status::OK);
         }
 
-        // The source completes it once its own host flush is done, and only
-        // then moves on to the write behind it.
+        // Restoring through shared ownership must also discard the old
+        // host-only flush job, then replay the saved guest FLUSH on the ring.
+        let mut dev = std::sync::Arc::new(dev);
+        let observer = dev.clone();
+        dev.restore(state);
+        assert!(!observer.host_flush_wanted());
+        assert!(!dev.process_queue_pass().unwrap());
+        assert!(observer.host_flush_wanted());
+        assert_eq!(used_idx(&mem), 1);
+        // Complete the replayed FLUSH before the write behind it.
         dev.service_host_flush().unwrap();
         assert!(!dev.host_flush_wanted());
         assert!(!dev.process_queue_pass().unwrap());
@@ -2494,6 +2484,14 @@ mod tests {
         let state = dev.save();
         let mut restored = VirtioBlkMmio::new_stub(5, 2);
         restored.restore(state.clone());
+        let mut shared = std::sync::Arc::new(VirtioBlkMmio::new_stub(5, 2));
+        let observer = shared.clone();
+        shared.restore(state.clone());
+        assert_eq!(
+            observer.save(),
+            state,
+            "Arc restore must update the shared transport"
+        );
 
         assert_eq!(restored.save(), state);
         assert_eq!(
