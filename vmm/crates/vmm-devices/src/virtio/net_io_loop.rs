@@ -1,9 +1,9 @@
-//! virtio-net I/O loop: a thread that owns the tap fd + a TX kick EventFd
+//! virtio-net I/O loop: a thread that owns the tap fd + a shared RX/TX kick EventFd
 //! and shuttles packets between the host tap and the virtio queues.
 //!
 //! Two events drive it (epoll-based):
 //!   * tap fd readable → read up to one frame → `inject_rx_packet()`.
-//!   * tx kick EventFd readable → `process_tx_queue()`.
+//!   * RX/TX kick EventFd readable → TX processing and blocked RX retry.
 //!
 //! Linux-only. The transport itself is portable for unit-testability, but
 //! the actual data plane needs epoll + raw read/write on the tap fd.
@@ -159,7 +159,7 @@ impl Drop for NetIoLoop {
 
 /// Spawn the I/O loop. `tap_fd` must be non-blocking and stay open for the
 /// lifetime of the returned handle. `tx_kick_fd` is an EventFd registered
-/// with KVM as the ioeventfd for the TX queue's QUEUE_NOTIFY register, so
+/// with KVM for BOTH RX and TX QUEUE_NOTIFY values, so
 /// guest kicks land here instead of trapping into the vCPU.
 pub fn spawn_net_io_loop(
     device: Arc<VirtioNetMmio>,
@@ -344,8 +344,10 @@ fn run(
             // if the counter is empty so a published descriptor cannot be
             // restored without the kick that made it visible. Drain TAP RX
             // while the vCPUs are stopped, then park before capture.
+            // A frame this drain retains must be retried on the next queue
+            // kick exactly as one retained outside a pause.
             if !drain_kick(tx_kick_fd, &device)
-                || drain_tap(tap_fd, &device, &mut buf, &mut pending) == Rx::Failed
+                || !service_rx(ep, tap_fd, &device, &mut buf, &mut pending, &mut rx_blocked)
             {
                 break;
             }
@@ -381,25 +383,10 @@ fn run(
         }
         // While blocked, retry on every wake-up (a queue kick after the guest
         // posts buffers, or the timeout as a backstop).
-        if tap_ready || rx_blocked {
-            match drain_tap(tap_fd, &device, &mut buf, &mut pending) {
-                Rx::Failed => break,
-                Rx::Blocked if !rx_blocked => {
-                    if let Err(error) = watch_tap(ep, tap_fd, false) {
-                        log::error!("net_io_loop: stop watching tap: {error}");
-                        break;
-                    }
-                    rx_blocked = true;
-                }
-                Rx::Drained if rx_blocked => {
-                    if let Err(error) = watch_tap(ep, tap_fd, true) {
-                        log::error!("net_io_loop: watch tap: {error}");
-                        break;
-                    }
-                    rx_blocked = false;
-                }
-                _ => {}
-            }
+        if (tap_ready || rx_blocked)
+            && !service_rx(ep, tap_fd, &device, &mut buf, &mut pending, &mut rx_blocked)
+        {
+            break;
         }
     }
 
@@ -418,6 +405,40 @@ enum Rx {
     /// posts few, large buffers that run out often.
     Blocked,
     Failed,
+}
+
+/// [`drain_tap`], then keep the loop's blocked state in step with what it
+/// left: while a frame waits for a guest buffer (`rx_blocked`) the tap is not
+/// watched and every wake-up retries. Every drain goes through here, so a
+/// frame retained while pausing is retried like any other. Returns false when
+/// the worker must exit.
+fn service_rx(
+    ep: RawFd,
+    tap_fd: RawFd,
+    device: &Arc<VirtioNetMmio>,
+    buf: &mut [u8],
+    pending: &mut Option<usize>,
+    rx_blocked: &mut bool,
+) -> bool {
+    match drain_tap(tap_fd, device, buf, pending) {
+        Rx::Failed => return false,
+        Rx::Blocked if !*rx_blocked => {
+            if let Err(error) = watch_tap(ep, tap_fd, false) {
+                log::error!("net_io_loop: stop watching tap: {error}");
+                return false;
+            }
+            *rx_blocked = true;
+        }
+        Rx::Drained if *rx_blocked => {
+            if let Err(error) = watch_tap(ep, tap_fd, true) {
+                log::error!("net_io_loop: watch tap: {error}");
+                return false;
+            }
+            *rx_blocked = false;
+        }
+        _ => {}
+    }
+    true
 }
 
 /// Move frames from the tap (non-blocking) into the guest's receive queue
@@ -506,6 +527,15 @@ fn drain_tap(
         }
         if rc == 0 {
             break Rx::Drained;
+        }
+        // inject_rx returns false both for missing descriptors and a frame
+        // that can never fit the transport limit. Only the former may park
+        // RX: otherwise one oversized frame permanently blocks later packets.
+        if !device.vnet_hdr()
+            && rc as usize
+                > super::net_transport::MAX_FRAME_BYTES - super::net_transport::VIRTIO_NET_HDR_LEN
+        {
+            continue;
         }
         match deliver(&buf[..rc as usize]) {
             Ok(true) => {
@@ -753,6 +783,145 @@ mod tests {
                 // SAFETY: both descriptors came from socketpair above.
                 unsafe { libc::close(fd) };
             }
+        }
+    }
+
+    #[test]
+    fn oversized_plain_frame_does_not_park_or_hide_next_frame() {
+        for oversized in [1589, 1600, 2000] {
+            let (device, mem, tap, peer) = rx_device(false);
+            let send = |frame: &[u8]| {
+                // SAFETY: frame is valid for its full length; peer is owned here.
+                assert_eq!(
+                    unsafe { libc::write(peer, frame.as_ptr().cast(), frame.len()) },
+                    frame.len() as isize
+                );
+            };
+            send(&vec![0x33; oversized]);
+            send(&vec![0x42; 1588]);
+            // Match the actual plain-TAP read buffer, including truncation of
+            // datagrams larger than that buffer. No guest buffers yet.
+            let mut buf = vec![0; MAX_FRAME];
+            let mut pending = None;
+            assert_eq!(drain_tap(tap, &device, &mut buf, &mut pending), Rx::Blocked);
+            assert_eq!(pending, Some(1588), "only valid frame may be retained");
+            post_rx_buffer(&mem, 0);
+            assert_eq!(drain_tap(tap, &device, &mut buf, &mut pending), Rx::Drained);
+            assert_eq!(pending, None);
+            assert_eq!(device.rx_packets.load(Ordering::Relaxed), 1);
+            let mut payload = vec![0; 1588];
+            mem.read_slice(&mut payload, GuestAddress(0x30_0000 + 12))
+                .unwrap();
+            assert!(payload.iter().all(|byte| *byte == 0x42));
+            for fd in [tap, peer] {
+                // SAFETY: both socketpair descriptors are owned by this test.
+                unsafe { libc::close(fd) };
+            }
+        }
+    }
+
+    #[test]
+    fn every_drain_tracks_whether_a_frame_waits_for_a_guest_buffer() {
+        let (device, mem, tap, peer) = rx_device(false);
+        // SAFETY: epoll_create1 takes no pointers; the result is checked.
+        let ep = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        assert!(ep >= 0);
+        let mut ev = libc::epoll_event {
+            events: libc::EPOLLIN as u32,
+            u64: 1,
+        };
+        // SAFETY: `ev` is live for the call and both descriptors are open.
+        assert_eq!(
+            unsafe { libc::epoll_ctl(ep, libc::EPOLL_CTL_ADD, tap, &mut ev) },
+            0
+        );
+        let send = |byte: u8| {
+            let frame = [byte; 300];
+            // SAFETY: frame is valid and peer is owned by this test.
+            assert_eq!(
+                unsafe { libc::write(peer, frame.as_ptr().cast(), frame.len()) },
+                300
+            );
+        };
+        let tap_watched = || {
+            let mut events = [libc::epoll_event { events: 0, u64: 0 }; 1];
+            // SAFETY: `events` is a valid writable array of length 1.
+            unsafe { libc::epoll_wait(ep, events.as_mut_ptr(), 1, 0) == 1 }
+        };
+        let mut buf = vec![0; MAX_FRAME];
+        let mut pending = None;
+        let mut rx_blocked = false;
+
+        // No guest buffer: the frame is retained and the tap is no longer
+        // watched, whichever branch of the loop performed the drain.
+        send(0x41);
+        assert!(service_rx(
+            ep,
+            tap,
+            &device,
+            &mut buf,
+            &mut pending,
+            &mut rx_blocked
+        ));
+        assert!(rx_blocked);
+        assert_eq!(pending, Some(300));
+        send(0x42);
+        assert!(!tap_watched(), "a blocked worker must not spin on the tap");
+
+        // Buffers posted: the retry delivers both frames and watches again.
+        post_rx_buffer(&mem, 0);
+        post_rx_buffer(&mem, 1);
+        assert!(service_rx(
+            ep,
+            tap,
+            &device,
+            &mut buf,
+            &mut pending,
+            &mut rx_blocked
+        ));
+        assert!(!rx_blocked);
+        assert_eq!(pending, None);
+        assert_eq!(device.rx_packets.load(Ordering::Relaxed), 2);
+        send(0x43);
+        assert!(tap_watched(), "a drained worker must watch the tap again");
+        for fd in [ep, tap, peer] {
+            // SAFETY: all three descriptors are owned by this test.
+            unsafe { libc::close(fd) };
+        }
+    }
+
+    #[test]
+    fn rx_queue_kick_wakes_blocked_worker_without_tx_traffic() {
+        let (device, mem, tap, peer) = rx_device(false);
+        let kick = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        let mut worker = spawn_net_io_loop(device.clone(), tap, kick.as_raw_fd()).unwrap();
+        let frame = [0x42u8; 300];
+        // SAFETY: frame is valid and peer is owned by this test.
+        assert_eq!(
+            unsafe { libc::write(peer, frame.as_ptr().cast(), frame.len()) },
+            300
+        );
+        // Quiescence synchronizes with the worker: it has read and retained
+        // the frame without a descriptor. This avoids a timing-only test.
+        worker.pause().unwrap();
+        assert_eq!(device.rx_packets.load(Ordering::Relaxed), 0);
+        post_rx_buffer(&mem, 0);
+        worker.resume().unwrap();
+        // Both queue notifications use this exact shared eventfd in KVM.
+        // No TX descriptor is ever published by this test.
+        kick.write(1).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(80);
+        while device.rx_packets.load(Ordering::Relaxed) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "RX waited for timeout instead of kick"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        worker.stop();
+        for fd in [tap, peer] {
+            // SAFETY: worker has stopped before its borrowed descriptors close.
+            unsafe { libc::close(fd) };
         }
     }
 
