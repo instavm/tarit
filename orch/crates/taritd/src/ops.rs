@@ -1598,6 +1598,8 @@ async fn create_local_owned(
             unreachable!("failed lifecycle helper always returns an error")
         }
     };
+    let boot = ticket.identity();
+    task.attach_boot(boot.clone());
     if task.is_cancelled() {
         return cancel_unstarted_lifecycle(state, id, &ticket, task, lifecycle_cancelled_error())
             .await;
@@ -1649,9 +1651,10 @@ async fn create_local_owned(
     let booted = tokio::task::spawn_blocking(move || sup.spawn_vm(ticket, cfg)).await;
     let booted = match booted {
         Err(error) => {
-            let error = state
-                .supervisor
-                .cleanup_boot_join_failure(id, "create boot task", error);
+            let error =
+                state
+                    .supervisor
+                    .cleanup_boot_join_failure(&boot, "create boot task", error);
             if task.is_cancelled() {
                 return finish_cancelled_lifecycle(state, id, task, error).await;
             }
@@ -2106,6 +2109,8 @@ async fn restore_local_owned(
                 unreachable!("failed lifecycle helper always returns an error")
             }
         };
+        let boot = ticket.identity();
+        task.attach_boot(boot.clone());
         if task.is_cancelled() {
             return cancel_unstarted_lifecycle(
                 state,
@@ -2147,7 +2152,7 @@ async fn restore_local_owned(
                 let error =
                     state
                         .supervisor
-                        .cleanup_boot_join_failure(id, "restore boot task", error);
+                        .cleanup_boot_join_failure(&boot, "restore boot task", error);
                 if task.is_cancelled() {
                     return finish_cancelled_lifecycle(state, id, task, error).await;
                 }
@@ -3097,6 +3102,7 @@ async fn resume_hibernated_local_locked(
         }
         Err(error) => return Err(error),
     };
+    let boot = ticket.identity();
     let path = hibernation.snapshot_path.clone();
     let shape = restore_config.resource_shape();
     let supervisor = Arc::clone(&state.supervisor);
@@ -3118,7 +3124,7 @@ async fn resume_hibernated_local_locked(
             let error =
                 state
                     .supervisor
-                    .cleanup_boot_join_failure(id, "hibernation restore task", join);
+                    .cleanup_boot_join_failure(&boot, "hibernation restore task", join);
             return Err(release_failed_activation_reservation(state, id, error));
         }
     };
