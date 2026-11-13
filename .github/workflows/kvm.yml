@@ -15,10 +15,12 @@ concurrency:
 jobs:
   kvm:
     name: KVM lifecycle and performance gates
-    # Never execute pull-request code on a persistent privileged runner. Runs
-    # are limited to the protected main ref, including manual dispatches.
+    # Never execute pull-request code on a privileged runner. Runs are limited
+    # to the protected main ref, including manual dispatches. The runner is a
+    # one-job (JIT) registration on a VM whose OS disk is replaced before every
+    # job, so nothing a job leaves behind reaches the next one.
     if: github.ref == 'refs/heads/main'
-    runs-on: [self-hosted, linux, x64, kvm]
+    runs-on: [self-hosted, linux, x64, kvm, tarit-kvm-ephemeral]
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -34,19 +36,31 @@ jobs:
           workspaces: vmm
           key: kvm-integration
 
-      - name: Verify runner capabilities and guest assets
-        working-directory: vmm
+      - name: Verify runner capabilities
         run: |
           set -euo pipefail
           test "$(uname -m)" = x86_64
           test -c /dev/kvm && test -r /dev/kvm && test -w /dev/kvm
-          test -r "${TARIT_KERNEL:-/tmp/vmlinux.microvm}"
-          test -r "${TARIT_ROOTFS:-/tmp/vsock-rootfs.ext4}"
           sudo -n true
+          findmnt -n -o FSTYPE /mnt/reflink | grep -qx xfs
 
       - name: Build release VMM
         working-directory: vmm
         run: cargo build --release --locked -p vmm --features boot
+
+      - name: Build guest assets
+        # The disk is fresh for every job, so the guest kernel and rootfs are
+        # built here from the pinned inputs (setup-guest.sh falls back to the
+        # checksum-pinned kernel source when no release artifact exists).
+        env:
+          OUT_DIR: /tmp/guest-assets
+          VMM: ${{ github.workspace }}/vmm/target/release/vmm
+        run: |
+          set -euo pipefail
+          sudo -E env "PATH=$PATH" bash scripts/setup-guest.sh
+          sudo install -m 0644 /tmp/guest-assets/vmlinux /tmp/vmlinux.microvm
+          sudo install -m 0644 /tmp/guest-assets/rootfs.ext4 /tmp/vsock-rootfs.ext4
+          test -r /tmp/vmlinux.microvm && test -r /tmp/vsock-rootfs.ext4
 
       - name: Build release orchestrator
         working-directory: orch
@@ -86,8 +100,9 @@ jobs:
         env:
           VMM_TEST_KERNEL: /tmp/vmlinux.microvm
           VMM_TEST_ROOTFS: /tmp/vsock-rootfs.ext4
+          VMM_TEST_OVERLAY_DIR: /mnt/reflink
         run: |
-          sudo -E env "PATH=$HOME/.cargo/bin:$PATH" cargo test --locked --workspace \
+          sudo -E env "PATH=$HOME/.cargo/bin:$PATH" cargo test --locked --workspace --no-fail-fast \
             --features vmm-core/kvm \
             --features vmm-core/boot \
             --features vmm-memory-backend/kvm \
@@ -152,9 +167,3 @@ jobs:
           name: orchestrator-performance-${{ github.run_id }}
           path: perf-orch
           if-no-files-found: ignore
-
-      - name: Reclaim root-owned workspace files
-        # Several steps run under sudo and leave root-owned artifacts that
-        # break the next checkout on this persistent runner.
-        if: always()
-        run: sudo chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE"
