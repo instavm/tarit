@@ -806,20 +806,9 @@ async fn cleanup_hibernation_snapshots_for_vm(
             .store
             .lock()
             .map_err(|_| OrchError::Internal("store lock poisoned".into()))?;
-        let bindings = store.list_hibernations().map_err(crate::api::store_err)?;
         store
-            .list_ephemeral_snapshots_for_vm(vm_id)
+            .list_unbound_hibernation_snapshots_for_vm(vm_id)
             .map_err(crate::api::store_err)?
-            .into_iter()
-            .filter(|snapshot| snapshot.vm_id == vm_id)
-            // A failed publication may retain its wake image while the cache
-            // still says Running. Only retire snapshots no binding needs.
-            .filter(|snapshot| {
-                !bindings
-                    .iter()
-                    .any(|binding| binding.snapshot_path == snapshot.path)
-            })
-            .collect()
     };
     cleanup_ephemeral_snapshots(state, snapshots).await
 }
@@ -2904,16 +2893,85 @@ pub async fn resolve_owner_for_activation(
     }
 }
 
-fn activation_gate(state: &AppState, id: Uuid) -> Result<Arc<tokio::sync::Mutex<()>>, OrchError> {
+type ActivationGateMap =
+    std::sync::Mutex<std::collections::HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>;
+
+/// Owns one caller's place in activation serialization, including time spent
+/// waiting. The map entry survives until the final caller releases its lease.
+pub(crate) struct ActivationGate {
+    id: Uuid,
+    gates: Arc<ActivationGateMap>,
+    gate: Option<Arc<tokio::sync::Mutex<()>>>,
+}
+
+impl ActivationGate {
+    pub(crate) async fn lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.gate
+            .as_ref()
+            .expect("live activation lease")
+            .lock()
+            .await
+    }
+
+    /// Like [`Self::lock`], but the guard owns this lease, so it can be held
+    /// across `spawn_blocking` or moved into a task. Both variants wait in the
+    /// same FIFO queue of this id's single gate; other ids are never involved.
+    pub(crate) async fn lock_owned(self) -> OwnedActivationGuard {
+        // The temporary holding the extra gate reference is dropped before
+        // `self` if this wait is cancelled, so the lease still retires the
+        // map entry when it is the last one.
+        let guard = Arc::clone(self.gate.as_ref().expect("live activation lease"))
+            .lock_owned()
+            .await;
+        OwnedActivationGuard {
+            _guard: guard,
+            _lease: self,
+        }
+    }
+}
+
+/// An activation guard that owns its lease. Fields drop in declaration order:
+/// the gate is unlocked first, then the lease is released (and the map entry
+/// retired if this was the final lease).
+pub(crate) struct OwnedActivationGuard {
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+    _lease: ActivationGate,
+}
+
+impl Drop for ActivationGate {
+    fn drop(&mut self) {
+        // Acquisition and eviction share this mutex. A new caller therefore
+        // cannot create a second gate while an existing waiter still uses it.
+        let mut gates = self.gates.lock().unwrap_or_else(|error| error.into_inner());
+        let gate = self.gate.take().expect("live activation lease");
+        if Arc::strong_count(&gate) == 2
+            && gates
+                .get(&self.id)
+                .is_some_and(|entry| Arc::ptr_eq(entry, &gate))
+        {
+            gates.remove(&self.id);
+        }
+        // Release this reference before unlocking: simultaneous final drops
+        // must observe one another's release, or the map could retain a gate.
+        drop(gate);
+    }
+}
+
+pub(crate) fn activation_gate(state: &AppState, id: Uuid) -> Result<ActivationGate, OrchError> {
     let mut gates = state
         .activation_gates
         .lock()
         .map_err(|_| OrchError::Internal("activation gate map poisoned".into()))?;
-    Ok(Arc::clone(
+    let gate = Arc::clone(
         gates
             .entry(id)
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
-    ))
+    );
+    Ok(ActivationGate {
+        id,
+        gates: Arc::clone(&state.activation_gates),
+        gate: Some(gate),
+    })
 }
 
 /// Make a logical VM runnable, coalescing every concurrent wake source into
@@ -3773,7 +3831,7 @@ pub async fn localize_branch_artifact(
         });
     }
     let gate = activation_gate(state, artifact.artifact_id)?;
-    let _localization = gate.lock_owned().await;
+    let _localization = gate.lock().await;
     let existing_local = {
         let store = state
             .store
@@ -4402,7 +4460,7 @@ pub async fn put_egress_policy_local(
     // Serialize with HTTP/PTY/SSH activation so a policy update cannot race a
     // hibernated VM's transition back to a newly provisioned TAP.
     let activation = activation_gate(state, id)?;
-    let _activation = activation.lock().await;
+    let activation_guard = activation.lock_owned().await;
     let vm = vm_get(state, id)?;
     if vm.owner_key.as_deref() != Some(owner_key) {
         return Err(OrchError::Forbidden("VM belongs to another tenant".into()));
@@ -4423,6 +4481,49 @@ pub async fn put_egress_policy_local(
     };
     let allowlist = crate::net::normalize_tenant_egress_allowlist(&allowlist)?;
     let now = Utc::now();
+    if vm.status != VmStatus::Hibernated {
+        let current = get_egress_policy_local(state, id, owner_key)?;
+        if current.revision != expected_revision {
+            return Err(OrchError::Conflict(format!(
+                "egress policy revision is {}, expected {expected_revision}",
+                current.revision
+            )));
+        }
+        expected_revision
+            .checked_add(1)
+            .ok_or_else(|| OrchError::Conflict("egress policy revision overflow".into()))?;
+        // The owned blocking operation survives request cancellation with both
+        // lifecycle gates held until host application and persistence settle.
+        let state = state.clone();
+        let owner_key = owner_key.to_owned();
+        return tokio::task::spawn_blocking(move || {
+            let _activation = activation_guard;
+            let _operation = _operation;
+            apply_and_commit_egress(
+                &current,
+                &allowlist,
+                allow_existing,
+                |rules, existing| state.supervisor.update_egress(id, rules.to_vec(), existing),
+                || {
+                    state
+                        .store
+                        .lock()
+                        .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
+                        .update_egress_policy(
+                            &owner_key,
+                            id,
+                            expected_revision,
+                            &allowlist,
+                            allow_existing,
+                            now,
+                        )
+                        .map_err(crate::api::store_err)
+                },
+            )
+        })
+        .await
+        .map_err(|error| OrchError::Internal(format!("egress update join: {error}")))?;
+    }
     if vm.status == VmStatus::Hibernated {
         if let Some(fleet) = state.fleet.as_ref() {
             let current = get_egress_policy_local(state, id, owner_key)?;
@@ -4472,14 +4573,41 @@ pub async fn put_egress_policy_local(
                 "local hibernation egress persistence failed after fleet CAS");
             crate::api::store_err(error)
         })?;
-    if vm.status != VmStatus::Hibernated {
-        let sup = Arc::clone(&state.supervisor);
-        let applied = allowlist.clone();
-        tokio::task::spawn_blocking(move || sup.update_egress(id, applied, allow_existing))
-            .await
-            .map_err(|e| OrchError::Internal(format!("join: {e}")))??;
-    }
     Ok(policy)
+}
+
+// Host application may have partially changed rules even on error. Restore the
+// last committed policy on either failure; never publish the requested revision
+// before successful host application. NetProvisioner contains failed updates.
+//
+// BadRequest/NotFound from the apply step are refusals, not host failures
+// (see Supervisor::update_egress and NetProvisioner::apply_egress). BadRequest
+// (no host networking, no allocation, invalid rule) is always raised before
+// any host rule is touched. NotFound means this VM's allocation is not, or no
+// longer, active; if it is raised after rules were touched, apply_egress has
+// already taken the TAP down. In both cases a restore would be refused the
+// same way and turn a clean 4xx into a 500, so return the refusal as is.
+fn apply_and_commit_egress(
+    current: &EgressPolicyRecord,
+    allowlist: &[String],
+    allow_existing: bool,
+    mut apply: impl FnMut(&[String], bool) -> Result<usize, OrchError>,
+    persist: impl FnOnce() -> Result<EgressPolicyRecord, OrchError>,
+) -> Result<EgressPolicyRecord, OrchError> {
+    let result = match apply(allowlist, allow_existing) {
+        Err(refused @ (OrchError::BadRequest(_) | OrchError::NotFound(_))) => return Err(refused),
+        applied => applied.and_then(|_| persist()),
+    };
+    match result {
+        Ok(policy) => Ok(policy),
+        Err(error) => match apply(&current.allowlist, current.allow_existing) {
+            Ok(_) => Err(error),
+            Err(rollback) => Err(OrchError::Internal(format!(
+                "egress update failed: {error}; restoring committed revision {} also failed: {rollback}; host containment remains required; policy update was not committed",
+                current.revision
+            ))),
+        },
+    }
 }
 
 /// DELETE must still authorize the tenant while a retryable transition is
@@ -4872,6 +5000,232 @@ mod tests {
     use std::sync::{Mutex, RwLock};
     use std::time::Duration;
     use tarit_store::Store;
+
+    #[test]
+    fn activation_gates_retire_after_missing_vm_requests() {
+        let (state, _writes) = test_state_with_durable_writer();
+        test_runtime().block_on(async {
+            for _ in 0..1000 {
+                assert!(matches!(
+                    ensure_active_local(&state, Uuid::new_v4()).await,
+                    Err(OrchError::NotFound(_))
+                ));
+                assert!(state.activation_gates.lock().unwrap().is_empty());
+            }
+        });
+    }
+
+    #[test]
+    fn activation_gates_preserve_waiters_and_cross_vm_concurrency() {
+        let (state, _writes) = test_state_with_durable_writer();
+        test_runtime().block_on(async {
+            let id = Uuid::new_v4();
+            let first = activation_gate(&state, id).unwrap();
+            let held = first.lock().await;
+            let waiter = activation_gate(&state, id).unwrap();
+            {
+                let mut waiting = std::pin::pin!(waiter.lock());
+                assert!(tokio::time::timeout(Duration::ZERO, &mut waiting)
+                    .await
+                    .is_err());
+                let other = activation_gate(&state, Uuid::new_v4()).unwrap();
+                let independent = other
+                    .gate
+                    .as_ref()
+                    .unwrap()
+                    .try_lock()
+                    .expect("different VMs do not serialize");
+                drop(independent);
+                drop(other);
+                drop(held);
+                drop(first);
+                let next = activation_gate(&state, id).unwrap();
+                assert!(Arc::ptr_eq(
+                    waiter.gate.as_ref().unwrap(),
+                    next.gate.as_ref().unwrap()
+                ));
+                let acquired = waiting.await;
+                assert!(next.gate.as_ref().unwrap().try_lock().is_err());
+                drop(acquired);
+                drop(next);
+            }
+            drop(waiter);
+            assert!(state.activation_gates.lock().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn simultaneous_final_activation_leases_do_not_leave_entries() {
+        let (state, _writes) = test_state_with_durable_writer();
+        for _ in 0..50 {
+            let id = Uuid::new_v4();
+            let leases: Vec<_> = (0..8)
+                .map(|_| activation_gate(&state, id).unwrap())
+                .collect();
+            let barrier = Arc::new(std::sync::Barrier::new(leases.len()));
+            std::thread::scope(|scope| {
+                for lease in leases {
+                    let barrier = Arc::clone(&barrier);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        drop(lease);
+                    });
+                }
+            });
+            assert!(state.activation_gates.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn cancelled_activation_waiter_releases_its_lease() {
+        let (state, _writes) = test_state_with_durable_writer();
+        test_runtime().block_on(async {
+            let id = Uuid::new_v4();
+            let first = activation_gate(&state, id).unwrap();
+            let held = first.lock().await;
+            let waiter = activation_gate(&state, id).unwrap();
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move {
+                started.send(()).unwrap();
+                let _guard = waiter.lock().await;
+            });
+            ready.await.unwrap();
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            assert_eq!(state.activation_gates.lock().unwrap().len(), 1);
+            drop(held);
+            drop(first);
+            assert!(state.activation_gates.lock().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn owned_activation_guard_crosses_tasks_and_keeps_per_vm_serialization() {
+        let (state, _writes) = test_state_with_durable_writer();
+        test_runtime().block_on(async {
+            let id = Uuid::new_v4();
+            let held = activation_gate(&state, id).unwrap().lock_owned().await;
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            // The owned guard is held on a blocking worker, not by this task.
+            let holder = tokio::task::spawn_blocking(move || {
+                let _held = held;
+                released.recv().unwrap();
+            });
+            let waiter = activation_gate(&state, id).unwrap();
+            {
+                let mut waiting = std::pin::pin!(waiter.lock());
+                assert!(futures_util::poll!(&mut waiting).is_pending());
+                let other = activation_gate(&state, Uuid::new_v4()).unwrap();
+                let _independent = tokio::time::timeout(Duration::ZERO, other.lock_owned())
+                    .await
+                    .expect("a held gate never blocks another VM's gate");
+                release.send(()).unwrap();
+                holder.await.unwrap();
+                drop(waiting.await);
+            }
+            drop(waiter);
+            assert!(state.activation_gates.lock().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn owned_and_borrowed_activation_waiters_share_one_fifo_queue() {
+        let (state, _writes) = test_state_with_durable_writer();
+        test_runtime().block_on(async {
+            let id = Uuid::new_v4();
+            let first = activation_gate(&state, id).unwrap();
+            let held = first.lock().await;
+            let borrowed_lease = activation_gate(&state, id).unwrap();
+            {
+                let mut owned = Box::pin(activation_gate(&state, id).unwrap().lock_owned());
+                assert!(futures_util::poll!(&mut owned).is_pending());
+                let mut borrowed = std::pin::pin!(borrowed_lease.lock());
+                assert!(futures_util::poll!(&mut borrowed).is_pending());
+                drop(held);
+                drop(first);
+                // The earlier owned waiter is served first; the borrowed one waits.
+                assert!(futures_util::poll!(&mut borrowed).is_pending());
+                let owned_guard = match futures_util::poll!(&mut owned) {
+                    std::task::Poll::Ready(guard) => guard,
+                    std::task::Poll::Pending => panic!("first queued waiter must be served"),
+                };
+                drop(owned);
+                assert!(futures_util::poll!(&mut borrowed).is_pending());
+                drop(owned_guard);
+                drop(borrowed.await);
+            }
+            drop(borrowed_lease);
+            assert!(state.activation_gates.lock().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn cancelled_owned_activation_waiter_retires_the_final_lease() {
+        let (state, _writes) = test_state_with_durable_writer();
+        test_runtime().block_on(async {
+            let id = Uuid::new_v4();
+            let first = activation_gate(&state, id).unwrap();
+            let held = first.lock().await;
+            let mut waiting = Box::pin(activation_gate(&state, id).unwrap().lock_owned());
+            assert!(futures_util::poll!(&mut waiting).is_pending());
+            drop(held);
+            drop(first);
+            // The cancelled waiter is now the final lease; dropping it must
+            // not leave the entry behind because of its own extra reference.
+            drop(waiting);
+            assert!(state.activation_gates.lock().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn held_activation_guard_never_blocks_another_tenants_vm() {
+        let (state, _writes) = test_state_with_durable_writer();
+        let tenant_a = insert_running_vm(&state);
+        let tenant_b = insert_running_vm(&state);
+        state
+            .vm_cache
+            .write()
+            .unwrap()
+            .get_mut(&tenant_b)
+            .unwrap()
+            .owner_key = Some("tenant-b".into());
+        test_runtime().block_on(async {
+            // Tenant A's activation and egress gates are held indefinitely.
+            let held = activation_gate(&state, tenant_a)
+                .unwrap()
+                .lock_owned()
+                .await;
+            let blocked = tokio::spawn(async move {
+                let _held = held;
+                std::future::pending::<()>().await;
+            });
+            let deadline = Duration::from_secs(5);
+            tokio::time::timeout(
+                deadline,
+                ensure_active_local_for_owner(&state, tenant_b, "tenant-b"),
+            )
+            .await
+            .expect("tenant B activation is not blocked by tenant A")
+            .unwrap();
+            let egress = tokio::time::timeout(
+                deadline,
+                put_egress_policy_local(&state, tenant_b, "tenant-b", 1, Vec::new(), true),
+            )
+            .await
+            .expect("tenant B egress update is not blocked by tenant A");
+            // Tests have no host networking, so the update itself is refused;
+            // only that it was never queued behind tenant A matters here.
+            assert!(egress.is_err());
+            {
+                let gates = state.activation_gates.lock().unwrap();
+                assert_eq!(gates.len(), 1);
+                assert!(gates.contains_key(&tenant_a));
+            }
+            blocked.abort();
+            let _ = blocked.await;
+            assert!(state.activation_gates.lock().unwrap().is_empty());
+        });
+    }
 
     #[test]
     fn live_transition_validation_is_idempotent_and_rejects_wrong_states() {
@@ -7352,6 +7706,142 @@ mod tests {
             .block_on(stop_local(&state, id))
             .expect_err("a completed concurrent delete must be terminal");
         assert!(matches!(error, OrchError::NotFound(_)));
+    }
+
+    #[test]
+    fn live_egress_commits_only_after_apply_and_restores_on_apply_or_store_failure() {
+        for failure in ["none", "apply", "persist", "restore"] {
+            let (state, _) = test_state_with_durable_writer();
+            let id = insert_running_vm(&state);
+            let current = get_egress_policy_local(&state, id, "test").unwrap();
+            let requested = vec!["1.1.1.1:443/tcp".to_owned()];
+            let effective = std::cell::RefCell::new(current.allowlist.clone());
+            let calls = std::cell::Cell::new(0);
+            let result = apply_and_commit_egress(
+                &current,
+                &requested,
+                true,
+                |rules, _| {
+                    let call = calls.get() + 1;
+                    calls.set(call);
+                    *effective.borrow_mut() = rules.to_vec();
+                    if failure == "apply" && call == 1 || failure == "restore" && call == 2 {
+                        return Err(OrchError::Internal("injected host failure".into()));
+                    }
+                    Ok(rules.len())
+                },
+                || {
+                    // Real SQLite has not advanced while host application runs.
+                    assert_eq!(
+                        get_egress_policy_local(&state, id, "test")
+                            .unwrap()
+                            .revision,
+                        1
+                    );
+                    assert_eq!(*effective.borrow(), requested);
+                    if failure == "persist" || failure == "restore" {
+                        return state
+                            .store
+                            .lock()
+                            .unwrap()
+                            .update_egress_policy("test", id, 0, &requested, true, Utc::now())
+                            .map_err(crate::api::store_err);
+                    }
+                    state
+                        .store
+                        .lock()
+                        .unwrap()
+                        .update_egress_policy("test", id, 1, &requested, true, Utc::now())
+                        .map_err(crate::api::store_err)
+                },
+            );
+            let stored = get_egress_policy_local(&state, id, "test").unwrap();
+            if failure == "none" {
+                assert_eq!(result.unwrap().revision, 2);
+                assert_eq!(stored.allowlist, requested);
+                assert_eq!(calls.get(), 1);
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(stored.revision, 1);
+                assert_eq!(stored.allowlist, current.allowlist);
+                assert_eq!(calls.get(), 2);
+                if failure == "restore" {
+                    assert!(error
+                        .to_string()
+                        .contains("restoring committed revision 1 also failed"));
+                } else {
+                    assert_eq!(*effective.borrow(), current.allowlist);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn live_egress_without_host_network_does_not_advance_persisted_policy() {
+        let (state, _) = test_state_with_durable_writer();
+        let id = insert_running_vm(&state);
+        // A live runtime without host networking, so the request reaches
+        // Supervisor::update_egress instead of stopping at the operation gate.
+        state
+            .supervisor
+            .install_test_control_runtime(id, PathBuf::from("unused.sock"));
+        let result = test_runtime().block_on(put_egress_policy_local(
+            &state,
+            id,
+            "test",
+            1,
+            vec!["1.1.1.1:443".into()],
+            true,
+        ));
+        // The host refused before touching any rule: a clean 400, not the
+        // 500 "restoring committed revision ... also failed" of a restore.
+        let error = result.unwrap_err();
+        assert!(
+            matches!(&error, OrchError::BadRequest(message) if message.contains("TARIT_ENABLE_NET")),
+            "{error:?}"
+        );
+        assert_eq!(error.http_status(), 400);
+        let stored = get_egress_policy_local(&state, id, "test").unwrap();
+        assert_eq!(stored.revision, 1);
+        assert!(stored.allowlist.is_empty());
+    }
+
+    #[test]
+    fn live_egress_refused_before_host_apply_skips_restore() {
+        let (state, _) = test_state_with_durable_writer();
+        let id = insert_running_vm(&state);
+        let current = get_egress_policy_local(&state, id, "test").unwrap();
+        for refusal in [
+            OrchError::BadRequest("no host networking".into()),
+            OrchError::NotFound("allocation no longer active".into()),
+        ] {
+            let status = refusal.http_status();
+            let refusal = std::cell::RefCell::new(Some(refusal));
+            let calls = std::cell::Cell::new(0);
+            let error = apply_and_commit_egress(
+                &current,
+                &["1.1.1.1:443/tcp".to_owned()],
+                true,
+                |_, _| {
+                    calls.set(calls.get() + 1);
+                    Err(refusal
+                        .borrow_mut()
+                        .take()
+                        .unwrap_or_else(|| OrchError::BadRequest("refused again".into())))
+                },
+                || panic!("a refused policy must not be persisted"),
+            )
+            .unwrap_err();
+            assert_eq!(calls.get(), 1, "no restore after a refusal");
+            assert_eq!(error.http_status(), status);
+            assert_ne!(status, 500);
+        }
+        assert_eq!(
+            get_egress_policy_local(&state, id, "test")
+                .unwrap()
+                .revision,
+            1
+        );
     }
 
     #[test]
