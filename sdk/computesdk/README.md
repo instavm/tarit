@@ -34,7 +34,7 @@ What maps to what:
   capped at 180 s.
 - `snapshot.create` takes an incremental checkpoint: the guest pauses only for
   memory changed since the last one, and the result restores on its own.
-- `pause`/`resume` keep memory. `getUrl` creates a public share of the port.
+- `pause`/`resume` keep memory. `getUrl` reuses an active public share for the VM and port, creating one if needed. Private and revoked shares are left untouched. Concurrent calls with the same API URL/key, VM, and port share one lookup/create operation within this process. Separate processes can still create duplicates because the API does not enforce uniqueness. Each later call checks current shares again; a concurrent revocation can still invalidate a returned URL.
 
 ## Fast creates
 
@@ -51,3 +51,5 @@ On the reference host (6-core desktop, other load present), ComputeSDK's
 time-to-interactive benchmark measured a 66 ms median and a 99.1 score with
 10 sandboxes at once. Treat that as a lower bound for a remote host, which
 adds the network round trips.
+
+Command requests and polling share a total deadline of the guest command timeout plus 5 seconds. Command timeouts must be finite positive milliseconds at most 2,147,478,647. Transient polling responses (429/502/503/504) retry the same execution; submission is never replayed. `TaritDeadlineExceeded` retains `executionId` when submission returned it; an unavailable ID means submission may still have been accepted.

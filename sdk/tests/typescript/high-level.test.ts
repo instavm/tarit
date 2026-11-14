@@ -226,8 +226,86 @@ test("fork aborts an in-flight request at its deadline", async () => {
   const client = new TaritClient({ baseUrl: "https://tarit.test", apiKey: "tenant-key", fetch });
   await assert.rejects(
     () => client.fork(vmId, { childId, deadlineMs: 5 }),
-    (error: unknown) => error instanceof TaritDeadlineExceeded,
+    (error: unknown) => error instanceof TaritDeadlineExceeded && error.childId === childId,
   );
+});
+
+test("fork returns a success response that arrives after its deadline", async () => {
+  // The child exists once the server answers 201; a late reply is not ambiguous, so the
+  // caller must get it rather than a deadline error that forces a replay.
+  let calls = 0;
+  const fetch: typeof globalThis.fetch = async () => {
+    calls += 1;
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    return json(201, forkResult());
+  };
+  const client = new TaritClient({ baseUrl: "https://tarit.test", apiKey: "tenant-key", fetch });
+  const result = await client.fork(vmId, { childId, deadlineMs: 5 });
+  assert.equal(result.vm.id, childId);
+  assert.equal(calls, 1);
+});
+
+test("fork reports a non-retryable error that arrives after its deadline", async () => {
+  const fetch: typeof globalThis.fetch = async () => {
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    return json(403, { error: "VM belongs to another tenant" });
+  };
+  const client = new TaritClient({ baseUrl: "https://tarit.test", apiKey: "tenant-key", fetch });
+  await assert.rejects(
+    () => client.fork(vmId, { childId, deadlineMs: 5 }),
+    (error: unknown) => error instanceof TaritApiError && error.status === 403,
+  );
+});
+
+test("fork turns a retryable response after its deadline into a deadline error", async () => {
+  let calls = 0;
+  const fetch: typeof globalThis.fetch = async () => {
+    calls += 1;
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    return json(503, { error: "busy" });
+  };
+  const client = new TaritClient({ baseUrl: "https://tarit.test", apiKey: "tenant-key", fetch });
+  await assert.rejects(
+    () => client.fork(vmId, { childId, deadlineMs: 5 }),
+    (error: unknown) => error instanceof TaritDeadlineExceeded && error.childId === childId,
+  );
+  assert.equal(calls, 1);
+});
+
+test("fork deadline exposes the SDK-generated child ID sent to the server", async () => {
+  let sentId: string | undefined;
+  const fetch: typeof globalThis.fetch = async (request, init) => {
+    const incoming = request instanceof Request ? request : new Request(request, init);
+    sentId = (await incoming.json() as { id: string }).id;
+    return new Promise((_resolve, reject) => {
+      incoming.signal.addEventListener("abort", () => reject(incoming.signal.reason), { once: true });
+    });
+  };
+  const client = new TaritClient({ baseUrl: "https://tarit.test", apiKey: "tenant-key", fetch });
+  await assert.rejects(() => client.fork(vmId, { deadlineMs: 20 }), (error: unknown) => {
+    assert.ok(sentId);
+    assert.ok(error instanceof TaritDeadlineExceeded);
+    assert.equal(error.childId, sentId);
+    assert.equal(error.executionId, undefined);
+    assert.ok(error.message.includes(sentId));
+    return true;
+  });
+});
+
+test("fork and PTY reject invalid or overflowing native timer deadlines before I/O", async () => {
+  let calls = 0;
+  const fetch: typeof globalThis.fetch = async () => { calls += 1; return json(201, forkResult()); };
+  const client = new TaritClient({ baseUrl: "https://tarit.test", apiKey: "tenant-key", fetch });
+  const socket = new FakeWebSocket();
+  socket.open();
+  const pty = new PtyConnection(client, vmId, ptyId, socket.asPtySocket());
+  for (const deadlineMs of [0, -1, NaN, Infinity, 2_147_483_648, Number.MAX_VALUE]) {
+    await assert.rejects(() => client.fork(vmId, { deadlineMs }), RangeError);
+    await assert.rejects(() => client.openPty(vmId, { deadlineMs }), RangeError);
+    await assert.rejects(() => pty.read({ deadlineMs }), TaritDeadlineExceeded);
+  }
+  assert.equal(calls, 0);
+  await pty.close({ deleteSession: false });
 });
 
 test("fork does not hide programming errors as retries", async () => {

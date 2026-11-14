@@ -84,7 +84,8 @@ microVMs needs root (or membership in the `kvm` group), so the commands use
 
 ```sh
 git clone https://github.com/instavm/tarit && cd tarit
-sudo make install      # build + install vmm, taritd, and the guest agent
+make build             # compile vmm, taritd, and the guest agent as your regular user
+sudo make install      # copy the prebuilt artifacts into system locations
 sudo make guest        # one-time: fetch a verified guest kernel + pull an Ubuntu rootfs
 ```
 
@@ -108,7 +109,11 @@ For a kernel-only install, run `sudo vmm kernel install`. Interactive
 `--kernel` is omitted. Non-interactive commands require `--kernel` or a prior
 install.
 
-Only want the hypervisor? `sudo make install-vmm` installs just `vmm`.
+Only want the hypervisor? Run `make vmm` as your regular user, then
+`sudo make install-vmm` to install just `vmm`. Install targets only copy prebuilt
+artifacts and fail with build guidance if an artifact is missing or older than
+the sources it was built from (for example after a `git pull` without `make
+build`); they never run Cargo or the guest compiler under sudo.
 
 ### Layer 2: snapshot, suspend, restore
 

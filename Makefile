@@ -1,9 +1,9 @@
 # Tarit build. See README.md for the quickstart.
 #
 #   make              build both binaries (vmm + taritd) and the guest agent
-#   sudo make install build, then install both binaries to $(BINDIR)
+#   make build && sudo make install  build as your user, then install to $(BINDIR)
 #   make vmm          build only the VMM (and the guest agent)
-#   sudo make install-vmm  install only the VMM
+#   make vmm && sudo make install-vmm  build as your user, then install the VMM
 #
 # Install location (override e.g. `make install PREFIX=$HOME/.local`):
 PREFIX  ?= /usr/local
@@ -39,7 +39,11 @@ guest:
 	./scripts/setup-guest.sh
 
 # Install host binaries plus the guest-only agent (use sudo for /usr/local).
-install: build
+install:
+	@./scripts/check-install-artifact.sh vmm/target/release/vmm "make build" vmm/Cargo.lock
+	@./scripts/check-install-artifact.sh orch/target/release/taritd "make build" orch/Cargo.lock
+	@test -x vmm/guest/agent/vmm-agent && $(MAKE) --no-print-directory -q -C vmm/guest/agent vmm-agent || \
+		{ echo "error: vmm/guest/agent/vmm-agent is missing or older than its source; run 'make build' as your regular user first, then install again" >&2; exit 1; }
 	install -d "$(DESTDIR)$(BINDIR)"
 	install -d "$(DESTDIR)$(LIBEXECDIR)"
 	install -m755 vmm/target/release/vmm     "$(DESTDIR)$(BINDIR)/vmm"
@@ -49,7 +53,8 @@ install: build
 	@echo "installed guest agent to $(DESTDIR)$(LIBEXECDIR)/vmm-agent"
 
 # Install only the VMM.
-install-vmm: vmm
+install-vmm:
+	@./scripts/check-install-artifact.sh vmm/target/release/vmm "make vmm" vmm/Cargo.lock
 	install -d "$(DESTDIR)$(BINDIR)"
 	install -m755 vmm/target/release/vmm "$(DESTDIR)$(BINDIR)/vmm"
 	@echo "installed vmm to $(DESTDIR)$(BINDIR)"

@@ -78,11 +78,13 @@ export class TaritApiError extends Error {
 
 export class TaritDeadlineExceeded extends Error {
   readonly executionId: string | undefined;
+  readonly childId: string | undefined;
 
-  constructor(message: string, options: { executionId?: string | undefined } = {}) {
+  constructor(message: string, options: { executionId?: string | undefined; childId?: string | undefined } = {}) {
     super(options.executionId === undefined ? message : `${message}; execution ID ${options.executionId}`);
     this.name = "TaritDeadlineExceeded";
     this.executionId = options.executionId;
+    this.childId = options.childId;
   }
 }
 
@@ -118,6 +120,12 @@ async function sleepUntil(wakeAt: number): Promise<void> {
   } while (performance.now() < wakeAt);
 }
 
+// Native browser/Node timers accept at most a signed 32-bit millisecond delay.
+const MAX_TIMER_MS = 2_147_483_647;
+function validTimerDeadline(milliseconds: number): boolean {
+  return Number.isFinite(milliseconds) && milliseconds > 0 && milliseconds <= MAX_TIMER_MS;
+}
+
 function validatePollInterval(milliseconds: number): void {
   if (!Number.isFinite(milliseconds) || milliseconds < 0) {
     throw new RangeError("pollIntervalMs must be a finite nonnegative number");
@@ -129,6 +137,7 @@ async function withExecutionDeadline<T>(
   message: string,
   operation: (signal: AbortSignal, deadline: number) => Promise<T>,
   executionId: () => string | undefined,
+  errorOverride?: () => TaritDeadlineExceeded,
 ): Promise<T> {
   if (!Number.isFinite(milliseconds) || milliseconds <= 0) {
     throw new RangeError("deadlineMs must be a finite positive number");
@@ -136,6 +145,7 @@ async function withExecutionDeadline<T>(
   const deadline = performance.now() + milliseconds;
   const controller = new AbortController();
   const deadlineError = () => {
+    if (errorOverride !== undefined) return errorOverride();
     const id = executionId();
     return new TaritDeadlineExceeded(
       id === undefined ? `${message}; execution ID unavailable; submission may have been accepted` : message,
@@ -344,7 +354,7 @@ export class PtyConnection {
     if (queued !== undefined) return Promise.resolve(queued);
     if (this.terminalError !== undefined) return Promise.reject(this.terminalError);
     const deadlineMs = options.deadlineMs ?? 30_000;
-    if (!Number.isFinite(deadlineMs) || deadlineMs <= 0) {
+    if (!validTimerDeadline(deadlineMs)) {
       return Promise.reject(new TaritDeadlineExceeded(`PTY session ${this.ptyId} read exceeded its deadline`));
     }
     return new Promise((resolve, reject) => {
@@ -440,10 +450,10 @@ export class TaritClient {
     const rows = options.rows ?? 24;
     validatePtyDimensions(cols, rows);
     const deadlineMs = options.deadlineMs ?? 30_000;
-    if (!Number.isFinite(deadlineMs) || deadlineMs <= 0) {
-      throw new RangeError("PTY deadlineMs must be a finite positive number");
+    if (!validTimerDeadline(deadlineMs)) {
+      throw new RangeError("PTY deadlineMs must be positive and at most 2147483647");
     }
-    const deadline = Date.now() + deadlineMs;
+    const deadline = performance.now() + deadlineMs;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), deadlineMs);
     let created: { pty_id: string; connect_token: string };
@@ -468,7 +478,7 @@ export class TaritClient {
     } finally {
       clearTimeout(timer);
     }
-    const remaining = deadline - Date.now();
+    const remaining = deadline - performance.now();
     if (remaining <= 0) {
       await this.deletePtySession(vmId, created.pty_id);
       throw new TaritDeadlineExceeded(`open PTY for VM ${vmId} exceeded its deadline`);
@@ -481,7 +491,7 @@ export class TaritClient {
         remaining,
       );
       connection = new PtyConnection(this, vmId, created.pty_id, socket);
-      const attachRemaining = deadline - Date.now();
+      const attachRemaining = deadline - performance.now();
       if (attachRemaining <= 0) {
         throw new TaritDeadlineExceeded(`open PTY for VM ${vmId} exceeded its deadline`);
       }
@@ -495,26 +505,32 @@ export class TaritClient {
     }
   }
 
-  async deletePtySession(vmId: string, ptyId: string): Promise<void> {
-    const result = await this.raw.DELETE("/v1/vms/{id}/pty/sessions/{pty_id}", {
-      params: { path: { id: vmId, pty_id: ptyId } },
-    });
-    if (result.response.status === 204 || result.response.status === 404) return;
-    throw new TaritApiError(
-      "delete PTY session",
-      result.response.status,
-      errorMessage(result.error),
-      result.error,
-    );
+  async deletePtySession(vmId: string, ptyId: string, options: { deadlineMs?: number } = {}): Promise<void> {
+    const message = `delete PTY session ${ptyId} exceeded its deadline`;
+    return withExecutionDeadline(options.deadlineMs ?? 5_000, message, async (signal) => {
+      const result = await this.raw.DELETE("/v1/vms/{id}/pty/sessions/{pty_id}", {
+        params: { path: { id: vmId, pty_id: ptyId } },
+        signal,
+      });
+      if (result.response.status === 204 || result.response.status === 404) return;
+      throw new TaritApiError("delete PTY session", result.response.status, errorMessage(result.error), result.error);
+    }, () => undefined, () => new TaritDeadlineExceeded(message));
   }
 
   async fork(vmId: string, options: ForkOptions = {}): Promise<ForkVmResponse> {
+    const deadlineMs = options.deadlineMs ?? 30_000;
+    if (!validTimerDeadline(deadlineMs)) {
+      throw new RangeError("fork deadlineMs must be positive and at most 2147483647");
+    }
     const childId = options.childId ?? crypto.randomUUID();
-    const deadline = Date.now() + (options.deadlineMs ?? 30_000);
+    const deadline = performance.now() + deadlineMs;
+    const deadlineError = () => new TaritDeadlineExceeded(
+      `fork VM ${vmId} exceeded its deadline; child ID ${childId}`, { childId },
+    );
     let attempt = 0;
     while (true) {
-      const requestBudget = deadline - Date.now();
-      if (requestBudget <= 0) throw new TaritDeadlineExceeded(`fork VM ${vmId} exceeded its deadline`);
+      const requestBudget = deadline - performance.now();
+      if (requestBudget <= 0) throw deadlineError();
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), Math.max(1, requestBudget));
       try {
@@ -523,6 +539,9 @@ export class TaritClient {
           body: { id: childId },
           signal: controller.signal,
         });
+        // A complete response is authoritative even when it lands after the deadline: a
+        // late 201/200 means the child exists and a late 4xx is a definite rejection. Only
+        // a retryable status falls through to the deadline check below.
         // 201 creates the child; 200 replays a fork that already used this child id.
         if ((result.response.status === 201 || result.response.status === 200) && result.data !== undefined) {
           return result.data;
@@ -541,8 +560,8 @@ export class TaritClient {
       } finally {
         clearTimeout(timer);
       }
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) throw new TaritDeadlineExceeded(`fork VM ${vmId} exceeded its deadline`);
+      const remaining = deadline - performance.now();
+      if (remaining <= 0) throw deadlineError();
       await sleep(Math.min(retryDelay(attempt), remaining));
       attempt += 1;
     }
@@ -593,6 +612,7 @@ export class TaritClient {
     deadline: number,
     pollInterval: number,
   ): Promise<ExecutionRecord> {
+    let retryAttempt = 0;
     while (true) {
       if (signal.aborted || performance.now() >= deadline) {
         throw new TaritDeadlineExceeded(`execution ${executionId} exceeded its deadline`);
@@ -601,6 +621,12 @@ export class TaritClient {
         params: { path: { id: executionId } },
         signal,
       });
+      if (RETRYABLE_STATUS.has(result.response.status)) {
+        const delay = Math.max(pollInterval, retryDelay(retryAttempt++));
+        await sleepUntil(Math.min(performance.now() + delay, deadline));
+        continue;
+      }
+      retryAttempt = 0;
       if (result.response.status !== 200 || result.data === undefined) {
         throw new TaritApiError(
           "get execution",
