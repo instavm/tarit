@@ -41,7 +41,8 @@ class MakeInstallTests(unittest.TestCase):
             "orch/target/release/taritd": ["orch/crates/taritd/src/main.rs", "proto/src/lib.rs"],
         }
         files = [path for paths in self.sources.values() for path in paths]
-        files += ["vmm/Cargo.lock", "orch/Cargo.lock", "vmm/guest/agent/vmm-agent.c"]
+        files += ["vmm/Cargo.lock", "orch/Cargo.lock"]
+        files += ["vmm/guest/agent/vmm-agent.c", "vmm/guest/agent/worker-supervisor.h"]
         for path in files:
             self.write(path, "source", OLD)
         self.registry.parent.mkdir(parents=True)
