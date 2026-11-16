@@ -5158,7 +5158,7 @@ mod tests {
             .get_snapshot_location(snapshot.snapshot_id)
             .await?
             .unwrap();
-        assert_eq!(retained.owner_key, "tenant-a");
+        assert_eq!(retained.owner_key, snapshot.owner_key.as_deref().unwrap());
         assert_eq!(retained.host_id, moved.host_id);
         assert_eq!(retained.snapshot_path, moved.path);
         let mut ownerless = moved.clone();
@@ -5187,7 +5187,11 @@ mod tests {
             .unwrap();
         assert_eq!(
             winner.owner_key,
-            if left.is_ok() { "tenant-a" } else { "tenant-b" }
+            if left.is_ok() {
+                snapshot.owner_key.as_deref().unwrap()
+            } else {
+                "tenant-b"
+            }
         );
         let client = fleet.pool.get().await?;
         client
