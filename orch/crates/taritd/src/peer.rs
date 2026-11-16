@@ -142,6 +142,12 @@ pub(crate) struct ArtifactTransferDescriptor {
     pub integrity_bytes: u64,
 }
 
+/// Per-node deadline for one tenant's snapshot list. Listing reads the owner
+/// node's local store, so a node that has not answered by then is reported as
+/// unavailable in the partial list rather than holding the whole
+/// `GET /v1/snapshots` for the client's general 120 s budget.
+pub(crate) const SNAPSHOT_LIST_PEER_TIMEOUT: Duration = Duration::from_secs(10);
+
 impl PeerClient {
     #[cfg(test)]
     pub fn new(secret: String) -> Self {
@@ -1023,6 +1029,62 @@ impl PeerClient {
         Self::decode(resp, "egress")
     }
 
+    pub fn list_snapshots_remote(
+        &self,
+        target: &PeerTarget,
+        identity: &ApiIdentity,
+    ) -> Result<Vec<crate::api::PublicSnapshot>, OrchError> {
+        self.list_snapshots_remote_within(target, identity, SNAPSHOT_LIST_PEER_TIMEOUT)
+    }
+
+    fn list_snapshots_remote_within(
+        &self,
+        target: &PeerTarget,
+        identity: &ApiIdentity,
+        timeout: Duration,
+    ) -> Result<Vec<crate::api::PublicSnapshot>, OrchError> {
+        let request = self.empty_request(
+            target,
+            reqwest::Method::GET,
+            "/internal/v1/snapshots",
+            Some(identity),
+        )?;
+        let response = request
+            .timeout(timeout)
+            .send()
+            .map_err(|error| OrchError::Unavailable(format!("peer snapshot list: {error}")))?;
+        if response.status().as_u16() == 503 {
+            return Err(OrchError::Unavailable(
+                "peer snapshot list unavailable".into(),
+            ));
+        }
+        Self::decode(response, "snapshot list")
+    }
+
+    pub fn delete_snapshot_remote(
+        &self,
+        target: &PeerTarget,
+        id: Uuid,
+        identity: &ApiIdentity,
+    ) -> Result<(), OrchError> {
+        let path = format!("/internal/v1/snapshots/{id}");
+        let request = self.empty_request(target, reqwest::Method::DELETE, &path, Some(identity))?;
+        let response = request
+            .send()
+            .map_err(|error| OrchError::Unavailable(format!("peer snapshot delete: {error}")))?;
+        if response.status().is_success() {
+            return Ok(());
+        }
+        if response.status().as_u16() == 503 {
+            return Err(OrchError::Unavailable(
+                "peer snapshot delete unavailable".into(),
+            ));
+        }
+        // Decode preserves the owner-side lifecycle/authentication error. A
+        // successful delete is 204 and deliberately has no JSON body.
+        Self::decode::<serde_json::Value>(response, "snapshot delete").map(|_| ())
+    }
+
     pub fn get_egress_policy_remote(
         &self,
         target: &PeerTarget,
@@ -1380,6 +1442,48 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), expected);
         assert_eq!(digest, format!("sha256:{:x}", Sha256::digest(&expected)));
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn snapshot_list_gives_up_on_a_node_that_never_answers() {
+        use std::net::TcpListener;
+        // A registered node that accepts the connection but never replies
+        // (wedged, or stopped mid-request) must count as unavailable within
+        // the snapshot-list deadline, not the client's 120 s budget.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let _ = release_rx.recv();
+            drop(stream);
+        });
+        let client = PeerClient::new("peer-secret".into());
+        let target = PeerTarget {
+            host_id: "node-b".into(),
+            boot_session_id: Uuid::new_v4(),
+            rpc_addr: format!("http://{address}"),
+        };
+        let identity = ApiIdentity {
+            api_key_id: "key-a".into(),
+            tenant: "tenant-a".into(),
+            role: ApiRole::User,
+            max_vms: None,
+        };
+        let started = std::time::Instant::now();
+        let result =
+            client.list_snapshots_remote_within(&target, &identity, Duration::from_millis(300));
+        let elapsed = started.elapsed();
+        release_tx.send(()).unwrap();
+        server.join().unwrap();
+        assert!(
+            matches!(result, Err(OrchError::Unavailable(_))),
+            "{result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "silent node held the list for {elapsed:?}"
+        );
     }
 
     #[test]

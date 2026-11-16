@@ -27,7 +27,6 @@ use crate::supervisor::VmAdmissionGate;
 
 const TICK: Duration = Duration::from_secs(10);
 const LEADER_TTL_SECS: i64 = 30;
-const HOST_FRESH: Duration = Duration::from_secs(15);
 const COOLDOWN: Duration = Duration::from_secs(60);
 
 struct ScaleDecision<'a> {
@@ -75,22 +74,17 @@ pub fn spawn(
                 }
             }
 
-            let hosts = match fleet.list_hosts().await {
+            let (now, hosts) = match fleet.list_hosts_with_clock().await {
                 Ok(h) => h,
                 Err(e) => {
                     tracing::warn!("autoscaler: list_hosts failed: {e}");
                     continue;
                 }
             };
-            let now = chrono::Utc::now();
             let healthy: Vec<_> = hosts
                 .iter()
                 .filter(|h| {
-                    h.healthy
-                        && (now - h.last_heartbeat)
-                            .to_std()
-                            .map(|d| d < HOST_FRESH)
-                            .unwrap_or(false)
+                    h.healthy && tarit_fleet::host_heartbeat_is_fresh(h.last_heartbeat, now)
                 })
                 .collect();
             let node_count = healthy.len();

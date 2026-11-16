@@ -32,7 +32,7 @@ Boolean environment variables accept `1`, `true`, `yes`, or `on` for true and `0
 | --- | --- | --- | --- |
 | `TARIT_DATABASE_URL` | string | unset | PostgreSQL fleet registry URL. Empty string is treated as unset. Setting this enables distributed fleet behavior. `TARIT_PRODUCTION=1` requires `sslmode=require` unless every host is a Unix socket, because the default `sslmode=prefer` silently falls back to plaintext. |
 | `TARIT_PEER_SECRET` | string | random local-only value | Key for short-lived, source/target-bound peer request HMACs. It is never sent on the wire. Explicit values must be at least 32 characters and cannot be `dev-peer-secret`; cluster mode requires this variable. |
-| `TARIT_ALLOW_INSECURE_PEER_HTTP` | bool | `false` | Permit `http://` peer origins in cluster mode. Use only on an isolated development network; production mode forbids it. |
+| `TARIT_ALLOW_INSECURE_PEER_HTTP` | bool | `false` | Permit `http://` peer origins in cluster mode. Use only on an isolated development network; production mode forbids it. When set, `TARIT_PEER_LISTEN` and an IP-literal `TARIT_RPC_ADDR` must be loopback or private (RFC 1918 / IPv6 unique-local `fc00::/7`; wildcard binds are refused), and startup logs a loud `INSECURE` warning. |
 | `TARIT_PRODUCTION` | bool | `false` | Enforce the strict production configuration gates, including per-VM PID and network namespaces. This does not by itself satisfy every release gate in `PRODUCTION_READINESS.md`. |
 | `TARIT_IMAGE_REQUIRE_SIGNATURE` | bool | `false` | Require registered OCI images to have been verified with the currently configured cosign public key. `TARIT_PRODUCTION=1` requires this setting. Non-admin production creates must name a registered image and cannot fall back to the raw node default rootfs. |
 | `TARIT_IMAGE_COSIGN_KEY` | path | unset | Trusted cosign public key used at image admission. The key is hashed into the immutable image record; rotating the configured key fences images admitted by the old policy until they are explicitly readmitted or the old key is restored. |
@@ -346,6 +346,10 @@ origin and set `TARIT_ALLOW_INSECURE_PEER_HTTP=1` explicitly.
 - Cluster peer origins must use HTTPS unless
   `TARIT_ALLOW_INSECURE_PEER_HTTP=1`; production mode always forbids insecure
   peer HTTP.
+- With `TARIT_ALLOW_INSECURE_PEER_HTTP=1`, `TARIT_PEER_LISTEN` and an
+  IP-literal `TARIT_RPC_ADDR` must be loopback or private (IPv4 RFC 1918, IPv6
+  `fc00::/7`); a public or wildcard (`0.0.0.0`, `::`) address is refused with
+  `TARIT_ALLOW_INSECURE_PEER_HTTP=1 requires ...`.
 - PTY active-connection limits must be positive; the per-tenant limit must be
   less than the global limit, and the per-VM limit must not exceed the
   per-tenant limit.
