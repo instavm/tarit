@@ -13669,7 +13669,7 @@ mod tests {
             assert!(supervisor.warm.lock().unwrap().is_empty());
             assert!(!supervisor.scheduler.is_reserved(id));
             supervisor.scan_for_exited_processes(); // Idempotent after successful retry.
-            assert!(supervisor.take_unexpected_exits().is_empty());
+            assert!(supervisor.pending_unexpected_exits().is_empty());
         }
     }
 
@@ -13767,7 +13767,7 @@ mod tests {
             Some(1),
             "warm cleanup retry ran before the user VM exit was reconciled"
         );
-        let exits = supervisor.take_unexpected_exits();
+        let exits = supervisor.pending_unexpected_exits();
         assert_eq!(exits.len(), 1);
         assert_eq!(exits[0].id, user_id);
         std::fs::remove_dir(&socket).unwrap();
