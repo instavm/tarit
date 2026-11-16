@@ -524,8 +524,9 @@ Response `200`:
 ```
 
 In cluster mode the list covers every node that holds one of the caller's
-snapshots. A node that cannot answer (down, unhealthy, stale, deregistered, or
-running a version without the peer snapshot route) does not fail the request:
+snapshots. A node that cannot answer (down, unhealthy, stale, deregistered,
+running a version without the peer snapshot route, or silent for 10 seconds)
+does not fail the request:
 the response is still `200` with the snapshots every other node returned, and
 carries the header `X-Tarit-Unavailable-Hosts: <n>`, the number of nodes holding
 some of the caller's snapshots that could not be asked. The header is absent
