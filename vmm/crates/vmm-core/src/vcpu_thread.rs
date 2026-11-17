@@ -281,10 +281,13 @@ impl VcpuThread {
                             // to let other threads (serial, net) run.
                             std::thread::yield_now();
                         }
-                        Ok(exit) => {
-                            handle_io_exit(exit, &mmio_bus, &serial_for_thread)?;
-                            pending_io = true;
-                        }
+                        Ok(exit) => match handle_io_exit(exit, &mmio_bus, &serial_for_thread)? {
+                            ExitAction::Continue => pending_io = true,
+                            // The guest can never run again. Ending the thread
+                            // marks it exited; the controller then records
+                            // the VM as stopped.
+                            ExitAction::GuestStop => return Ok(()),
+                        },
                         Err(e) => {
                             // EINTR = a control-thread tgkill(SIGALRM) fired
                             // to interrupt this blocking KVM_RUN so we re-check
@@ -607,6 +610,7 @@ fn complete_pending_io(
     budget: usize,
 ) -> Result<PendingIo> {
     vcpu.set_kvm_immediate_exit(1);
+    let mut guest_stopped = false;
     let result = drain_pending_io(stop, budget, || match vcpu.run() {
         Err(error) if error.errno() == libc::EINTR => Ok(true),
         Err(error) if error.errno() == libc::EAGAIN => Ok(false),
@@ -615,20 +619,36 @@ fn complete_pending_io(
         ))),
         // One instruction may need multiple exits (e.g. split MMIO). Service
         // those with immediate_exit still set, until KVM confirms completion.
-        Ok(exit) => {
-            handle_io_exit(exit, bus, serial)?;
-            Ok(false)
-        }
+        Ok(exit) => match handle_io_exit(exit, bus, serial)? {
+            ExitAction::Continue => Ok(false),
+            ExitAction::GuestStop => {
+                guest_stopped = true;
+                Ok(true)
+            }
+        },
     });
     vcpu.set_kvm_immediate_exit(0);
+    if guest_stopped {
+        return Ok(PendingIo::Stopped);
+    }
     result
+}
+
+/// What the run loop does after a userspace exit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitAction {
+    /// The exit was serviced; keep running the guest.
+    Continue,
+    /// The guest reset or shut itself down. With no firmware to reset into,
+    /// the guest can never run again, so this vCPU stops.
+    GuestStop,
 }
 
 fn handle_io_exit(
     exit: VcpuExit<'_>,
     bus: &MmioBus,
     serial: &vmm_devices::serial::Serial,
-) -> Result<()> {
+) -> Result<ExitAction> {
     match exit {
         VcpuExit::MmioWrite(addr, data) => {
             let mut bytes = [0; 8];
@@ -647,6 +667,9 @@ fn handle_io_exit(
         VcpuExit::IoOut(port, data) => {
             if (0x3f8..=0x3ff).contains(&port) {
                 serial.write((port - 0x3f8) as u8, data[0]);
+            } else if crate::vcpu::is_i8042_reset(port, data) {
+                log::info!("i8042 reset (port 0x64, 0xFE) — guest rebooting; vCPU stopping");
+                return Ok(ExitAction::GuestStop);
             }
         }
         VcpuExit::IoIn(port, data) => {
@@ -654,12 +677,27 @@ fn handle_io_exit(
                 data[0] = serial.read((port - 0x3f8) as u8);
             }
         }
+        // A triple fault (Linux's last reboot method) or a reset, shutdown
+        // or crash the guest reported to KVM.
+        VcpuExit::Shutdown => {
+            log::info!("KVM_EXIT_SHUTDOWN — guest reset (triple fault); vCPU stopping");
+            return Ok(ExitAction::GuestStop);
+        }
+        VcpuExit::SystemEvent(
+            kind @ (kvm_bindings::KVM_SYSTEM_EVENT_SHUTDOWN
+            | kvm_bindings::KVM_SYSTEM_EVENT_RESET
+            | kvm_bindings::KVM_SYSTEM_EVENT_CRASH),
+            _,
+        ) => {
+            log::info!("KVM system event {kind} — guest shutdown, reset or crash; vCPU stopping");
+            return Ok(ExitAction::GuestStop);
+        }
         other => {
             log::warn!("vCPU exit {other:?} — stopping");
             return Err(VmmError::Kvm(format!("unhandled exit: {other:?}")));
         }
     }
-    Ok(())
+    Ok(ExitAction::Continue)
 }
 
 #[cfg(test)]
@@ -811,14 +849,103 @@ mod tests {
     fn unhandled_exit_is_logged_before_the_vcpu_stops() {
         let serial = test_serial();
         let (result, warnings) =
-            capture_warnings(|| handle_io_exit(VcpuExit::Shutdown, &MmioBus::new(), &serial));
+            capture_warnings(|| handle_io_exit(VcpuExit::InternalError, &MmioBus::new(), &serial));
         assert!(result.is_err());
         assert!(
             warnings
                 .iter()
-                .any(|line| line.contains("Shutdown") && line.contains("stopping")),
+                .any(|line| line.contains("InternalError") && line.contains("stopping")),
             "{warnings:?}"
         );
+    }
+
+    /// Every way a guest resets or shuts itself down stops its vCPU cleanly
+    /// (not as a fault). Before this, `vmm serve` dropped the i8042 reset,
+    /// so a guest that panicked with `reboot=k panic=1` ran on with no exits
+    /// and its VM never stopped. Ordinary port writes, including other
+    /// i8042 commands, keep the guest running. Needs the `kvm` feature on
+    /// Linux, not /dev/kvm.
+    #[test]
+    fn guest_reset_and_shutdown_exits_stop_the_vcpu() {
+        let serial = test_serial();
+        let bus = MmioBus::new();
+        let action = |exit| handle_io_exit(exit, &bus, &serial).unwrap();
+        assert_eq!(
+            action(VcpuExit::IoOut(0x64, &[0xfe])),
+            ExitAction::GuestStop
+        );
+        assert_eq!(action(VcpuExit::Shutdown), ExitAction::GuestStop);
+        for kind in [
+            kvm_bindings::KVM_SYSTEM_EVENT_SHUTDOWN,
+            kvm_bindings::KVM_SYSTEM_EVENT_RESET,
+            kvm_bindings::KVM_SYSTEM_EVENT_CRASH,
+        ] {
+            assert_eq!(
+                action(VcpuExit::SystemEvent(kind, &[])),
+                ExitAction::GuestStop
+            );
+        }
+        assert_eq!(action(VcpuExit::IoOut(0x64, &[0xad])), ExitAction::Continue);
+        assert_eq!(action(VcpuExit::IoOut(0x60, &[0xfe])), ExitAction::Continue);
+        assert_eq!(action(VcpuExit::IoOut(0x80, &[0x00])), ExitAction::Continue);
+        let mut status = [0u8];
+        assert_eq!(
+            action(VcpuExit::IoIn(0x64, &mut status)),
+            ExitAction::Continue
+        );
+    }
+
+    /// A real guest's i8042 reset and triple fault each end the vCPU thread
+    /// promptly and without error, so the controller can record the VM as
+    /// stopped; a guest that keeps running keeps its thread.
+    #[test]
+    #[ignore = "requires /dev/kvm; run explicitly on the KVM fixture host"]
+    fn kvm_guest_reset_and_triple_fault_end_the_vcpu_thread() {
+        let kvm = kvm_ioctls::Kvm::new().unwrap();
+        for (name, program) in [
+            // mov al, 0xfe; out 0x64, al; jmp $
+            ("i8042 reset", &[0xb0, 0xfe, 0xe6, 0x64, 0xeb, 0xfe][..]),
+            // lidt [0x3100] (zero limit); int3; jmp $ — the breakpoint cannot
+            // be delivered, nor can the faults that follow: a triple fault.
+            (
+                "triple fault",
+                &[0x0f, 0x01, 0x1e, 0x00, 0x31, 0xcc, 0xeb, 0xfe][..],
+            ),
+        ] {
+            let (vm, _mem) = real_mode_vm(&kvm, program);
+            let thread = VcpuThread::spawn(
+                VcpuId(0),
+                real_mode_vcpu(&vm),
+                Arc::new(MmioBus::new()),
+                test_serial(),
+            )
+            .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            while !thread.is_exited() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{name}: the vCPU thread did not stop"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            thread
+                .stop()
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+        }
+
+        // A guest writing other i8042 commands keeps running.
+        // mov al, 0xad; out 0x64, al; jmp $
+        let (vm, _mem) = real_mode_vm(&kvm, &[0xb0, 0xad, 0xe6, 0x64, 0xeb, 0xfe]);
+        let thread = VcpuThread::spawn(
+            VcpuId(0),
+            real_mode_vcpu(&vm),
+            Arc::new(MmioBus::new()),
+            test_serial(),
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!thread.is_exited());
+        thread.stop().unwrap();
     }
 
     /// #126: a vCPU thread started with `spawn_parked` runs no guest
@@ -968,7 +1095,10 @@ mod tests {
             loop {
                 match vcpu.run() {
                     Ok(VcpuExit::Hlt) => break,
-                    Ok(exit) => handle_io_exit(exit, &bus, &serial).unwrap(),
+                    Ok(exit) => assert_eq!(
+                        handle_io_exit(exit, &bus, &serial).unwrap(),
+                        ExitAction::Continue
+                    ),
                     Err(error) if error.errno() == libc::EINTR => {}
                     Err(error) => panic!("KVM_RUN after completion: {error}"),
                 }
