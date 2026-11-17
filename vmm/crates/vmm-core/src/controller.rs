@@ -714,6 +714,7 @@ impl VmmController {
         let vm = slot
             .as_mut()
             .ok_or_else(|| VmmError::InvalidConfig("no VM (boot first)".into()))?;
+        settle_guest_stop(vm);
 
         if vm.state == VmState::Stopped {
             return Err(VmmError::InvalidConfig(
@@ -1594,6 +1595,7 @@ impl VmmController {
             let vm = slot
                 .as_mut()
                 .ok_or_else(|| VmmError::InvalidConfig("no VM".into()))?;
+            settle_guest_stop(vm);
             if vm.state != VmState::Running {
                 return Err(VmmError::InvalidConfig(
                     "live snapshot requires a running VM".into(),
@@ -2339,6 +2341,7 @@ impl VmmController {
         let vm = slot
             .as_mut()
             .ok_or_else(|| VmmError::InvalidConfig("no VM".into()))?;
+        settle_guest_stop(vm);
         if vm.state == VmState::Stopped {
             return Err(VmmError::InvalidConfig(
                 "cannot suspend a stopped VM".into(),
@@ -2367,6 +2370,7 @@ impl VmmController {
         let vm = slot
             .as_mut()
             .ok_or_else(|| VmmError::InvalidConfig("no VM".into()))?;
+        settle_guest_stop(vm);
         if vm.state == VmState::Paused {
             return Ok(());
         }
@@ -2405,6 +2409,7 @@ impl VmmController {
         let vm = slot
             .as_mut()
             .ok_or_else(|| VmmError::InvalidConfig("no VM".into()))?;
+        settle_guest_stop(vm);
         if vm.state == VmState::Running {
             return Ok(());
         }
@@ -2427,12 +2432,15 @@ impl VmmController {
 
     /// Return a cheap health/info snapshot of the VM (no guest interaction).
     /// Errors if no VM exists — that error is itself a valid response proving
-    /// the serve process is alive to the orchestrator's health check.
+    /// the serve process is alive to the orchestrator's health check. A VM
+    /// whose guest has stopped itself is recorded as stopped first (see
+    /// [`settle_guest_stop`]), so the status reports it.
     pub fn status(&self) -> Result<crate::state::VmStatus> {
-        let slot = self.lock();
+        let mut slot = self.lock();
         let vm = slot
-            .as_ref()
+            .as_mut()
             .ok_or_else(|| VmmError::InvalidConfig("no VM (boot first)".into()))?;
+        settle_guest_stop(vm);
 
         #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
         let vcpu_alive = vm
@@ -3497,6 +3505,27 @@ fn stop_after_uncertain_pause(vm: &mut VmInstance) {
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
     stop_running_vm(vm);
     vm.state = VmState::Stopped;
+}
+
+/// A vCPU thread ends on its own only when the guest can never run again: it
+/// reset or shut itself down (an i8042 reset, a triple fault, a KVM system
+/// event) or KVM_RUN failed. Record that VM as stopped through the same
+/// stop-in-place as an unconfirmed pause, so the status reports it and pause,
+/// snapshot and suspend refuse it rather than act on a dead guest. A live
+/// snapshot holds the vCPU threads outside the slot while it runs; this
+/// checks only a VM that holds its own.
+fn settle_guest_stop(vm: &mut VmInstance) {
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    if vm.state != VmState::Stopped
+        && vm.running.as_ref().is_some_and(|running| {
+            running.vcpu_thread.is_exited() || running.ap_threads.iter().any(|ap| ap.is_exited())
+        })
+    {
+        log::warn!("a vCPU stopped on its own (guest reset, shutdown or fault); stopping the VM");
+        stop_after_uncertain_pause(vm);
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
+    let _ = vm;
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]

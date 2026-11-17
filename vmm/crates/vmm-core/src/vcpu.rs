@@ -42,6 +42,21 @@ impl VcpuId {
 ))]
 pub(crate) const PENDING_IO_REENTRY_BUDGET: usize = 16_384;
 
+/// The guest's i8042 CPU reset: 0xFE written to the controller's command
+/// port 0x64. Linux resets this way for `reboot=k`, including the reset that
+/// `panic=N` performs after a kernel panic. This VMM has no BIOS to reset
+/// into, so the reset ends the guest. A guest whose reset is ignored falls
+/// through to Linux's real-mode BIOS restart and runs on with no exits.
+#[cfg(any(
+    test,
+    all(feature = "kvm", target_arch = "x86_64", target_os = "linux")
+))]
+pub(crate) fn is_i8042_reset(port: u16, data: &[u8]) -> bool {
+    const I8042_COMMAND_PORT: u16 = 0x64;
+    const I8042_PULSE_RESET: u8 = 0xfe;
+    port == I8042_COMMAND_PORT && data.first() == Some(&I8042_PULSE_RESET)
+}
+
 /// Outcome of finishing a vCPU's in-flight I/O instruction before a pause.
 #[cfg(any(
     test,
@@ -172,6 +187,19 @@ mod tests {
             // TASK_COMM_LEN is 16 including the terminating NUL.
             assert!(VcpuId(id).thread_name().len() <= 15);
         }
+    }
+
+    /// Only the reset command on the command port is a reset. Other
+    /// controller commands, and 0xFE written to the data port 0x60 (a
+    /// keyboard "resend"), are not.
+    #[test]
+    fn only_the_i8042_reset_command_resets_the_guest() {
+        assert!(is_i8042_reset(0x64, &[0xfe]));
+        assert!(!is_i8042_reset(0x64, &[0xad]));
+        assert!(!is_i8042_reset(0x64, &[0xd1]));
+        assert!(!is_i8042_reset(0x60, &[0xfe]));
+        assert!(!is_i8042_reset(0x3f8, &[0xfe]));
+        assert!(!is_i8042_reset(0x64, &[]));
     }
 
     #[test]
