@@ -36,7 +36,9 @@ types.
 - **Fork.** A running VM can be forked. Children share its memory until
   they write to it, and on a reflink filesystem its disk too.
 - **Images.** Any OCI or Docker image can become a VM root filesystem,
-  without root (`taritd image build`, `vmm pull`).
+  without root through a local Docker/Podman engine (`taritd image build`,
+  `vmm pull`). Registry conversion using only skopeo/umoci requires ownership
+  privileges; an explicit registry auth file cannot be forwarded to the engine.
 - **Network.** With taritd's networking on, each VM gets its own TAP and
   address, and outbound traffic is denied unless allowed.
 - **Access.** Commands run over vsock; there are also PTYs, an SSH
