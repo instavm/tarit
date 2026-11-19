@@ -1266,6 +1266,41 @@ impl VirtioNetMmio {
         *self.lock_state(&self.rx_processor, "rx_processor") = None;
         *self.lock_state(&self.tx_processor, "tx_processor") = None;
     }
+
+    fn apply_state(&self, state: VirtioNetMmioState) {
+        self.status.store(state.status, Ordering::Relaxed);
+        self.queue_sel.store(state.queue_sel, Ordering::Relaxed);
+        self.host_features_sel
+            .store(state.host_features_sel, Ordering::Relaxed);
+        self.guest_features_sel
+            .store(state.guest_features_sel, Ordering::Relaxed);
+        self.guest_features
+            .store(state.guest_features, Ordering::Relaxed);
+        *self.lock_state(&self.queues, "queues") = state.queues;
+        self.activated.store(state.activated, Ordering::Relaxed);
+        if state.activated {
+            // The new tap starts with no offloads; give it the guest's.
+            self.request_tap_offloads(state.guest_features);
+        }
+        self.interrupt_status
+            .store(state.interrupt_status, Ordering::SeqCst);
+        let queues = self.lock_state(&self.queues, "queues");
+        let rx_config = queues
+            .get(QUEUE_RX)
+            .map(Self::queue_config_from_state)
+            .unwrap_or_default();
+        let tx_config = queues
+            .get(QUEUE_TX)
+            .map(Self::queue_config_from_state)
+            .unwrap_or_default();
+        drop(queues);
+        *self.lock_state(&self.rx_processor, "rx_processor") = state
+            .rx_processor
+            .map(|p| VirtQueueProcessor::from_state(rx_config, p));
+        *self.lock_state(&self.tx_processor, "tx_processor") = state
+            .tx_processor
+            .map(|p| VirtQueueProcessor::from_state(tx_config, p));
+    }
 }
 
 impl Persist for VirtioNetMmio {
@@ -1281,38 +1316,7 @@ impl Persist for VirtioNetMmio {
     }
 
     fn restore(&mut self, state: Self::State) {
-        self.status.store(state.status, Ordering::Relaxed);
-        self.queue_sel.store(state.queue_sel, Ordering::Relaxed);
-        self.host_features_sel
-            .store(state.host_features_sel, Ordering::Relaxed);
-        self.guest_features_sel
-            .store(state.guest_features_sel, Ordering::Relaxed);
-        self.guest_features
-            .store(state.guest_features, Ordering::Relaxed);
-        *self.lock_state(&self.queues, "queues") = state.queues;
-        self.activated.store(state.activated, Ordering::Relaxed);
-        if state.activated {
-            // The new tap starts with no offloads; give it the guest's.
-            self.request_tap_offloads(state.guest_features);
-        }
-        self.interrupt_status
-            .store(state.interrupt_status, Ordering::SeqCst);
-        let queues = self.lock_state(&self.queues, "queues");
-        let rx_config = queues
-            .get(QUEUE_RX)
-            .map(Self::queue_config_from_state)
-            .unwrap_or_default();
-        let tx_config = queues
-            .get(QUEUE_TX)
-            .map(Self::queue_config_from_state)
-            .unwrap_or_default();
-        drop(queues);
-        *self.lock_state(&self.rx_processor, "rx_processor") = state
-            .rx_processor
-            .map(|p| VirtQueueProcessor::from_state(rx_config, p));
-        *self.lock_state(&self.tx_processor, "tx_processor") = state
-            .tx_processor
-            .map(|p| VirtQueueProcessor::from_state(tx_config, p));
+        self.apply_state(state);
     }
 }
 
@@ -1328,38 +1332,7 @@ impl Persist for Arc<VirtioNetMmio> {
     }
 
     fn restore(&mut self, state: Self::State) {
-        self.status.store(state.status, Ordering::Relaxed);
-        self.queue_sel.store(state.queue_sel, Ordering::Relaxed);
-        self.host_features_sel
-            .store(state.host_features_sel, Ordering::Relaxed);
-        self.guest_features_sel
-            .store(state.guest_features_sel, Ordering::Relaxed);
-        self.guest_features
-            .store(state.guest_features, Ordering::Relaxed);
-        *self.lock_state(&self.queues, "queues") = state.queues;
-        self.activated.store(state.activated, Ordering::Relaxed);
-        if state.activated {
-            // The new tap starts with no offloads; give it the guest's.
-            self.request_tap_offloads(state.guest_features);
-        }
-        self.interrupt_status
-            .store(state.interrupt_status, Ordering::SeqCst);
-        let queues = self.lock_state(&self.queues, "queues");
-        let rx_config = queues
-            .get(QUEUE_RX)
-            .map(VirtioNetMmio::queue_config_from_state)
-            .unwrap_or_default();
-        let tx_config = queues
-            .get(QUEUE_TX)
-            .map(VirtioNetMmio::queue_config_from_state)
-            .unwrap_or_default();
-        drop(queues);
-        *self.lock_state(&self.rx_processor, "rx_processor") = state
-            .rx_processor
-            .map(|p| VirtQueueProcessor::from_state(rx_config, p));
-        *self.lock_state(&self.tx_processor, "tx_processor") = state
-            .tx_processor
-            .map(|p| VirtQueueProcessor::from_state(tx_config, p));
+        self.apply_state(state);
     }
 }
 
@@ -1606,9 +1579,14 @@ mod tests {
 
         let mut restored = VirtioNetMmio::new(6, [0; 6]);
         restored.set_vnet_hdr(true);
-        restored.restore(state);
+        restored.restore(state.clone());
         assert_eq!(restored.negotiated_offloads(), net_features::OFFLOADS);
         assert_eq!(restored.take_offload_request(), Some(0x07));
+        let mut shared = Arc::new(VirtioNetMmio::new(6, [0; 6]));
+        shared.set_vnet_hdr(true);
+        let observer = shared.clone();
+        shared.restore(state);
+        assert_eq!(observer.take_offload_request(), Some(0x07));
     }
 
     #[cfg(target_os = "linux")]
@@ -2524,6 +2502,14 @@ mod tests {
         let state = dev.save();
         let mut restored = VirtioNetMmio::new(6, [0; 6]);
         restored.restore(state.clone());
+        let mut shared = std::sync::Arc::new(VirtioNetMmio::new(6, [0; 6]));
+        let observer = shared.clone();
+        shared.restore(state.clone());
+        assert_eq!(
+            observer.save(),
+            state,
+            "Arc restore must update the shared transport"
+        );
 
         assert_eq!(restored.save(), state);
         assert_eq!(
