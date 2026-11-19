@@ -5,7 +5,9 @@ use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::sync::RwLock;
 use thiserror::Error;
-use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap, GuestRegionMmap, MmapRegion};
+use vm_memory::{
+    Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap, GuestRegionMmap, MmapRegion,
+};
 
 /// Guest physical addresses reserved for virtio MMIO, PCI configuration, and
 /// the KVM TSS. RAM above the aperture is packed immediately after low RAM in
@@ -382,14 +384,22 @@ impl GuestMemory {
         }
     }
 
-    fn gpa_range_to_offset(&self, gpa: u64, len: u64) -> Option<u64> {
-        let end = gpa.checked_add(len)?;
-        let offset = self.gpa_to_offset(gpa)?;
-        if len == 0 {
-            return Some(offset);
+    /// Translate a complete range inside one RAM region to its packed backing
+    /// offset. Reject holes, partial ranges, arithmetic overflow, and mappings
+    /// outside our owned mmap; packed RAM size is not a guest address limit.
+    pub fn gpa_range_to_offset(&self, gpa: u64, len: u64) -> Option<u64> {
+        gpa.checked_add(len)?;
+        let length = usize::try_from(len).ok()?;
+        // get_slice validates the entire range in one actual RAM region;
+        // checking only the first address would admit a range into a hole.
+        self.inner.get_slice(GuestAddress(gpa), length).ok()?;
+        let host = self.inner.get_host_address(GuestAddress(gpa)).ok()? as usize;
+        let offset = host.checked_sub(self.backing.as_ptr() as usize)?;
+        let end = offset.checked_add(length)?;
+        if end > self.backing.size() || u64::try_from(end).ok()? > self.size_bytes {
+            return None;
         }
-        let last_offset = self.gpa_to_offset(end.checked_sub(1)?)?;
-        (last_offset == offset + len - 1).then_some(offset)
+        u64::try_from(offset).ok()
     }
 
     /// Read `buf.len()` bytes from guest physical address `gpa`.
@@ -543,6 +553,9 @@ impl GuestMemory {
         let offset = self
             .gpa_range_to_offset(gpa, len)
             .ok_or(MemoryError::OutOfBounds(gpa, len))?;
+        let host_offset =
+            usize::try_from(offset).map_err(|_| MemoryError::OutOfBounds(gpa, len))?;
+        let length = usize::try_from(len).map_err(|_| MemoryError::OutOfBounds(gpa, len))?;
         if let Some(discard) = self
             .lazy_page_discard
             .read()
@@ -550,14 +563,13 @@ impl GuestMemory {
             .clone()
         {
             discard
-                .discard(offset as usize, len as usize)
+                .discard(host_offset, length)
                 .map_err(|error| MemoryError::Region(error.to_string()))?;
             self.host_dirty.mark_range(offset, len);
             return Ok(());
         }
         let base = self.as_ptr() as *mut u8;
-        let offset = usize::try_from(offset).map_err(|_| MemoryError::OutOfBounds(gpa, len))?;
-        let length = usize::try_from(len).map_err(|_| MemoryError::OutOfBounds(gpa, len))?;
+        let offset = host_offset;
         if self.is_file_backed() {
             // SAFETY: range validation above proves this page-aligned subrange
             // is within the live guest mapping owned by `self`. MAP_FIXED
@@ -635,7 +647,7 @@ mod tests {
         );
         assert!(!mem.advise_huge_pages(u64::MAX - 10, 100), "overflow");
     }
-    use vm_memory::{GuestMemoryBackend as _, GuestMemoryRegion as _};
+    use vm_memory::GuestMemoryRegion as _;
 
     #[test]
     fn hotplug_layout_and_dma_dirty_tracking_preserve_packed_offsets() {
@@ -714,6 +726,63 @@ mod tests {
             &[0x5a; 16]
         );
         assert!(m.drain_host_dirty().contains(MMIO_GAP_START));
+    }
+
+    #[test]
+    fn range_translation_checks_regions_and_owned_backing() {
+        const PAGE: u64 = 4096;
+        let m = GuestMemory::new(MMIO_GAP_START + 2 * PAGE).unwrap();
+        assert_eq!(m.gpa_range_to_offset(0, PAGE), Some(0));
+        assert_eq!(
+            m.gpa_range_to_offset(MMIO_GAP_START - PAGE, PAGE),
+            Some(MMIO_GAP_START - PAGE)
+        );
+        assert_eq!(
+            m.gpa_range_to_offset(MMIO_GAP_END, 2 * PAGE),
+            Some(MMIO_GAP_START)
+        );
+        assert_eq!(
+            m.gpa_range_to_offset(MMIO_GAP_END + PAGE, PAGE),
+            Some(MMIO_GAP_START + PAGE)
+        );
+        for (gpa, len) in [
+            (MMIO_GAP_START, PAGE),
+            (MMIO_GAP_START - PAGE, PAGE + 1),
+            (
+                MMIO_GAP_START - PAGE,
+                MMIO_GAP_END - MMIO_GAP_START + 2 * PAGE,
+            ),
+            (MMIO_GAP_END + PAGE, PAGE + 1),
+            (MMIO_GAP_END + 2 * PAGE, PAGE),
+            (u64::MAX - PAGE + 1, PAGE),
+        ] {
+            assert_eq!(m.gpa_range_to_offset(gpa, len), None, "{gpa:#x}+{len}");
+        }
+        // Public region metadata cannot authorize mmap access outside backing.
+        let mut mismatched = GuestMemory::new(PAGE).unwrap();
+        mismatched.inner = Arc::new(
+            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), (2 * PAGE) as usize)]).unwrap(),
+        );
+        assert_eq!(mismatched.gpa_range_to_offset(0, PAGE), None);
+    }
+
+    #[test]
+    fn discard_high_ram_preserves_neighbors_and_rejects_holes_before_writing() {
+        const PAGE: u64 = 4096;
+        let m = GuestMemory::new_hotplug(256 * 1024 * 1024, 128 * 1024 * 1024).unwrap();
+        let high = MMIO_GAP_END;
+        m.write_phys(high, &[0x51; 4096]).unwrap();
+        m.write_phys(high + PAGE, &[0x52; 4096]).unwrap();
+        assert!(m.discard_range(m.low_size_bytes - PAGE, 2 * PAGE).is_err());
+        assert!(m.discard_range(m.low_size_bytes, PAGE).is_err());
+        m.discard_range(high, PAGE).unwrap();
+        let mut page = [0; 4096];
+        m.read_phys(high, &mut page).unwrap();
+        assert_eq!(page, [0; 4096]);
+        m.read_phys(high + PAGE, &mut page).unwrap();
+        assert_eq!(page, [0x52; 4096]);
+        let dirty = m.drain_host_dirty();
+        assert!(dirty.contains(m.low_size_bytes));
     }
 
     #[test]
