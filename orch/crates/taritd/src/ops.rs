@@ -5984,6 +5984,60 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn retry_during_delete_keeps_withdrawn_runtime_reserved_through_failed_teardown() {
+        let (state, _) = test_state_with_durable_writer();
+        let id = insert_running_vm(&state);
+        let other = insert_running_vm(&state);
+        let record = vm_get(&state, id).unwrap();
+        state.store.lock().unwrap().insert_vm(&record).unwrap();
+        state.supervisor.reserve_existing_for_test(id);
+        retain_confirmed_guest_stop(&state, record.clone(), Utc::now()).unwrap();
+
+        test_runtime().block_on(async {
+            let socket = std::env::temp_dir().join(format!("delete-{id}.sock"));
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            state
+                .supervisor
+                .install_test_control_runtime(id, socket.clone());
+            let deleting = tokio::spawn({
+                let state = state.clone();
+                async move { stop_local(&state, id).await }
+            });
+            // stop_vm sends Stop on this socket only after withdrawing the runtime.
+            let (stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                state.supervisor.operation_gate(id),
+                Err(OrchError::NotFound(_))
+            ));
+            retry_live_reconciliation(&state, &record).await.unwrap();
+            stop_local(&state, other).await.unwrap();
+            assert_eq!(vm_get(&state, other).unwrap().status, VmStatus::Stopped);
+            assert_eq!(vm_get(&state, id).unwrap().status, VmStatus::Running);
+            assert!(state.scheduler.is_reserved(id));
+
+            // Force the real cleanup to fail after the stop response is released.
+            drop(listener);
+            std::fs::remove_file(&socket).unwrap();
+            std::fs::create_dir(&socket).unwrap();
+            drop(stream);
+            let err = deleting.await.unwrap().unwrap_err();
+            assert!(err.to_string().contains("remove VMM socket"));
+            assert!(state.supervisor.operation_gate(id).is_ok());
+            assert!(state.scheduler.is_reserved(id));
+            assert_eq!(vm_get(&state, id).unwrap().status, VmStatus::Running);
+
+            std::fs::remove_dir(&socket).unwrap();
+            retry_live_reconciliation(&state, &record).await.unwrap();
+            assert!(!state.scheduler.is_reserved(id));
+            assert_eq!(vm_get(&state, id).unwrap().status, VmStatus::Stopped);
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn stopped_vmm_during_snapshot_retry_finalizes_runtime_and_usage() {
         snapshot_reconciliation_after_status_outage(
             tarit_vmm_client::VmState::Stopped,
@@ -6065,7 +6119,11 @@ mod tests {
                 .get_billing_end(id)
                 .unwrap()
                 .is_some());
-            std::fs::remove_file(socket).unwrap();
+            test_runtime()
+                .block_on(retry_live_reconciliation(&state, &vm))
+                .unwrap();
+            assert_eq!(vm_get(&state, id).unwrap().status, VmStatus::Stopped);
+            assert!(!socket.exists());
         }
     }
 
