@@ -156,14 +156,25 @@ fn retain_confirmed_guest_stop(
     record: VmRecord,
     stopped_at: chrono::DateTime<Utc>,
 ) -> Result<(), OrchError> {
+    let id = record.id;
+    // Serialize the observation with periodic metering. Keep the in-memory
+    // fence even if persisting it fails so reconciliation can retry.
+    let store = state
+        .store
+        .lock()
+        .map_err(|_| OrchError::Internal("store lock poisoned".into()))?;
     set_lifecycle_state(
         state,
-        record.id,
+        id,
         LifecycleState::Reconciling {
             record,
             stopped_at: Some(stopped_at),
         },
-    )
+    )?;
+    store
+        .freeze_billing_end(id, stopped_at)
+        .map_err(crate::api::store_err)?;
+    Ok(())
 }
 
 async fn observe_and_compensate_vm_status(
@@ -185,7 +196,10 @@ async fn reconcile_failed_live_operation(
     prior: &VmRecord,
     primary: OrchError,
 ) -> OrchError {
-    if prior.status != VmStatus::Running {
+    if !matches!(
+        prior.status,
+        VmStatus::Running | VmStatus::Paused | VmStatus::Suspended
+    ) {
         return primary;
     }
     let observed = match observe_vm_control_state(state, prior.id).await {
@@ -219,7 +233,7 @@ async fn reconcile_failed_live_operation(
             );
         }
     };
-    if observed == VmStatus::Running {
+    if observed == prior.status {
         return primary;
     }
     match compensate_vm_status(state, prior, observed).await {
@@ -780,6 +794,9 @@ async fn finish_terminal_transition(state: &AppState, id: Uuid) -> Result<(), Or
                         .store
                         .lock()
                         .map_err(|_| OrchError::Internal("store lock poisoned".into()))?;
+                    store
+                        .delete_egress_policy(owner_key, id)
+                        .map_err(crate::api::store_err)?;
                     // A scale-to-zero VM has no supervisor runtime to clean,
                     // but its durable hibernation relation still owns the
                     // snapshot binding. Remove it as part of the retryable
@@ -1151,6 +1168,11 @@ async fn retry_pending_lifecycle(state: &AppState, terminal_gate_held: bool) -> 
 
 async fn retry_live_reconciliation(state: &AppState, expected: &VmRecord) -> Result<(), OrchError> {
     let id = expected.id;
+    // DELETE keeps this lease even after the supervisor withdraws the runtime.
+    // A busy VM will be revisited on the next sweep.
+    let Some(activation) = activation_gate(state, id)?.try_lock_owned() else {
+        return Ok(());
+    };
     let operation = match state.supervisor.operation_gate(id) {
         Ok(gate) => Some(gate.lock_owned().await),
         Err(OrchError::NotFound(_)) => None,
@@ -1187,35 +1209,13 @@ async fn retry_live_reconciliation(state: &AppState, expected: &VmRecord) -> Res
         }
     };
 
-    let terminal_gate = Arc::clone(&state.terminal_transition_gate)
-        .lock_owned()
-        .await;
-    // A teardown can withdraw the runtime before its terminal state is
-    // published. Recheck ownership under the terminal gate even when there
-    // was no operation gate to lock.
-    if !matches!(
-        lifecycle_state(state, id)?,
-        Some(LifecycleState::Reconciling { record, stopped_at: Some(current) })
-            if record.created_at == expected.created_at
-                && record.pid == expected.pid
-                && current == stopped_at
-    ) {
-        return Ok(());
-    }
-
     // Freeze the usage cutoff before the VMM process is killed. If the store
     // is unavailable the confirmed-stop fence remains and the next sweep
     // retries; it cannot fall back to "running" because the UDS vanished.
     crate::usage::meter_vm_final_at(state, id, stopped_at)?;
-    let supervisor = Arc::clone(&state.supervisor);
-    let (_operation, _terminal_gate) = tokio::task::spawn_blocking(move || {
-        // Carry both guards into the blocking worker. Cancellation of the
-        // waiter must not release them during teardown.
-        supervisor.stop_vm(id).map(|()| (operation, terminal_gate))
-    })
-    .await
-    .map_err(|error| OrchError::Internal(format!("stopped VMM teardown join: {error}")))??;
+    let (_activation, _operation) = stop_under_vm_gates(state, id, activation, operation).await?;
     state.pty_registry.close_vm_sessions(id);
+    let _terminal_gate = state.terminal_transition_gate.lock().await;
     start_terminal_transition(state, id, VmStatus::Stopped, true)?;
     finish_terminal_transition(state, id).await
 }
@@ -2377,8 +2377,7 @@ pub async fn stop_local(state: &AppState, id: Uuid) -> Result<(), OrchError> {
         }
         return Ok(());
     }
-    let activation = activation_gate(state, id)?;
-    let _activation = activation.lock().await;
+    let activation = activation_gate(state, id)?.lock_owned().await;
     let operation_gate = match state.supervisor.operation_gate(id) {
         Ok(gate) => Some(gate),
         Err(OrchError::NotFound(_)) => None,
@@ -2411,14 +2410,6 @@ pub async fn stop_local(state: &AppState, id: Uuid) -> Result<(), OrchError> {
         match lifecycle_state(state, id)? {
             Some(LifecycleState::Terminal { .. }) => {
                 finish_terminal_transition(state, id).await?;
-                if let Some(owner) = policy_owner.as_deref() {
-                    state
-                        .store
-                        .lock()
-                        .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
-                        .delete_egress_policy(owner, id)
-                        .map_err(crate::api::store_err)?;
-                }
                 return Ok(());
             }
             Some(LifecycleState::Publishing { .. }) => finish_publication(state, id).await?,
@@ -2451,23 +2442,32 @@ pub async fn stop_local(state: &AppState, id: Uuid) -> Result<(), OrchError> {
     // withdraws the runtime before signalling the VMM, so its exit is not
     // reported as unexpected.
     //
-    let sup = Arc::clone(&state.supervisor);
-    tokio::task::spawn_blocking(move || sup.stop_vm(id))
-        .await
-        .map_err(|e| OrchError::Internal(format!("join: {e}")))??;
+    let (_activation, _operation) = stop_under_vm_gates(state, id, activation, _operation).await?;
     state.pty_registry.close_vm_sessions(id);
     let _terminal_gate = state.terminal_transition_gate.lock().await;
     start_terminal_transition(state, id, VmStatus::Stopped, true)?;
     finish_terminal_transition(state, id).await?;
-    if let Some(owner) = policy_owner.as_deref() {
-        state
-            .store
-            .lock()
-            .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
-            .delete_egress_policy(owner, id)
-            .map_err(crate::api::store_err)?;
-    }
     Ok(())
+}
+
+// If the request is cancelled, the blocking worker must still own both
+// leases until stop_vm has confirmed death or restored the runtime for retry.
+async fn stop_under_vm_gates(
+    state: &AppState,
+    id: Uuid,
+    activation: OwnedActivationGuard,
+    operation: Option<tokio::sync::OwnedMutexGuard<()>>,
+) -> Result<
+    (
+        OwnedActivationGuard,
+        Option<tokio::sync::OwnedMutexGuard<()>>,
+    ),
+    OrchError,
+> {
+    let supervisor = Arc::clone(&state.supervisor);
+    tokio::task::spawn_blocking(move || supervisor.stop_vm(id).map(|()| (activation, operation)))
+        .await
+        .map_err(|e| OrchError::Internal(format!("VMM teardown join: {e}")))?
 }
 
 /// Detect and persist unexpected VMM exits using one shared bounded scan.
@@ -3018,6 +3018,16 @@ pub(crate) struct ActivationGate {
 }
 
 impl ActivationGate {
+    fn try_lock_owned(self) -> Option<OwnedActivationGuard> {
+        let guard = Arc::clone(self.gate.as_ref().expect("live activation lease"))
+            .try_lock_owned()
+            .ok()?;
+        Some(OwnedActivationGuard {
+            _guard: guard,
+            _lease: self,
+        })
+    }
+
     pub(crate) async fn lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.gate
             .as_ref()
@@ -5940,8 +5950,20 @@ mod tests {
             store.insert_vm(&record).unwrap();
             store.set_billing_watermark(id, billing_start).unwrap();
         }
-        retain_confirmed_guest_stop(&state, record, stopped_at).unwrap();
+        retain_confirmed_guest_stop(&state, record.clone(), stopped_at).unwrap();
 
+        // DELETE has withdrawn the runtime but is still waiting for process death.
+        test_runtime().block_on(async {
+            let held = activation_gate(&state, id).unwrap().lock_owned().await;
+            retry_live_reconciliation(&state, &record).await.unwrap();
+            assert!(state.scheduler.is_reserved(id));
+            assert_eq!(vm_get(&state, id).unwrap().status, VmStatus::Running);
+            assert!(activation_gate(&state, Uuid::new_v4())
+                .unwrap()
+                .try_lock_owned()
+                .is_some());
+            drop(held);
+        });
         let runtime = test_runtime();
         for _ in 0..2 {
             assert!(runtime
@@ -5976,6 +5998,71 @@ mod tests {
             tarit_vmm_client::VmState::Running,
             VmStatus::Running,
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resume_failure_from_paused_or_suspended_freezes_confirmed_stop() {
+        for prior in [VmStatus::Paused, VmStatus::Suspended] {
+            let (state, _) = test_state_with_durable_writer();
+            let id = insert_running_vm(&state);
+            let mut vm = vm_get(&state, id).unwrap();
+            vm.status = prior;
+            vm.api_key_id = Some("key".into());
+            commit_vm_record(&state, vm.clone()).unwrap();
+            state.store.lock().unwrap().insert_vm(&vm).unwrap();
+            let socket = std::env::temp_dir().join(format!("resume-{id}.sock"));
+            let listener = UnixListener::bind(&socket).unwrap();
+            state
+                .supervisor
+                .install_test_control_runtime(id, socket.clone());
+            let server = std::thread::spawn(move || {
+                for i in 0..2 {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let mut length = [0; 4];
+                    stream.read_exact(&mut length).unwrap();
+                    let mut body = vec![0; u32::from_be_bytes(length) as usize];
+                    stream.read_exact(&mut body).unwrap();
+                    let req: tarit_vmm_client::ApiRequest = serde_json::from_slice(&body).unwrap();
+                    let response = if i == 0 {
+                        assert!(matches!(req, tarit_vmm_client::ApiRequest::Resume));
+                        tarit_vmm_client::ApiResponse::Err {
+                            msg: "resume failed".into(),
+                        }
+                    } else {
+                        assert!(matches!(req, tarit_vmm_client::ApiRequest::Status));
+                        tarit_vmm_client::ApiResponse::Status(tarit_vmm_client::VmStatus {
+                            state: tarit_vmm_client::VmState::Stopped,
+                            uptime_ms: 1,
+                            vcpus: 1,
+                            mem_mib: 256,
+                            volumes: 0,
+                            nets: 0,
+                            kernel: "kernel".into(),
+                            vcpu_alive: false,
+                        })
+                    };
+                    let bytes = serde_json::to_vec(&response).unwrap();
+                    stream
+                        .write_all(&(bytes.len() as u32).to_be_bytes())
+                        .unwrap();
+                    stream.write_all(&bytes).unwrap();
+                }
+            });
+            let err = test_runtime()
+                .block_on(resume_local(&state, id))
+                .unwrap_err();
+            assert!(err.to_string().contains("teardown is pending"));
+            server.join().unwrap();
+            assert!(state
+                .store
+                .lock()
+                .unwrap()
+                .get_billing_end(id)
+                .unwrap()
+                .is_some());
+            std::fs::remove_file(socket).unwrap();
+        }
     }
 
     #[cfg(target_os = "linux")]

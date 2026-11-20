@@ -2866,10 +2866,23 @@ impl ManagedProcess {
             }
             return Ok(());
         }
-        child
-            .wait()
-            .map(|_| ())
-            .map_err(|error| OrchError::Internal(format!("wait for VMM exit: {error}")))
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if child
+                .try_wait()
+                .map_err(|error| OrchError::Internal(format!("wait for VMM exit: {error}")))?
+                .is_some()
+            {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(OrchError::Internal(format!(
+                    "VMM {} did not exit after SIGKILL",
+                    child.id()
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// Terminate a re-adopted VMM through its pidfd. Signalling the pidfd targets

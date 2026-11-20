@@ -559,6 +559,14 @@ impl Store {
                                  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                 WHERE vm_id = OLD.id AND revoked_at IS NULL;
              END;
+             CREATE TRIGGER IF NOT EXISTS delete_policy_on_terminal_vm
+             AFTER UPDATE OF status ON vms WHEN NEW.status IN ('stopped','error') BEGIN
+               DELETE FROM vm_egress_policies WHERE vm_id = NEW.id AND owner_key = OLD.owner_key;
+             END;
+             CREATE TRIGGER IF NOT EXISTS delete_policy_on_vm_removal
+             AFTER DELETE ON vms BEGIN
+               DELETE FROM vm_egress_policies WHERE vm_id = OLD.id AND owner_key = OLD.owner_key;
+             END;
              CREATE TRIGGER IF NOT EXISTS revoke_shares_on_vm_stop
              AFTER UPDATE OF status ON vms WHEN NEW.status = 'stopped' BEGIN
                UPDATE shares SET revoked_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
@@ -573,7 +581,8 @@ impl Store {
         // clearing it, including startup recovery and administrative writers.
         // A previously frozen death boundary wins over the observation time.
         conn.execute_batch(
-            "CREATE TRIGGER IF NOT EXISTS start_runtime_on_vm_insert
+            "SAVEPOINT migrate_runtime_triggers;
+             CREATE TRIGGER IF NOT EXISTS start_runtime_on_vm_insert
              AFTER INSERT ON vms WHEN NEW.status IN ('running','paused','suspended') BEGIN
                INSERT OR REPLACE INTO billing_watermark VALUES (NEW.id, NEW.updated_at);
              END;
@@ -583,13 +592,17 @@ impl Store {
               AND OLD.status NOT IN ('running','paused','suspended') BEGIN
                INSERT OR REPLACE INTO billing_watermark VALUES (NEW.id, NEW.updated_at);
              END;
-             CREATE TRIGGER IF NOT EXISTS clear_runtime_end_on_watermark_delete
-             AFTER DELETE ON billing_watermark BEGIN
+             DROP TRIGGER IF EXISTS clear_runtime_end_on_watermark_delete;
+             CREATE TRIGGER clear_runtime_end_on_watermark_delete
+             AFTER DELETE ON billing_watermark
+             WHEN NOT EXISTS (SELECT 1 FROM vms WHERE id = OLD.vm_id
+                              AND status IN ('running','paused','suspended')) BEGIN
                DELETE FROM billing_runtime_end WHERE vm_id = OLD.vm_id;
              END;
              DROP TRIGGER IF EXISTS clear_runtime_on_vm_inactive;
              DROP TRIGGER IF EXISTS clear_runtime_on_vm_delete;
-             CREATE TRIGGER IF NOT EXISTS finalize_runtime_on_vm_inactive
+             DROP TRIGGER IF EXISTS finalize_runtime_on_vm_inactive;
+             CREATE TRIGGER finalize_runtime_on_vm_inactive
              AFTER UPDATE OF status ON vms
              WHEN NEW.status NOT IN ('running','paused','suspended') BEGIN
                INSERT INTO usage_outbox
@@ -607,8 +620,10 @@ impl Store {
                   AND OLD.owner_key IS NOT NULL
                   AND julianday(COALESCE(e.ended_at, NEW.updated_at)) > julianday(w.last_billed_at);
                DELETE FROM billing_watermark WHERE vm_id = NEW.id;
+               DELETE FROM billing_runtime_end WHERE vm_id = NEW.id;
              END;
-             CREATE TRIGGER IF NOT EXISTS finalize_runtime_on_vm_delete
+             DROP TRIGGER IF EXISTS finalize_runtime_on_vm_delete;
+             CREATE TRIGGER finalize_runtime_on_vm_delete
              BEFORE DELETE ON vms BEGIN
                INSERT INTO usage_outbox
                  (id, api_key_id, owner_key, host_id, vm_id, kind, seconds,
@@ -625,17 +640,20 @@ impl Store {
                   AND OLD.owner_key IS NOT NULL
                   AND julianday(COALESCE(e.ended_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))) > julianday(w.last_billed_at);
                DELETE FROM billing_watermark WHERE vm_id = OLD.id;
+               DELETE FROM billing_runtime_end WHERE vm_id = OLD.id;
              END;
              UPDATE vms SET status = status
               WHERE status NOT IN ('running','paused','suspended')
-                AND id IN (SELECT vm_id FROM billing_watermark);",
+                AND id IN (SELECT vm_id FROM billing_watermark);
+             RELEASE migrate_runtime_triggers;",
         )?;
         // Upgrade/readoption of an existing live VM without a watermark starts
         // at observation time. Its historical runtime is unknown; never infer
         // it from created_at (which may predate many hibernations).
         conn.execute(
             "INSERT OR IGNORE INTO billing_watermark (vm_id, last_billed_at)
-             SELECT id, ?1 FROM vms WHERE status IN ('running','paused','suspended')",
+             SELECT id, ?1 FROM vms WHERE status IN ('running','paused','suspended')
+               AND NOT EXISTS (SELECT 1 FROM billing_runtime_end WHERE vm_id = vms.id)",
             params![Utc::now().to_rfc3339()],
         )?;
         Ok(Self { conn })
@@ -5596,6 +5614,56 @@ mod tests {
     }
 
     #[test]
+    fn restart_preserves_guest_stop_before_and_after_final_usage_commit() {
+        for settled in [false, true] {
+            let path = std::env::temp_dir().join(format!("tarit-cutoff-{}.sqlite", Uuid::new_v4()));
+            let id = Uuid::new_v4();
+            let mut vm = test_vm(id, "owner");
+            let start = Utc::now() - chrono::Duration::seconds(30);
+            let end = start + chrono::Duration::seconds(5);
+            vm.status = VmStatus::Running;
+            vm.api_key_id = Some("key".into());
+            vm.updated_at = start;
+            let store = Store::open(&path).unwrap();
+            store.insert_vm(&vm).unwrap();
+            store.freeze_billing_end(id, end).unwrap();
+            if settled {
+                let event = UsageEvent {
+                    id: Uuid::new_v4(),
+                    api_key_id: "key".into(),
+                    owner_key: "owner".into(),
+                    host_id: vm.host_id.clone(),
+                    vm_id: id,
+                    kind: UsageKind::VmRuntime,
+                    seconds: Some(5.0),
+                    duration_ms: None,
+                    window_start: start,
+                    window_end: end,
+                    created_at: end,
+                };
+                store.commit_runtime_usage(&event, true).unwrap();
+            }
+            drop(store);
+            let store = Store::open(&path).unwrap();
+            assert_eq!(store.get_billing_end(id).unwrap(), Some(end));
+            assert_eq!(
+                store.get_billing_watermark(id).unwrap(),
+                (!settled).then_some(start)
+            );
+            vm.status = VmStatus::Stopped;
+            vm.updated_at = Utc::now();
+            vm.revision += 1;
+            store.update_vm(&vm).unwrap();
+            let events = store.list_unsent_usage(10).unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!((events[0].window_start, events[0].window_end), (start, end));
+            assert_eq!(store.get_billing_end(id).unwrap(), None);
+            drop(store);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
     fn billing_restart_preserves_live_progress_and_fences_unknown_history() {
         let path = std::env::temp_dir().join(format!("tarit-billing-{}.sqlite", Uuid::new_v4()));
         let id = Uuid::new_v4();
@@ -5797,6 +5865,27 @@ mod tests {
             hosts[0].peer_certificate_sha256.as_deref(),
             Some("certificate-b")
         );
+    }
+
+    #[test]
+    fn terminal_guest_cleanup_retires_policy_before_uuid_reuse() {
+        let store = Store::open(":memory:").unwrap();
+        let id = Uuid::new_v4();
+        let mut vm = test_vm(id, "first");
+        vm.status = VmStatus::Running;
+        store.insert_vm(&vm).unwrap();
+        store
+            .update_egress_policy("first", id, 1, &[], false, Utc::now())
+            .unwrap();
+        vm.status = VmStatus::Stopped;
+        vm.revision += 1;
+        store.update_vm(&vm).unwrap();
+        assert!(store.get_egress_policy("first", id).unwrap().is_none());
+        store.delete_vm(id).unwrap();
+        store.insert_vm(&test_vm(id, "second")).unwrap();
+        store
+            .update_egress_policy("second", id, 1, &[], false, Utc::now())
+            .unwrap();
     }
 
     #[test]
