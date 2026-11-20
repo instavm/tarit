@@ -6017,14 +6017,14 @@ mod tests {
                 .supervisor
                 .install_test_control_runtime(id, socket.clone());
             let server = std::thread::spawn(move || {
-                for i in 0..2 {
+                for i in 0..3 {
                     let (mut stream, _) = listener.accept().unwrap();
                     let mut length = [0; 4];
                     stream.read_exact(&mut length).unwrap();
                     let mut body = vec![0; u32::from_be_bytes(length) as usize];
                     stream.read_exact(&mut body).unwrap();
                     let req: tarit_vmm_client::ApiRequest = serde_json::from_slice(&body).unwrap();
-                    let response = if i == 0 {
+                    let response = if i == 1 {
                         assert!(matches!(req, tarit_vmm_client::ApiRequest::Resume));
                         tarit_vmm_client::ApiResponse::Err {
                             msg: "resume failed".into(),
@@ -6032,7 +6032,11 @@ mod tests {
                     } else {
                         assert!(matches!(req, tarit_vmm_client::ApiRequest::Status));
                         tarit_vmm_client::ApiResponse::Status(tarit_vmm_client::VmStatus {
-                            state: tarit_vmm_client::VmState::Stopped,
+                            state: match (i, prior) {
+                                (0, VmStatus::Paused) => tarit_vmm_client::VmState::Paused,
+                                (0, VmStatus::Suspended) => tarit_vmm_client::VmState::Suspended,
+                                _ => tarit_vmm_client::VmState::Stopped,
+                            },
                             uptime_ms: 1,
                             vcpus: 1,
                             mem_mib: 256,
