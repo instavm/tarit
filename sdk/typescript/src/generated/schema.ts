@@ -45,8 +45,59 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Health check for external load balancer */
+        /** Check liveness (alias for /livez) */
         get: operations["getHealth"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/livez": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Check that the persistence worker is live */
+        get: operations["getLiveness"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/startupz": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Check configuration, local store, and persistence queue startup */
+        get: operations["getStartup"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/readyz": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Check whether this node is ready to admit traffic */
+        get: operations["getReadiness"];
         put?: never;
         post?: never;
         delete?: never;
@@ -415,8 +466,10 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * List the tenant's snapshots on this node
-         * @description Oldest first. Fork-owned snapshots and hibernation wake images are managed by their VM and are not listed.
+         * List the tenant's snapshots
+         * @description In fleet mode, this lists snapshots across reachable nodes, deduplicated and oldest first.
+         *     Otherwise it lists snapshots on this node. The response can be partial when some snapshot
+         *     hosts are unavailable. Fork-owned snapshots and hibernation wake images are not listed.
          */
         get: operations["listSnapshots"];
         put?: never;
@@ -794,6 +847,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/warm-pool": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Inspect this node's warm pool (admin only) */
+        get: operations["getWarmPool"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/usage": {
         parameters: {
             query?: never;
@@ -838,6 +908,32 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        ProbeStatus: {
+            /** @enum {string} */
+            status: "ok" | "unhealthy";
+            /** @description Named checks and their state. Check names vary by probe and configuration. */
+            checks: {
+                [key: string]: string;
+            };
+        };
+        WarmPoolStatus: {
+            enabled: boolean;
+            cpu_overcommit: number;
+            replenish_concurrency: number;
+            total_target: number;
+            /** @description Learning limits, target depth, and idle timeout. */
+            learn: {
+                [key: string]: number;
+            };
+            /** @description Node-local disk pressure, usage, reservation, and cleanup counters. */
+            disk_pressure: {
+                [key: string]: unknown;
+            };
+            /** @description Configured and learned warm classes and their current depth. */
+            classes: {
+                [key: string]: unknown;
+            }[];
+        };
         Branch: {
             /** Format: uuid */
             branch_id: string;
@@ -1253,12 +1349,110 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description OK */
+            /** @description All checks passed */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["ProbeStatus"];
+                };
+            };
+            /** @description One or more checks failed */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProbeStatus"];
+                };
+            };
+        };
+    };
+    getLiveness: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description All checks passed */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProbeStatus"];
+                };
+            };
+            /** @description One or more checks failed */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProbeStatus"];
+                };
+            };
+        };
+    };
+    getStartup: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description All checks passed */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProbeStatus"];
+                };
+            };
+            /** @description One or more checks failed */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProbeStatus"];
+                };
+            };
+        };
+    };
+    getReadiness: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description All checks passed */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProbeStatus"];
+                };
+            };
+            /** @description One or more checks failed */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProbeStatus"];
+                };
             };
         };
     };
@@ -2562,9 +2756,11 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Tenant snapshots */
+            /** @description Tenant snapshots (possibly partial in fleet mode) */
             200: {
                 headers: {
+                    /** @description Present only for a partial list; the count of snapshot hosts that could not answer, not their names. */
+                    "x-tarit-unavailable-hosts"?: number;
                     [name: string]: unknown;
                 };
                 content: {
@@ -2573,6 +2769,13 @@ export interface operations {
             };
             /** @description Missing or invalid API key */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Fleet snapshot-host discovery is unavailable */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -3945,6 +4148,40 @@ export interface operations {
                 content?: never;
             };
             /** @description Admin role required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    getWarmPool: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Warm pool status */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WarmPoolStatus"];
+                };
+            };
+            /** @description Missing or invalid API key */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Admin privileges are required */
             403: {
                 headers: {
                     [name: string]: unknown;

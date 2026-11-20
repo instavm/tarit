@@ -16,6 +16,45 @@ components:
       name: X-API-Key
       description: API key mapped by taritd to a tenant and role (admin or user).
   schemas:
+    ProbeStatus:
+      type: object
+      required: [status, checks]
+      properties:
+        status:
+          type: string
+          enum: [ok, unhealthy]
+        checks:
+          type: object
+          description: Named checks and their state. Check names vary by probe and configuration.
+          additionalProperties:
+            type: string
+    WarmPoolStatus:
+      type: object
+      required: [enabled, cpu_overcommit, replenish_concurrency, total_target, learn, disk_pressure, classes]
+      properties:
+        enabled:
+          type: boolean
+        cpu_overcommit:
+          type: number
+        replenish_concurrency:
+          type: integer
+        total_target:
+          type: integer
+        learn:
+          type: object
+          description: Learning limits, target depth, and idle timeout.
+          additionalProperties:
+            type: integer
+        disk_pressure:
+          type: object
+          description: Node-local disk pressure, usage, reservation, and cleanup counters.
+          additionalProperties: true
+        classes:
+          type: array
+          description: Configured and learned warm classes and their current depth.
+          items:
+            type: object
+            additionalProperties: true
     Branch:
       type: object
       required: [branch_id, name, head_artifact_id, revision, created_at, updated_at]
@@ -633,11 +672,75 @@ paths:
   /health:
     get:
       operationId: getHealth
-      summary: Health check for external load balancer
+      summary: Check liveness (alias for /livez)
       security: []
       responses:
         "200":
-          description: OK
+          description: All checks passed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProbeStatus"
+        "503":
+          description: One or more checks failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProbeStatus"
+  /livez:
+    get:
+      operationId: getLiveness
+      summary: Check that the persistence worker is live
+      security: []
+      responses:
+        "200":
+          description: All checks passed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProbeStatus"
+        "503":
+          description: One or more checks failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProbeStatus"
+  /startupz:
+    get:
+      operationId: getStartup
+      summary: Check configuration, local store, and persistence queue startup
+      security: []
+      responses:
+        "200":
+          description: All checks passed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProbeStatus"
+        "503":
+          description: One or more checks failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProbeStatus"
+  /readyz:
+    get:
+      operationId: getReadiness
+      summary: Check whether this node is ready to admit traffic
+      security: []
+      responses:
+        "200":
+          description: All checks passed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProbeStatus"
+        "503":
+          description: One or more checks failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProbeStatus"
   /metrics:
     get:
       operationId: getMetrics
@@ -1394,11 +1497,20 @@ paths:
   /v1/snapshots:
     get:
       operationId: listSnapshots
-      summary: List the tenant's snapshots on this node
-      description: Oldest first. Fork-owned snapshots and hibernation wake images are managed by their VM and are not listed.
+      summary: List the tenant's snapshots
+      description: |
+        In fleet mode, this lists snapshots across reachable nodes, deduplicated and oldest first.
+        Otherwise it lists snapshots on this node. The response can be partial when some snapshot
+        hosts are unavailable. Fork-owned snapshots and hibernation wake images are not listed.
       responses:
         "200":
-          description: Tenant snapshots
+          description: Tenant snapshots (possibly partial in fleet mode)
+          headers:
+            x-tarit-unavailable-hosts:
+              description: Present only for a partial list; the count of snapshot hosts that could not answer, not their names.
+              schema:
+                type: integer
+                minimum: 1
           content:
             application/json:
               schema:
@@ -1407,6 +1519,8 @@ paths:
                   $ref: "#/components/schemas/Snapshot"
         "401":
           description: Missing or invalid API key
+        "503":
+          description: Fleet snapshot-host discovery is unavailable
   /v1/snapshots/{id}:
     parameters:
       - name: id
@@ -2262,6 +2376,21 @@ paths:
           description: Missing or invalid API key
         "403":
           description: Admin role required
+  /v1/warm-pool:
+    get:
+      operationId: getWarmPool
+      summary: Inspect this node's warm pool (admin only)
+      responses:
+        "200":
+          description: Warm pool status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WarmPoolStatus"
+        "401":
+          description: Missing or invalid API key
+        "403":
+          description: Admin privileges are required
   /v1/usage:
     get:
       operationId: getUsage

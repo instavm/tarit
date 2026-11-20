@@ -27,7 +27,8 @@ class MakeInstallTests(unittest.TestCase):
         self.repo = (self.tmp / "checkout").resolve()
         (self.repo / "scripts").mkdir(parents=True)
         shutil.copy(ROOT / "Makefile", self.repo / "Makefile")
-        shutil.copy(ROOT / "scripts/check-install-artifact.sh", self.repo / "scripts")
+        for name in ("check-install-artifact.sh", "vmm-build-features.sh"):
+            shutil.copy(ROOT / "scripts" / name, self.repo / "scripts")
         agent = self.repo / "vmm/guest/agent"
         agent.mkdir(parents=True)
         shutil.copy(ROOT / "vmm/guest/agent/Makefile", agent / "Makefile")
@@ -50,6 +51,7 @@ class MakeInstallTests(unittest.TestCase):
         os.utime(self.registry, (OLD, OLD))
         for artifact, sources in self.sources.items():
             self.write_artifact(artifact, sources)
+        self.record_features("boot")
         self.write("vmm/guest/agent/vmm-agent", "agent", BUILT, executable=True)
         self.calls = self.tmp / "build-calls"
         self.recorder = self.tmp / "record-build"
@@ -73,10 +75,20 @@ class MakeInstallTests(unittest.TestCase):
     def touch(self, path, mtime=NEW):
         os.utime(self.repo / path, (mtime, mtime))
 
-    def make(self, target="install"):
+    def record_features(self, features):
+        subprocess.run(
+            ["./scripts/vmm-build-features.sh", "record", "vmm/target/release/vmm", features],
+            cwd=self.repo,
+            check=True,
+        )
+
+    def make(self, target="install", features="boot"):
         dest = self.tmp / "dest"
         result = subprocess.run(
-            ["make", "-s", target, f"DESTDIR={dest}", "PREFIX=/usr", f"CARGO={self.recorder}", f"CC={self.recorder}"],
+            [
+                "make", "-s", target, f"DESTDIR={dest}", "PREFIX=/usr",
+                f"CARGO={self.recorder}", f"CC={self.recorder}", f"VMM_FEATURES={features}",
+            ],
             cwd=self.repo,
             capture_output=True,
             text=True,
@@ -97,6 +109,28 @@ class MakeInstallTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         for path in ("usr/bin/vmm", "usr/bin/taritd", "usr/libexec/tarit/vmm-agent"):
             self.assertTrue((dest / path).is_file(), path)
+
+    def test_refuses_a_host_only_build_when_boot_is_expected(self):
+        self.record_features("")
+        self.assert_refused(*self.make(), "VMM_FEATURES (boot)")
+
+    def test_accepts_an_explicit_host_only_build(self):
+        self.record_features("")
+        result, _ = self.make("install-vmm", features="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_refuses_a_record_for_a_different_vmm(self):
+        self.write("vmm/target/release/vmm", "different binary", BUILT, executable=True)
+        self.assert_refused(*self.make(), "recorded VMM_FEATURES")
+
+    def test_refuses_a_missing_feature_record(self):
+        (self.repo / "vmm/target/release/vmm.features").unlink()
+        self.assert_refused(*self.make(), "recorded VMM_FEATURES")
+
+    def test_feature_lists_are_order_independent(self):
+        self.record_features("test-failpoints,boot")
+        result, _ = self.make("install-vmm", features="boot test-failpoints")
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_refuses_missing_binary(self):
         (self.repo / "orch/target/release/taritd").unlink()

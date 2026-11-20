@@ -68,7 +68,9 @@ accepted, and the SDK cannot recover its server-generated ID from that response.
 A fork deadline stops waiting; it does not cancel creation on the server. Catch
 `TaritDeadlineExceeded` and use its `child_id` to query or delete the child VM,
 or retry the fork with that same `child_id`. The error exposes the stable ID
-whether you supplied it or the SDK generated it.
+whether you supplied it or the SDK generated it. A complete success (200/201)
+or a definitive rejection that reaches the SDK is reported even if the
+local deadline has just passed.
 
 ## TypeScript
 
@@ -100,4 +102,9 @@ callers that need an operation outside the ergonomic layer.
 Creating a PTY activates a hibernated VM through the normal lifecycle gate. The
 API key remains in the authenticated HTTP request; the WebSocket URL contains
 only the short-lived, single-session connection token. Failed connections and
-normal close both delete the server-side PTY lease.
+normal close both attempt to delete the server-side PTY lease. Explicit
+Python `delete_pty_session(vm_id, pty_id, deadline_seconds=5)` and TypeScript
+`deletePtySession(vmId, ptyId, { deadlineMs: 5_000 })` treat an already
+deleted lease (404) as success. Python asyncio uses a total request deadline;
+synchronous Python caps each HTTP timeout phase and checks the elapsed
+deadline after receiving a response.

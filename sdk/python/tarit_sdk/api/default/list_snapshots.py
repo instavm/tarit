@@ -34,6 +34,10 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         response_401 = cast(Any, None)
         return response_401
 
+    if response.status_code == 503:
+        response_503 = cast(Any, None)
+        return response_503
+
     if client.raise_on_unexpected_status:
         raise errors.UnexpectedStatus(response.status_code, response.content)
     else:
@@ -55,10 +59,11 @@ def sync_detailed(
     *,
     client: AuthenticatedClient | Client,
 ) -> Response[Any | list[Snapshot]]:
-    """List the tenant's snapshots on this node
+    """List the tenant's snapshots
 
-     Oldest first. Fork-owned snapshots and hibernation wake images are managed by their VM and are not
-    listed.
+     In fleet mode, this lists snapshots across reachable nodes, deduplicated and oldest first.
+    Otherwise it lists snapshots on this node. The response can be partial when some snapshot
+    hosts are unavailable. Fork-owned snapshots and hibernation wake images are not listed.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -81,10 +86,11 @@ def sync(
     *,
     client: AuthenticatedClient | Client,
 ) -> Any | list[Snapshot] | None:
-    """List the tenant's snapshots on this node
+    """List the tenant's snapshots
 
-     Oldest first. Fork-owned snapshots and hibernation wake images are managed by their VM and are not
-    listed.
+     In fleet mode, this lists snapshots across reachable nodes, deduplicated and oldest first.
+    Otherwise it lists snapshots on this node. The response can be partial when some snapshot
+    hosts are unavailable. Fork-owned snapshots and hibernation wake images are not listed.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -103,10 +109,11 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient | Client,
 ) -> Response[Any | list[Snapshot]]:
-    """List the tenant's snapshots on this node
+    """List the tenant's snapshots
 
-     Oldest first. Fork-owned snapshots and hibernation wake images are managed by their VM and are not
-    listed.
+     In fleet mode, this lists snapshots across reachable nodes, deduplicated and oldest first.
+    Otherwise it lists snapshots on this node. The response can be partial when some snapshot
+    hosts are unavailable. Fork-owned snapshots and hibernation wake images are not listed.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -127,10 +134,11 @@ async def asyncio(
     *,
     client: AuthenticatedClient | Client,
 ) -> Any | list[Snapshot] | None:
-    """List the tenant's snapshots on this node
+    """List the tenant's snapshots
 
-     Oldest first. Fork-owned snapshots and hibernation wake images are managed by their VM and are not
-    listed.
+     In fleet mode, this lists snapshots across reachable nodes, deduplicated and oldest first.
+    Otherwise it lists snapshots on this node. The response can be partial when some snapshot
+    hosts are unavailable. Fork-owned snapshots and hibernation wake images are not listed.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.

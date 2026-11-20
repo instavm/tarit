@@ -160,27 +160,39 @@ class SyncDeadlineTests(unittest.TestCase):
                         if response is failure:
                             self.assertIs(raised.exception, failure)
 
-    def test_fork_deadline_exposes_generated_id_after_late_success(self) -> None:
-        clock = Clock()
-        ids = []
+    def test_fork_honors_late_final_responses_without_replay(self) -> None:
+        for status in (200, 201, 403, 503):
+            with self.subTest(status=status):
+                clock = Clock()
+                ids: list[str] = []
 
-        def handler(request: httpx.Request) -> httpx.Response:
-            child_id = json.loads(request.content)["id"]
-            ids.append(child_id)
-            clock.advance(2)
-            result = fork_result()
-            result["vm"]["id"] = child_id
-            return httpx.Response(201, json=result)
+                def handler(
+                    request: httpx.Request, status: int = status, ids: list[str] = ids, clock: Clock = clock
+                ) -> httpx.Response:
+                    child_id = json.loads(request.content)["id"]
+                    ids.append(child_id)
+                    clock.advance(2)
+                    if status in {403, 503}:
+                        return httpx.Response(status, json={"error": "late response"})
+                    result = fork_result()
+                    result["vm"]["id"] = child_id
+                    return httpx.Response(status, json=result)
 
-        with (
-            clock.patched(),
-            TaritClient("https://tarit.test", "key", transport=httpx.MockTransport(handler)) as client,
-            self.assertRaises(TaritDeadlineExceeded) as raised,
-        ):
-            client.fork(VM_ID, deadline_seconds=1)
-        self.assertEqual(raised.exception.child_id, UUID(ids[0]))
-        self.assertIn(ids[0], str(raised.exception))
-        self.assertEqual(len(ids), 1)
+                with clock.patched(), TaritClient(
+                    "https://tarit.test", "key", transport=httpx.MockTransport(handler)
+                ) as client:
+                    if status == 503:
+                        with self.assertRaises(TaritDeadlineExceeded) as raised:
+                            client.fork(VM_ID, deadline_seconds=1)
+                        self.assertEqual(raised.exception.child_id, UUID(ids[0]))
+                    elif status == 403:
+                        with self.assertRaises(TaritApiError) as rejected:
+                            client.fork(VM_ID, deadline_seconds=1)
+                        self.assertEqual(rejected.exception.status_code, 403)
+                    else:
+                        result = client.fork(VM_ID, deadline_seconds=1)
+                        self.assertEqual(result.vm.id, UUID(ids[0]))
+                self.assertEqual(len(ids), 1)
 
     def test_fork_transport_retry_deadline_retains_the_same_id(self) -> None:
         for supplied in (None, CHILD_ID):
@@ -242,8 +254,8 @@ class SyncDeadlineTests(unittest.TestCase):
         ):
             with self.assertRaises(TaritDeadlineExceeded):
                 client.wait_execution(EXECUTION_ID, deadline_seconds=1)
-            with self.assertRaises(TaritDeadlineExceeded):
-                client.fork(VM_ID, deadline_seconds=1)
+            result = client.fork(VM_ID, deadline_seconds=1)
+            self.assertEqual(result.vm.id, CHILD_ID)
 
     def test_submission_and_poll_share_one_budget(self) -> None:
         clock = Clock()
@@ -264,8 +276,8 @@ class SyncDeadlineTests(unittest.TestCase):
             self.assertEqual(client.raw.get_httpx_client().timeout.read, 30)
         self.assertEqual(budgets, [1, 0.25])
 
-    def test_late_responses_never_count_as_success(self) -> None:
-        for operation in ("execute", "wait_execution", "fork"):
+    def test_late_execution_responses_never_count_as_success(self) -> None:
+        for operation in ("execute", "wait_execution"):
             with self.subTest(operation=operation):
                 clock = Clock()
                 requests = []
@@ -278,8 +290,6 @@ class SyncDeadlineTests(unittest.TestCase):
                 ) -> httpx.Response:
                     requests.append(request)
                     clock.advance(2)
-                    if operation == "fork":
-                        return httpx.Response(201, json=fork_result())
                     return httpx.Response(
                         202 if operation == "execute" else 200,
                         json=execution("completed"),
@@ -296,15 +306,10 @@ class SyncDeadlineTests(unittest.TestCase):
                 ):
                     if operation == "execute":
                         client.execute(VM_ID, "echo ok", deadline_seconds=1)
-                    elif operation == "fork":
-                        client.fork(VM_ID, child_id=CHILD_ID, deadline_seconds=1)
                     else:
                         client.wait_execution(EXECUTION_ID, deadline_seconds=1)
                 self.assertEqual(len(requests), 1)
-                self.assertEqual(
-                    raised.exception.execution_id,
-                    None if operation == "fork" else EXECUTION_ID,
-                )
+                self.assertEqual(raised.exception.execution_id, EXECUTION_ID)
 
     def test_expired_poll_and_retry_do_not_start_another_request(self) -> None:
         for operation in ("wait_execution", "fork"):
@@ -492,25 +497,40 @@ class AsyncDeadlineTests(unittest.IsolatedAsyncioTestCase):
                         if response is failure:
                             self.assertIs(raised.exception, failure)
 
-    async def test_fork_deadline_exposes_generated_id_after_late_success(self) -> None:
-        clock = Clock()
-        ids = []
+    async def test_fork_honors_late_final_responses_without_replay(self) -> None:
+        for status in (200, 201, 403, 503):
+            with self.subTest(status=status):
+                clock = Clock()
+                ids: list[str] = []
 
-        async def handler(request: httpx.Request) -> httpx.Response:
-            child_id = json.loads(request.content)["id"]
-            ids.append(child_id)
-            clock.advance(2)
-            result = fork_result()
-            result["vm"]["id"] = child_id
-            return httpx.Response(201, json=result)
+                async def handler(
+                    request: httpx.Request, status: int = status, ids: list[str] = ids, clock: Clock = clock
+                ) -> httpx.Response:
+                    child_id = json.loads(request.content)["id"]
+                    ids.append(child_id)
+                    clock.advance(2)
+                    if status in {403, 503}:
+                        return httpx.Response(status, json={"error": "late response"})
+                    result = fork_result()
+                    result["vm"]["id"] = child_id
+                    return httpx.Response(status, json=result)
 
-        with clock.patched():
-            async with AsyncTaritClient("https://tarit.test", "key", transport=httpx.MockTransport(handler)) as client:
-                with self.assertRaises(TaritDeadlineExceeded) as raised:
-                    await client.fork(VM_ID, deadline_seconds=1)
-        self.assertEqual(raised.exception.child_id, UUID(ids[0]))
-        self.assertIn(ids[0], str(raised.exception))
-        self.assertEqual(len(ids), 1)
+                with clock.patched():
+                    async with AsyncTaritClient(
+                        "https://tarit.test", "key", transport=httpx.MockTransport(handler)
+                    ) as client:
+                        if status == 503:
+                            with self.assertRaises(TaritDeadlineExceeded) as raised:
+                                await client.fork(VM_ID, deadline_seconds=1)
+                            self.assertEqual(raised.exception.child_id, UUID(ids[0]))
+                        elif status == 403:
+                            with self.assertRaises(TaritApiError) as rejected:
+                                await client.fork(VM_ID, deadline_seconds=1)
+                            self.assertEqual(rejected.exception.status_code, 403)
+                        else:
+                            result = await client.fork(VM_ID, deadline_seconds=1)
+                            self.assertEqual(result.vm.id, UUID(ids[0]))
+                self.assertEqual(len(ids), 1)
 
     async def test_fork_transport_retry_deadline_retains_the_same_id(self) -> None:
         for supplied in (None, CHILD_ID):
@@ -584,8 +604,8 @@ class AsyncDeadlineTests(unittest.IsolatedAsyncioTestCase):
             async with AsyncTaritClient("https://tarit.test", "key", transport=httpx.MockTransport(handler)) as client:
                 with self.assertRaises(TaritDeadlineExceeded):
                     await client.wait_execution(EXECUTION_ID, deadline_seconds=1)
-                with self.assertRaises(TaritDeadlineExceeded):
-                    await client.fork(VM_ID, deadline_seconds=1)
+                result = await client.fork(VM_ID, deadline_seconds=1)
+                self.assertEqual(result.vm.id, CHILD_ID)
 
     async def test_submission_and_poll_share_one_budget(self) -> None:
         clock = Clock()
@@ -604,8 +624,8 @@ class AsyncDeadlineTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(client.raw.get_async_httpx_client().timeout.read, 30)
         self.assertEqual(budgets, [1, 0.25])
 
-    async def test_late_responses_never_count_as_success(self) -> None:
-        for operation in ("execute", "wait_execution", "fork"):
+    async def test_late_execution_responses_never_count_as_success(self) -> None:
+        for operation in ("execute", "wait_execution"):
             with self.subTest(operation=operation):
                 clock = Clock()
                 requests = []
@@ -618,8 +638,6 @@ class AsyncDeadlineTests(unittest.IsolatedAsyncioTestCase):
                 ) -> httpx.Response:
                     requests.append(request)
                     clock.advance(2)
-                    if operation == "fork":
-                        return httpx.Response(201, json=fork_result())
                     return httpx.Response(
                         202 if operation == "execute" else 200,
                         json=execution("completed"),
@@ -634,15 +652,10 @@ class AsyncDeadlineTests(unittest.IsolatedAsyncioTestCase):
                         with self.assertRaises(TaritDeadlineExceeded) as raised:
                             if operation == "execute":
                                 await client.execute(VM_ID, "echo ok", deadline_seconds=1)
-                            elif operation == "fork":
-                                await client.fork(VM_ID, child_id=CHILD_ID, deadline_seconds=1)
                             else:
                                 await client.wait_execution(EXECUTION_ID, deadline_seconds=1)
                 self.assertEqual(len(requests), 1)
-                self.assertEqual(
-                    raised.exception.execution_id,
-                    None if operation == "fork" else EXECUTION_ID,
-                )
+                self.assertEqual(raised.exception.execution_id, EXECUTION_ID)
 
     async def test_deadline_cancels_an_inflight_request(self) -> None:
         for operation in ("execute", "wait_execution", "fork"):

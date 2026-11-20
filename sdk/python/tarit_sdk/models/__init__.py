@@ -34,6 +34,9 @@ from .list_pty_sessions_response_200 import ListPtySessionsResponse200
 from .list_ssh_keys_response_200 import ListSshKeysResponse200
 from .patch_vm_egress_policy_body import PatchVmEgressPolicyBody
 from .patch_vm_egress_policy_response_200 import PatchVmEgressPolicyResponse200
+from .probe_status import ProbeStatus
+from .probe_status_checks import ProbeStatusChecks
+from .probe_status_status import ProbeStatusStatus
 from .pty_session_response import PtySessionResponse
 from .resize_pty_session_body import ResizePtySessionBody
 from .resize_pty_session_response_200 import ResizePtySessionResponse200
@@ -60,6 +63,10 @@ from .volume_capabilities import VolumeCapabilities
 from .volume_provider import VolumeProvider
 from .volume_status import VolumeStatus
 from .volume_storage_class import VolumeStorageClass
+from .warm_pool_status import WarmPoolStatus
+from .warm_pool_status_classes_item import WarmPoolStatusClassesItem
+from .warm_pool_status_disk_pressure import WarmPoolStatusDiskPressure
+from .warm_pool_status_learn import WarmPoolStatusLearn
 
 __all__ = (
     "AuditEvent",
@@ -96,6 +103,9 @@ __all__ = (
     "ListSshKeysResponse200",
     "PatchVmEgressPolicyBody",
     "PatchVmEgressPolicyResponse200",
+    "ProbeStatus",
+    "ProbeStatusChecks",
+    "ProbeStatusStatus",
     "PtySessionResponse",
     "ResizePtySessionBody",
     "ResizePtySessionResponse200",
@@ -122,4 +132,8 @@ __all__ = (
     "VolumeProvider",
     "VolumeStatus",
     "VolumeStorageClass",
+    "WarmPoolStatus",
+    "WarmPoolStatusClassesItem",
+    "WarmPoolStatusDiskPressure",
+    "WarmPoolStatusLearn",
 )

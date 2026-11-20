@@ -231,14 +231,18 @@ class SyncClientTests(unittest.TestCase):
         self.assertEqual(methods, ["POST", "DELETE"])
 
     def test_open_pty_bounds_session_creation(self) -> None:
-        with TaritClient("https://tarit.test", "tenant-key") as client:
-            http = client.raw.get_httpx_client()
-            with (
-                patch.object(http, "post", side_effect=httpx.ReadTimeout("slow create")) as post,
-                self.assertRaises(TaritDeadlineExceeded),
-            ):
-                client.open_pty(VM_ID, deadline_seconds=0.25)
-        self.assertEqual(post.call_args.kwargs["timeout"], 0.25)
+        def handler(request: httpx.Request) -> httpx.Response:
+            self.assertEqual(request.method, "POST")
+            for timeout in request.extensions["timeout"].values():
+                self.assertGreater(timeout, 0)
+                self.assertLessEqual(timeout, 0.25)
+            raise httpx.ReadTimeout("slow create")
+
+        with (
+            TaritClient("https://tarit.test", "key", transport=httpx.MockTransport(handler)) as client,
+            self.assertRaises(TaritDeadlineExceeded),
+        ):
+            client.open_pty(VM_ID, deadline_seconds=0.25)
 
 
 class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
@@ -303,3 +307,73 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(websocket.sent, [b"exit\n"])
         self.assertTrue(websocket.closed)
         self.assertEqual(methods, ["POST", "DELETE"])
+
+    async def test_cancelled_pty_connect_deletes_known_lease(self) -> None:
+        connecting = asyncio.Event()
+        methods: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            methods.append(request.method)
+            if request.method == "POST":
+                return httpx.Response(
+                    201, json={"pty_id": str(PTY_ID), "cols": 80, "rows": 24, "connect_token": "secret"}
+                )
+            self.assertTrue(request.url.path.endswith(f"/{PTY_ID}"))
+            return httpx.Response(500, json={"error": "cleanup failed"})
+
+        async def connect(*_args, **_kwargs):
+            connecting.set()
+            await asyncio.Future()
+
+        with patch("tarit_sdk.high_level.async_websocket_connect", side_effect=connect):
+            async with AsyncTaritClient(
+                "http://tarit.test", "key", transport=httpx.MockTransport(handler)
+            ) as client:
+                task = asyncio.create_task(client.open_pty(VM_ID))
+                await asyncio.wait_for(connecting.wait(), 1)
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await asyncio.wait_for(task, 1)
+        self.assertEqual(methods, ["POST", "DELETE"])
+
+    async def test_delete_session_deadline_cancels_inflight_cleanup(self) -> None:
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            self.assertEqual(request.method, "DELETE")
+            started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                cancelled.set()
+            raise AssertionError("blocked deletion returned")
+
+        async with AsyncTaritClient("http://tarit.test", "key", transport=httpx.MockTransport(handler)) as client:
+            with self.assertRaisesRegex(TaritDeadlineExceeded, "delete PTY session"):
+                await asyncio.wait_for(client.delete_pty_session(VM_ID, PTY_ID, deadline_seconds=0.02), 1)
+        self.assertTrue(started.is_set())
+        self.assertTrue(cancelled.is_set())
+
+
+class ApiKeyAndDeleteTests(unittest.TestCase):
+    def test_high_level_clients_reject_api_key_line_breaks(self) -> None:
+        for client_type in (TaritClient, AsyncTaritClient):
+            for api_key in ("\rkey", "key\n", "key\r\nother"):
+                with (
+                    self.subTest(client=client_type, api_key=api_key),
+                    self.assertRaisesRegex(ValueError, "must not contain CR or LF"),
+                ):
+                    client_type("https://tarit.test", api_key)
+
+    def test_delete_caps_http_timeout_and_accepts_missing_session(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            self.assertEqual(request.method, "DELETE")
+            self.assertTrue(request.url.path.endswith(f"/{PTY_ID}"))
+            for timeout in request.extensions["timeout"].values():
+                self.assertGreater(timeout, 0)
+                self.assertLessEqual(timeout, 2)
+            return httpx.Response(404)
+
+        with TaritClient("https://tarit.test", "key", transport=httpx.MockTransport(handler)) as client:
+            client.delete_pty_session(VM_ID, PTY_ID, deadline_seconds=2)
