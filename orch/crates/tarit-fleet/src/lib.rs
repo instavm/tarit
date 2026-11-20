@@ -2,10 +2,10 @@
 //!
 //! Uses `tokio-postgres` + `deadpool-postgres` (both MIT OR Apache-2.0).
 
-use chrono::{DateTime, Utc};
 use deadpool_postgres::{Config as PoolConfig, Pool, Runtime};
 use rustls::{ClientConfig, RootCertStore};
 use tarit_store::{HostRecord, SnapshotRecord, VolumeTransition};
+use tarit_types::Timestamp;
 use tarit_types::{
     ArtifactKind, ArtifactRecord, ArtifactReplicaRecord, ArtifactReplicaStatus,
     ArtifactReplicationState, ArtifactStatus, AuditEvent, BranchRecord, EgressPolicyRecord,
@@ -20,9 +20,9 @@ use uuid::Uuid;
 /// Common fleet heartbeat window. `now` must come from the registry database
 /// when evaluating a PostgreSQL host row. Keep the existing five-second future
 /// guard for legacy rows and database clock adjustments; writers use DB time.
-pub fn host_heartbeat_is_fresh(last_heartbeat: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+pub fn host_heartbeat_is_fresh(last_heartbeat: Timestamp, now: Timestamp) -> bool {
     let age = now - last_heartbeat;
-    age >= -chrono::Duration::seconds(5) && age < chrono::Duration::seconds(15)
+    age >= -time::SignedDuration::seconds(5) && age < time::SignedDuration::seconds(15)
 }
 
 fn row_to_host(row: &tokio_postgres::Row) -> HostRecord {
@@ -74,8 +74,8 @@ pub struct FleetHibernationRecord {
     pub owner_key: String,
     pub artifact_id: Uuid,
     pub egress_policy: EgressPolicyRecord,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 
 pub struct PostgresFleet {
@@ -246,9 +246,7 @@ impl PostgresFleet {
     }
 
     /// Observe membership and its freshness clock in the same database query.
-    pub async fn list_hosts_with_clock(
-        &self,
-    ) -> Result<(DateTime<Utc>, Vec<HostRecord>), FleetError> {
+    pub async fn list_hosts_with_clock(&self) -> Result<(Timestamp, Vec<HostRecord>), FleetError> {
         let client = self.pool.get().await?;
         let rows = client
             .query(
@@ -277,7 +275,7 @@ impl PostgresFleet {
     /// never steal the row. Older lifecycle writes also cannot regress state.
     pub async fn upsert_vm(&self, vm: &VmRecord) -> Result<u64, FleetError> {
         // PostgreSQL TIMESTAMPTZ and the postgres wire protocol preserve
-        // microseconds, while chrono can carry nanoseconds. Compare retries
+        // microseconds, while API timestamps can carry nanoseconds. Compare retries
         // against the same representation that PostgreSQL persists so an
         // identical retry cannot become a false same-revision conflict.
         let vm = normalize_vm_timestamps_for_postgres(vm);
@@ -475,7 +473,7 @@ impl PostgresFleet {
                 .revision
                 .checked_add(1)
                 .ok_or_else(|| FleetError::Conflict("VM revision overflow".into()))?;
-            vm.updated_at = Utc::now();
+            vm.updated_at = Timestamp::now();
             let changed = tx
                 .execute(
                     "UPDATE fleet_vms
@@ -530,7 +528,7 @@ impl PostgresFleet {
     pub async fn get_host_with_clock(
         &self,
         host_id: &str,
-    ) -> Result<Option<(DateTime<Utc>, HostRecord)>, FleetError> {
+    ) -> Result<Option<(Timestamp, HostRecord)>, FleetError> {
         let client = self.pool.get().await?;
         let row = client
             .query_opt(
@@ -906,7 +904,7 @@ impl PostgresFleet {
         {
             if row.get::<_, String>(0) == owner_key
                 && row.get::<_, Uuid>(1) == artifact_id
-                && row.get::<_, DateTime<Utc>>(2) == vm.created_at
+                && row.get::<_, Timestamp>(2) == vm.created_at
             {
                 tx.commit().await?;
                 return Ok(());
@@ -1312,7 +1310,7 @@ impl PostgresFleet {
         host_id: &str,
         boot_session_id: Uuid,
         failure_domain: &str,
-        expires_at: DateTime<Utc>,
+        expires_at: Timestamp,
     ) -> Result<Option<Uuid>, FleetError> {
         let mut client = self.pool.get().await?;
         let tx = client.transaction().await?;
@@ -1410,7 +1408,7 @@ impl PostgresFleet {
         host_id: &str,
         boot_session_id: Uuid,
         lease_token: Uuid,
-        expires_at: DateTime<Utc>,
+        expires_at: Timestamp,
     ) -> Result<bool, FleetError> {
         let client = self.pool.get().await?;
         Ok(client
@@ -1573,7 +1571,7 @@ impl PostgresFleet {
         branch_id: Uuid,
         expected_revision: u64,
         new_head: Uuid,
-        updated_at: DateTime<Utc>,
+        updated_at: Timestamp,
     ) -> Result<BranchRecord, FleetError> {
         let mut client = self.pool.get().await?;
         let tx = client.transaction().await?;
@@ -1675,7 +1673,7 @@ impl PostgresFleet {
             .execute(
                 "UPDATE fleet_artifacts SET reference_count = reference_count - 1, updated_at = $3
                  WHERE artifact_id = $1 AND owner_key = $2 AND reference_count > 0",
-                &[&branch.head_artifact_id, &owner_key, &Utc::now()],
+                &[&branch.head_artifact_id, &owner_key, &Timestamp::now()],
             )
             .await?;
         if released != 1 {
@@ -1726,7 +1724,7 @@ impl PostgresFleet {
                 .execute(
                     "UPDATE fleet_artifacts SET reference_count = reference_count - 1, updated_at = $3
                      WHERE artifact_id = $1 AND owner_key = $2 AND reference_count > 0",
-                    &[&parent_id, &owner_key, &Utc::now()],
+                    &[&parent_id, &owner_key, &Timestamp::now()],
                 )
                 .await?;
             if released != 1 {
@@ -1744,7 +1742,7 @@ impl PostgresFleet {
     pub async fn delete_vm(&self, vm: &VmRecord) -> Result<(), FleetError> {
         // `upsert_vm` persists PostgreSQL's microsecond representation. Apply
         // the same normalization to the incarnation fence here; otherwise a
-        // valid cleanup carrying chrono nanoseconds is rejected as stale even
+        // valid cleanup carrying nanoseconds is rejected as stale even
         // though it owns the row that PostgreSQL rounded on insertion.
         let vm = normalize_vm_timestamps_for_postgres(vm);
         let mut client = self.pool.get().await?;
@@ -1758,7 +1756,7 @@ impl PostgresFleet {
         let owns_current = current.is_some();
         if let Some(current) = current {
             if current.get::<_, String>(0) != vm.host_id
-                || current.get::<_, DateTime<Utc>>(1) != vm.created_at
+                || current.get::<_, Timestamp>(1) != vm.created_at
             {
                 return Err(FleetError::Conflict(format!(
                     "refusing stale ownership delete for VM {}",
@@ -1799,7 +1797,7 @@ impl PostgresFleet {
             tx.execute(
                 "UPDATE fleet_shares SET revoked_at = $2, updated_at = $2
                  WHERE vm_id = $1 AND revoked_at IS NULL",
-                &[&vm.id, &Utc::now().to_rfc3339()],
+                &[&vm.id, &Timestamp::now().to_rfc3339()],
             )
             .await?;
         }
@@ -1961,7 +1959,7 @@ impl PostgresFleet {
         id: Uuid,
         expected_status: VolumeStatus,
         expected_revision: u64,
-        updated_at: DateTime<Utc>,
+        updated_at: Timestamp,
     ) -> Result<VolumeRecord, FleetError> {
         let mut client = self.pool.get().await?;
         let tx = client.transaction().await?;
@@ -2244,7 +2242,7 @@ impl PostgresFleet {
         owner_key: &str,
         id: Uuid,
         max_vms: usize,
-        expires_at: DateTime<Utc>,
+        expires_at: Timestamp,
     ) -> Result<(), FleetError> {
         let mut client = self.pool.get().await?;
         let tx = client.transaction().await?;
@@ -2327,7 +2325,7 @@ impl PostgresFleet {
         &self,
         operation: &ForkOperationRecord,
         max_vms: usize,
-        expires_at: DateTime<Utc>,
+        expires_at: Timestamp,
     ) -> Result<ForkOperationClaimOutcome, FleetError> {
         let mut client = self.pool.get().await?;
         let tx = client.transaction().await?;
@@ -2534,8 +2532,8 @@ impl PostgresFleet {
         child_vm_id: Uuid,
         source_vm_id: Uuid,
         owner_key: &str,
-        child_created_at: DateTime<Utc>,
-        updated_at: DateTime<Utc>,
+        child_created_at: Timestamp,
+        updated_at: Timestamp,
     ) -> Result<(), FleetError> {
         let child_created_at = normalize_timestamp_for_postgres(child_created_at);
         let updated_at = normalize_timestamp_for_postgres(updated_at);
@@ -2658,7 +2656,7 @@ impl PostgresFleet {
     /// serialize with terminal updates; SKIP LOCKED allows concurrent node GC.
     pub async fn prune_finished_executions(
         &self,
-        cutoff: DateTime<Utc>,
+        cutoff: Timestamp,
         limit: usize,
     ) -> Result<usize, FleetError> {
         let client = self.pool.get().await?;
@@ -2719,7 +2717,7 @@ impl PostgresFleet {
                 "share target VM changed or is not running".into(),
             ));
         }
-        let revoked_at = share.revoked_at.as_ref().map(DateTime::to_rfc3339);
+        let revoked_at = share.revoked_at.as_ref().map(Timestamp::to_rfc3339);
         let created_at = share.created_at.to_rfc3339();
         let updated_at = share.updated_at.to_rfc3339();
         tx.execute(
@@ -2748,7 +2746,7 @@ impl PostgresFleet {
 
     pub async fn insert_share(&self, share: &ShareRecord) -> Result<(), FleetError> {
         let client = self.pool.get().await?;
-        let revoked_at = share.revoked_at.as_ref().map(DateTime::to_rfc3339);
+        let revoked_at = share.revoked_at.as_ref().map(Timestamp::to_rfc3339);
         let created_at = share.created_at.to_rfc3339();
         let updated_at = share.updated_at.to_rfc3339();
         client
@@ -2816,7 +2814,7 @@ impl PostgresFleet {
 
     pub async fn update_share(&self, share: &ShareRecord) -> Result<(), FleetError> {
         let client = self.pool.get().await?;
-        let revoked_at = share.revoked_at.as_ref().map(DateTime::to_rfc3339);
+        let revoked_at = share.revoked_at.as_ref().map(Timestamp::to_rfc3339);
         let updated_at = share.updated_at.to_rfc3339();
         let updated = client
             .execute(
@@ -2868,7 +2866,7 @@ impl PostgresFleet {
                 "share target VM changed or is not running".into(),
             ));
         }
-        let revoked_at = share.revoked_at.as_ref().map(DateTime::to_rfc3339);
+        let revoked_at = share.revoked_at.as_ref().map(Timestamp::to_rfc3339);
         let updated_at = share.updated_at.to_rfc3339();
         let updated = tx
             .execute(
@@ -2905,7 +2903,7 @@ impl PostgresFleet {
         expected_token_version: u64,
     ) -> Result<(), FleetError> {
         let client = self.pool.get().await?;
-        let revoked_at = share.revoked_at.as_ref().map(DateTime::to_rfc3339);
+        let revoked_at = share.revoked_at.as_ref().map(Timestamp::to_rfc3339);
         let updated_at = share.updated_at.to_rfc3339();
         let updated = client
             .execute(
@@ -3028,8 +3026,8 @@ impl PostgresFleet {
     pub async fn usage_summary(
         &self,
         api_key_id: Option<&str>,
-        from: DateTime<Utc>,
-        to: DateTime<Utc>,
+        from: Timestamp,
+        to: Timestamp,
     ) -> Result<Vec<UsageSummary>, FleetError> {
         let client = self.pool.get().await?;
         let rows = client
@@ -3600,12 +3598,8 @@ fn normalize_branch_timestamps_for_postgres(branch: &BranchRecord) -> BranchReco
     normalized
 }
 
-fn normalize_timestamp_for_postgres(timestamp: DateTime<Utc>) -> DateTime<Utc> {
-    DateTime::from_timestamp(
-        timestamp.timestamp(),
-        timestamp.timestamp_subsec_micros() * 1_000,
-    )
-    .expect("normalizing a valid chrono timestamp preserves its range")
+fn normalize_timestamp_for_postgres(timestamp: Timestamp) -> Timestamp {
+    timestamp.to_microsecond_precision()
 }
 
 async fn release_vm_artifact_ref_tx(
@@ -3624,7 +3618,7 @@ async fn release_vm_artifact_ref_tx(
     };
     let owner_key: String = row.get(0);
     let artifact_id: Uuid = row.get(1);
-    let created_at: DateTime<Utc> = row.get(2);
+    let created_at: Timestamp = row.get(2);
     if vm.owner_key.as_deref() != Some(owner_key.as_str()) || vm.created_at != created_at {
         return Err(FleetError::Conflict(
             "refusing stale VM artifact reference release".into(),
@@ -3799,12 +3793,10 @@ where
         .map_err(|error| FleetError::InvalidShareRow(format!("{name}: {error}")))
 }
 
-fn parse_share_timestamp(column: &str, value: &str) -> Result<DateTime<Utc>, FleetError> {
-    DateTime::parse_from_rfc3339(value)
-        .map(|timestamp| timestamp.with_timezone(&Utc))
-        .map_err(|error| {
-            FleetError::InvalidShareRow(format!("invalid {column} timestamp: {error}"))
-        })
+fn parse_share_timestamp(column: &str, value: &str) -> Result<Timestamp, FleetError> {
+    value.parse::<Timestamp>().map_err(|error| {
+        FleetError::InvalidShareRow(format!("invalid {column} timestamp: {error}"))
+    })
 }
 
 fn u64_to_sql_i64(value: u64) -> Result<i64, FleetError> {
@@ -3924,7 +3916,7 @@ pub fn host_record_from_capacity(
         free_vcpus,
         free_memory_mib,
         healthy: true,
-        last_heartbeat: Utc::now(),
+        last_heartbeat: Timestamp::now(),
     }
 }
 
@@ -3952,19 +3944,42 @@ mod tests {
 
     #[test]
     fn signed_heartbeat_window_accepts_small_future_skew_and_rejects_stale_rows() {
-        let now = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let now = Timestamp::from_timestamp(1_800_000_000, 0).unwrap();
         for offset_ms in [-14_999, 0, 500, 5_000] {
             assert!(host_heartbeat_is_fresh(
-                now + chrono::Duration::milliseconds(offset_ms),
+                now + time::SignedDuration::milliseconds(offset_ms),
                 now
             ));
         }
         for offset_ms in [-15_000, -60_000, 5_001, 60_000] {
             assert!(!host_heartbeat_is_fresh(
-                now + chrono::Duration::milliseconds(offset_ms),
+                now + time::SignedDuration::milliseconds(offset_ms),
                 now
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn postgres_existing_timestamptz_and_new_parameters_round_trip() -> Result<(), FleetError>
+    {
+        let Some(url) = postgres_test_database_url() else {
+            return Ok(());
+        };
+        let _database_guard = POSTGRES_TEST_LOCK.lock().await;
+        let fleet = PostgresFleet::connect_with_replication_policy(&url, 1, 1).await?;
+        let client = fleet.pool.get().await?;
+        let input: Timestamp = "2026-01-01T01:00:00.123456789+05:30".parse().unwrap();
+        let row = client
+            .query_one(
+                "SELECT TIMESTAMPTZ '1969-12-31 23:00:00.123400-01:00', $1::TIMESTAMPTZ",
+                &[&input],
+            )
+            .await?;
+        let older: Timestamp = row.get(0);
+        let bound: Timestamp = row.get(1);
+        assert_eq!(older.to_rfc3339(), "1970-01-01T00:00:00.123400+00:00");
+        assert_eq!(bound.to_rfc3339(), "2025-12-31T19:30:00.123456+00:00");
+        Ok(())
     }
 
     #[tokio::test]
@@ -3990,11 +4005,11 @@ mod tests {
         let artifact = test_artifact(&owner, &host_id, suffix);
         let result = async {
             for skew in [-24, 24] {
-                host.last_heartbeat = Utc::now() + chrono::Duration::hours(skew);
+                host.last_heartbeat = Timestamp::now() + time::SignedDuration::hours(skew);
                 fleet.upsert_host(&host).await?;
                 let (now, stored) = fleet.get_host_with_clock(&host_id).await?.unwrap();
                 assert!(host_heartbeat_is_fresh(stored.last_heartbeat, now));
-                assert!((now - stored.last_heartbeat).num_milliseconds().abs() < 5_000);
+                assert!((now - stored.last_heartbeat).whole_milliseconds().abs() < 5_000);
                 let (list_now, hosts) = fleet.list_hosts_with_clock().await?;
                 let listed = hosts.iter().find(|h| h.host_id == host_id).unwrap();
                 assert!(host_heartbeat_is_fresh(listed.last_heartbeat, list_now));
@@ -4035,31 +4050,31 @@ mod tests {
         };
         let _database_guard = POSTGRES_TEST_LOCK.lock().await;
         let fleet = PostgresFleet::connect(&url).await?;
-        let now = DateTime::from_timestamp(Utc::now().timestamp(), 0).unwrap();
-        let cutoff = now - chrono::Duration::hours(24);
+        let now = Timestamp::from_timestamp(Timestamp::now().unix_timestamp(), 0).unwrap();
+        let cutoff = now - time::SignedDuration::hours(24);
         let mut records = Vec::new();
         for (status, updated_at) in [
             (
                 ExecutionStatus::Completed,
-                cutoff - chrono::Duration::seconds(1),
+                cutoff - time::SignedDuration::seconds(1),
             ),
             (
                 ExecutionStatus::Failed,
-                cutoff - chrono::Duration::seconds(1),
+                cutoff - time::SignedDuration::seconds(1),
             ),
             (
                 ExecutionStatus::Completed,
-                cutoff - chrono::Duration::seconds(1),
+                cutoff - time::SignedDuration::seconds(1),
             ),
             (ExecutionStatus::Completed, cutoff),
             (ExecutionStatus::Completed, now),
             (
                 ExecutionStatus::Running,
-                cutoff - chrono::Duration::hours(24),
+                cutoff - time::SignedDuration::hours(24),
             ),
             (
                 ExecutionStatus::Pending,
-                cutoff - chrono::Duration::hours(24),
+                cutoff - time::SignedDuration::hours(24),
             ),
         ] {
             let record = ExecutionRecord {
@@ -4085,7 +4100,7 @@ mod tests {
         }
         let result = async {
             let mut changed = records[4].clone();
-            changed.vm_created_at = Some(now + chrono::Duration::seconds(1));
+            changed.vm_created_at = Some(now + time::SignedDuration::seconds(1));
             assert!(matches!(
                 fleet
                     .upsert_execution(&changed, "retention-owner", "key", "retention-test")
@@ -4121,7 +4136,7 @@ mod tests {
     }
 
     fn test_vm(id: Uuid, host_id: &str, owner_key: &str) -> VmRecord {
-        let now = Utc::now();
+        let now = Timestamp::now();
         VmRecord {
             id,
             host_id: host_id.into(),
@@ -4145,7 +4160,7 @@ mod tests {
     }
 
     fn test_artifact(owner_key: &str, host_id: &str, suffix: Uuid) -> ArtifactRecord {
-        let now = Utc::now();
+        let now = Timestamp::now();
         ArtifactRecord {
             artifact_id: Uuid::new_v4(),
             owner_key: owner_key.into(),
@@ -4172,7 +4187,7 @@ mod tests {
     }
 
     fn test_volume(owner_key: &str, host_id: &str, suffix: Uuid) -> VolumeRecord {
-        let now = Utc::now();
+        let now = Timestamp::now();
         VolumeRecord {
             id: Uuid::new_v4(),
             owner_key: owner_key.into(),
@@ -4200,7 +4215,7 @@ mod tests {
     }
 
     fn test_share(slug: String, owner_key: &str) -> ShareRecord {
-        let now = chrono::DateTime::from_timestamp(1_700_000_000, 123_456_789).unwrap();
+        let now = Timestamp::from_timestamp(1_700_000_000, 123_456_789).unwrap();
         ShareRecord {
             id: Uuid::new_v4(),
             slug,
@@ -4209,7 +4224,7 @@ mod tests {
             guest_port: 8080,
             visibility: ShareVisibility::Private,
             token_version: 2,
-            revoked_at: Some(chrono::DateTime::from_timestamp(1_700_000_001, 987_654_321).unwrap()),
+            revoked_at: Some(Timestamp::from_timestamp(1_700_000_001, 987_654_321).unwrap()),
             created_at: now,
             updated_at: now,
         }
@@ -4316,7 +4331,7 @@ mod tests {
         }
         let _database_guard = POSTGRES_TEST_LOCK.lock().await;
         let fleet = PostgresFleet::connect(&database_url).await?;
-        let now = Utc::now();
+        let now = Timestamp::now();
         let operation = ForkOperationRecord {
             child_vm_id: Uuid::new_v4(),
             source_vm_id: Uuid::new_v4(),
@@ -4329,7 +4344,7 @@ mod tests {
             created_at: now,
             updated_at: now,
         };
-        let expiry = now + chrono::Duration::minutes(1);
+        let expiry = now + time::SignedDuration::minutes(1);
         let result = async {
             assert_eq!(
                 fleet.claim_fork_operation(&operation, 2, expiry).await?,
@@ -4341,7 +4356,7 @@ mod tests {
             );
             let restarted_operation = ForkOperationRecord {
                 target_boot_session_id: Some(Uuid::new_v4()),
-                updated_at: now + chrono::Duration::seconds(1),
+                updated_at: now + time::SignedDuration::seconds(1),
                 ..operation.clone()
             };
             assert_eq!(
@@ -4380,14 +4395,14 @@ mod tests {
                 fleet.claim_fork_operation(&operation, 2, expiry).await?,
                 ForkOperationClaimOutcome::Resumed
             );
-            let child_created_at = Utc::now();
+            let child_created_at = Timestamp::now();
             fleet
                 .commit_fork_operation(
                     operation.child_vm_id,
                     operation.source_vm_id,
                     &operation.owner_key,
                     child_created_at,
-                    Utc::now(),
+                    Timestamp::now(),
                 )
                 .await?;
             let committed = fleet
@@ -4488,7 +4503,7 @@ mod tests {
                         expected_revision: 1,
                         status: VolumeStatus::Available,
                         last_error: None,
-                        updated_at: Utc::now(),
+                        updated_at: Timestamp::now(),
                     },
                 )
                 .await?;
@@ -4504,7 +4519,7 @@ mod tests {
                             expected_revision: 1,
                             status: VolumeStatus::Error,
                             last_error: Some("stale"),
-                            updated_at: Utc::now(),
+                            updated_at: Timestamp::now(),
                         },
                     )
                     .await,
@@ -4523,7 +4538,7 @@ mod tests {
                 owner_key: owner.clone(),
                 mode: VolumeAttachmentMode::ReadWrite,
                 volume_generation: 1,
-                created_at: Utc::now(),
+                created_at: Timestamp::now(),
             };
             let forward = [
                 rwx_attachment(vm_b.id, rwx_a.id, 0),
@@ -4552,7 +4567,7 @@ mod tests {
                 owner_key: owner.clone(),
                 mode,
                 volume_generation: 1,
-                created_at: Utc::now(),
+                created_at: Timestamp::now(),
             };
             let writer = attachment(vm_a.id, 0, VolumeAttachmentMode::ReadWrite);
             fleet.bind_vm_volumes(std::slice::from_ref(&writer)).await?;
@@ -4574,7 +4589,13 @@ mod tests {
             ));
             assert!(matches!(
                 fleet
-                    .begin_volume_delete(&owner, volume.id, VolumeStatus::Available, 2, Utc::now())
+                    .begin_volume_delete(
+                        &owner,
+                        volume.id,
+                        VolumeStatus::Available,
+                        2,
+                        Timestamp::now()
+                    )
                     .await,
                 Err(FleetError::Conflict(_))
             ));
@@ -4590,7 +4611,13 @@ mod tests {
             assert_eq!(fleet.volume_attachment_count(&owner, volume.id).await?, 0);
 
             let deleting = fleet
-                .begin_volume_delete(&owner, volume.id, VolumeStatus::Available, 2, Utc::now())
+                .begin_volume_delete(
+                    &owner,
+                    volume.id,
+                    VolumeStatus::Available,
+                    2,
+                    Timestamp::now(),
+                )
                 .await?;
             assert_eq!(deleting.status, VolumeStatus::Deleting);
             assert_eq!(deleting.revision, 3);
@@ -4664,8 +4691,8 @@ mod tests {
             source_vm_id: None,
             source_branch_id: None,
             revision: 1,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: Timestamp::now(),
+            updated_at: Timestamp::now(),
         };
         let result = async {
             fleet
@@ -4715,7 +4742,7 @@ mod tests {
                     "idempotent artifact replay duplicated primary replica".into(),
                 ));
             }
-            let now = Utc::now();
+            let now = Timestamp::now();
             let replica = ArtifactReplicaRecord {
                 artifact_id: first.artifact_id,
                 owner_key: owner.clone(),
@@ -4768,8 +4795,8 @@ mod tests {
                 owner_key: owner.clone(),
                 artifact_id: first.artifact_id,
                 egress_policy: policy.clone(),
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
+                created_at: Timestamp::now(),
+                updated_at: Timestamp::now(),
             };
             fleet.upsert_hibernation(&durable_hibernation).await?;
             if fleet
@@ -4838,7 +4865,7 @@ mod tests {
                     &host_c,
                     session_c,
                     "zone-c",
-                    Utc::now() + chrono::Duration::seconds(30),
+                    Timestamp::now() + time::SignedDuration::seconds(30),
                 )
                 .await?
                 .ok_or_else(|| FleetError::Config("repair lease was not acquired".into()))?;
@@ -4848,7 +4875,7 @@ mod tests {
                     &host_c,
                     session_c,
                     "zone-c",
-                    Utc::now() + chrono::Duration::seconds(30),
+                    Timestamp::now() + time::SignedDuration::seconds(30),
                 )
                 .await?
                 .is_some()
@@ -4858,7 +4885,7 @@ mod tests {
                         &host_c,
                         Uuid::new_v4(),
                         lease,
-                        Utc::now() + chrono::Duration::seconds(30),
+                        Timestamp::now() + time::SignedDuration::seconds(30),
                     )
                     .await?
             {
@@ -4872,7 +4899,7 @@ mod tests {
                     &host_c,
                     session_c,
                     lease,
-                    Utc::now() + chrono::Duration::seconds(30),
+                    Timestamp::now() + time::SignedDuration::seconds(30),
                 )
                 .await?
             {
@@ -4915,8 +4942,7 @@ mod tests {
             let replacement_policy = EgressPolicyRecord {
                 revision: 2,
                 allow_existing: true,
-                updated_at: DateTime::from_timestamp_micros(Utc::now().timestamp_micros())
-                    .expect("current timestamp fits"),
+                updated_at: Timestamp::now().to_microsecond_precision(),
                 ..policy
             };
             fleet
@@ -4979,7 +5005,7 @@ mod tests {
                         branch.branch_id,
                         1,
                         foreign.artifact_id,
-                        Utc::now()
+                        Timestamp::now()
                     )
                     .await,
                 Err(FleetError::NotFound)
@@ -4989,14 +5015,14 @@ mod tests {
                 ));
             }
             let updated = fleet
-                .update_branch_head(&owner, branch.branch_id, 1, second.artifact_id, Utc::now())
+                .update_branch_head(&owner, branch.branch_id, 1, second.artifact_id, Timestamp::now())
                 .await?;
             if updated.revision != 2 || updated.head_artifact_id != second.artifact_id {
                 return Err(FleetError::Config("branch CAS did not advance".into()));
             }
             if !matches!(
                 fleet
-                    .update_branch_head(&owner, branch.branch_id, 1, first.artifact_id, Utc::now())
+                    .update_branch_head(&owner, branch.branch_id, 1, first.artifact_id, Timestamp::now())
                     .await,
                 Err(FleetError::Conflict(_))
             ) {
@@ -5064,13 +5090,13 @@ mod tests {
     #[test]
     fn vm_timestamp_normalization_matches_postgres_precision() {
         let mut vm = test_vm(Uuid::new_v4(), "host-a", "tenant-a");
-        vm.created_at = DateTime::from_timestamp(1_700_000_000, 123_456_789).unwrap();
-        vm.updated_at = DateTime::from_timestamp(1_700_000_001, 987_654_321).unwrap();
+        vm.created_at = Timestamp::from_timestamp(1_700_000_000, 123_456_789).unwrap();
+        vm.updated_at = Timestamp::from_timestamp(1_700_000_001, 987_654_321).unwrap();
 
         let normalized = normalize_vm_timestamps_for_postgres(&vm);
 
-        assert_eq!(normalized.created_at.timestamp_subsec_nanos(), 123_456_000);
-        assert_eq!(normalized.updated_at.timestamp_subsec_nanos(), 987_654_000);
+        assert_eq!(normalized.created_at.nanosecond(), 123_456_000);
+        assert_eq!(normalized.updated_at.nanosecond(), 987_654_000);
         assert_eq!(normalized.id, vm.id);
         assert_eq!(normalized.revision, vm.revision);
     }
@@ -5111,7 +5137,7 @@ mod tests {
             cmdline: Some("console=ttyS0".into()),
             content_digest: Some("sha256:test".into()),
             size_bytes: Some(4096),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
         };
         fleet.upsert_snapshot(&snapshot).await?;
         let location = fleet
@@ -5241,7 +5267,7 @@ mod tests {
             cmdline: None,
             content_digest: None,
             size_bytes: Some(4096),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
         };
         let kept = [
             locator(&live_host, &tenant_a),
@@ -5354,8 +5380,8 @@ mod tests {
         let id = Uuid::new_v4();
         let owner = format!("tenant-{id}");
         let mut vm = test_vm(id, "host-a", &owner);
-        vm.created_at = DateTime::from_timestamp(1_700_000_000, 123_456_789).unwrap();
-        vm.updated_at = DateTime::from_timestamp(1_700_000_001, 987_654_321).unwrap();
+        vm.created_at = Timestamp::from_timestamp(1_700_000_000, 123_456_789).unwrap();
+        vm.updated_at = Timestamp::from_timestamp(1_700_000_001, 987_654_321).unwrap();
         let result = async {
             let first_generation = fleet.upsert_vm(&vm).await?;
             let retry_generation = fleet.upsert_vm(&vm).await?;
@@ -5366,7 +5392,7 @@ mod tests {
             let mut running = vm.clone();
             running.status = VmStatus::Running;
             running.revision += 1;
-            running.updated_at += chrono::Duration::seconds(1);
+            running.updated_at += time::SignedDuration::seconds(1);
             let second_generation = fleet.upsert_vm(&running).await?;
             assert!(second_generation > first_generation);
 
@@ -5422,7 +5448,7 @@ mod tests {
         let second_artifact = test_artifact(&owner, "host-a", suffix);
         fleet.insert_artifact(&artifact).await?;
         let mut vm = test_vm(Uuid::new_v4(), "host-a", &owner);
-        vm.created_at = DateTime::from_timestamp(1_700_000_000, 123_456_789).unwrap();
+        vm.created_at = Timestamp::from_timestamp(1_700_000_000, 123_456_789).unwrap();
         vm.updated_at = vm.created_at;
         let result = async {
             fleet
@@ -5440,7 +5466,7 @@ mod tests {
                 "retrying the same restore must not double-acquire"
             );
             let mut reused_uuid = vm.clone();
-            reused_uuid.created_at += chrono::Duration::seconds(1);
+            reused_uuid.created_at += time::SignedDuration::seconds(1);
             assert!(matches!(
                 fleet.release_vm_artifact_ref(&reused_uuid).await,
                 Err(FleetError::Conflict(_))
@@ -5661,7 +5687,7 @@ mod tests {
                 .revoked_at
                 .is_some());
             let mut replacement = vm.clone();
-            replacement.created_at += chrono::Duration::seconds(1);
+            replacement.created_at += time::SignedDuration::seconds(1);
             fleet.upsert_vm(&replacement).await?;
             assert!(matches!(
                 fleet.insert_share_for_vm(&late, &vm).await,
@@ -5724,7 +5750,7 @@ mod tests {
             let updated = ShareRecord {
                 guest_port: 9090,
                 token_version: share.token_version + 1,
-                updated_at: share.updated_at + chrono::Duration::seconds(1),
+                updated_at: share.updated_at + time::SignedDuration::seconds(1),
                 ..share.clone()
             };
             fleet
@@ -5784,7 +5810,7 @@ mod tests {
         let tenant_b = format!("tenant-b-{suffix}");
         let mut first = test_share(format!("share-{suffix}-first"), &tenant_a);
         let mut second = test_share(format!("share-{suffix}-second"), &tenant_a);
-        second.created_at += chrono::Duration::seconds(1);
+        second.created_at += time::SignedDuration::seconds(1);
         let other_tenant = test_share(format!("share-{suffix}-other"), &tenant_b);
         let missing = test_share(format!("share-{suffix}-missing"), &tenant_a);
         let ids = [first.id, second.id, other_tenant.id, missing.id];
@@ -5844,7 +5870,7 @@ mod tests {
             first.guest_port = 9090;
             first.visibility = ShareVisibility::Public;
             first.token_version += 1;
-            first.updated_at += chrono::Duration::seconds(1);
+            first.updated_at += time::SignedDuration::seconds(1);
             fleet.update_share(&first).await?;
             let updated = fleet
                 .get_share(first.id)

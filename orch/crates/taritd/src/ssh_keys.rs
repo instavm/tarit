@@ -4,8 +4,8 @@ use axum::{
     Json,
 };
 use base64::{engine::general_purpose, Engine as _};
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use tarit_types::Timestamp;
 use tarit_types::{openssh_sha256_fingerprint, OrchError, SshKeyRecord};
 use uuid::Uuid;
 
@@ -22,7 +22,7 @@ pub(crate) struct SshKeyResponse {
     id: Uuid,
     fingerprint: String,
     key_type: String,
-    created_at: DateTime<Utc>,
+    created_at: Timestamp,
 }
 
 #[derive(Debug, Serialize)]
@@ -47,7 +47,7 @@ pub(crate) async fn create_ssh_key(
         fingerprint: openssh_sha256_fingerprint(&parsed.blob),
         public_key: req.public_key.trim().to_string(),
         key_type: parsed.key_type,
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
         is_active: true,
     };
 

@@ -16,7 +16,6 @@ use axum::{
     Json, Router,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use chrono::Utc;
 use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -29,6 +28,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tarit_store::HostRecord;
+use tarit_types::Timestamp;
 use tarit_types::{
     ArtifactReplicaStatus, ArtifactStatus, CreateVmRequest, EgressPolicyRecord,
     EgressUpdateRequest, PeerSnapshotResponse, PutEgressPolicyRequest, VmRecord,
@@ -537,7 +537,7 @@ async fn verify_peer_request(
     }
     let issued_at = single_header(headers, "X-Tarit-Peer-Timestamp")
         .and_then(|value| value.parse::<i64>().ok())?;
-    if Utc::now().timestamp().abs_diff(issued_at) > MAX_PEER_IDENTITY_AGE_SECS {
+    if Timestamp::now().unix_timestamp().abs_diff(issued_at) > MAX_PEER_IDENTITY_AGE_SECS {
         return None;
     }
     let nonce = single_header(headers, "X-Tarit-Peer-Nonce")
@@ -636,7 +636,7 @@ fn current_peer_source(
     source: &str,
     session: Uuid,
     peer_certificate_sha256: &str,
-    now: chrono::DateTime<Utc>,
+    now: tarit_types::Timestamp,
 ) -> bool {
     host.peer_certificate_sha256.as_deref() == Some(peer_certificate_sha256)
         && current_peer_source_session(host, source, session, now)
@@ -646,7 +646,7 @@ fn current_peer_source_session(
     host: &HostRecord,
     source: &str,
     session: Uuid,
-    now: chrono::DateTime<Utc>,
+    now: tarit_types::Timestamp,
 ) -> bool {
     host.host_id == source
         && host.boot_session_id == Some(session)
@@ -754,7 +754,7 @@ fn peer_identity_from_headers(
     let api_key_id = single_header(headers, "X-Tarit-Api-Key-Id")?;
     let issued_at = single_header(headers, "X-Tarit-Identity-Timestamp")
         .and_then(|value| value.parse::<i64>().ok())?;
-    if Utc::now().timestamp().abs_diff(issued_at) > MAX_PEER_IDENTITY_AGE_SECS {
+    if Timestamp::now().unix_timestamp().abs_diff(issued_at) > MAX_PEER_IDENTITY_AGE_SECS {
         return None;
     }
     let nonce = single_header(headers, "X-Tarit-Identity-Nonce")
@@ -961,17 +961,42 @@ async fn internal_restore(
     Json(req): Json<InternalRestoreRequest>,
 ) -> Result<(StatusCode, Json<InternalVmRecord>), ApiError> {
     let identity = require_peer_identity(identity.as_ref().map(|i| &i.0))?;
+    let (owner_key, api_key_id) =
+        peer_restore_attribution(identity, req.owner_key, req.api_key_id)?;
     let rec = ops::restore_local_with_target(
         &state,
         &req.snapshot_path,
         Some(req.id),
-        Some(req.owner_key),
-        Some(req.api_key_id),
+        Some(owner_key),
+        Some(api_key_id),
         identity.is_admin(),
         req.target_memory_mib,
     )
     .await?;
     Ok((StatusCode::CREATED, Json(rec.into())))
+}
+
+fn peer_restore_attribution(
+    identity: &ApiIdentity,
+    owner_key: String,
+    api_key_id: String,
+) -> Result<(String, String), tarit_types::OrchError> {
+    // Only admins can delegate restore ownership and attribution. For other
+    // callers the wire fields remain for compatibility, not authorization.
+    if identity.is_admin() {
+        if owner_key.trim().is_empty() || api_key_id.trim().is_empty() {
+            return Err(tarit_types::OrchError::BadRequest(
+                "delegated restore requires a nonempty tenant and billing key ID".into(),
+            ));
+        }
+        return Ok((owner_key, api_key_id));
+    }
+    if owner_key != identity.tenant || api_key_id != identity.api_key_id {
+        return Err(tarit_types::OrchError::Forbidden(
+            "restore attribution must match the forwarded caller".into(),
+        ));
+    }
+    Ok((identity.tenant.clone(), identity.api_key_id.clone()))
 }
 
 async fn internal_exec(
@@ -1180,8 +1205,49 @@ async fn internal_put_egress_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
+    use tarit_types::Timestamp;
     use tarit_types::VmStatus;
+
+    #[test]
+    fn peer_restore_attribution_is_bound_for_non_admins() {
+        let identity = ApiIdentity {
+            tenant: "owner".into(),
+            api_key_id: "key-id".into(),
+            role: ApiRole::User,
+            max_vms: None,
+        };
+        assert_eq!(
+            peer_restore_attribution(&identity, "owner".into(), "key-id".into()).unwrap(),
+            (identity.tenant.clone(), identity.api_key_id.clone()),
+        );
+        for (owner, key_id) in [("different-owner", "key-id"), ("owner", "different-key-id")] {
+            assert!(matches!(
+                peer_restore_attribution(&identity, owner.into(), key_id.into()),
+                Err(tarit_types::OrchError::Forbidden(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn peer_restore_attribution_preserves_admin_delegation() {
+        let identity = ApiIdentity {
+            tenant: "admin".into(),
+            api_key_id: "admin-key-id".into(),
+            role: ApiRole::Admin,
+            max_vms: None,
+        };
+        assert_eq!(
+            peer_restore_attribution(&identity, "delegate".into(), "delegate-key-id".into())
+                .unwrap(),
+            ("delegate".to_string(), "delegate-key-id".to_string()),
+        );
+        for (owner, key) in [("", "key"), ("owner", "  ")] {
+            assert!(matches!(
+                peer_restore_attribution(&identity, owner.into(), key.into()),
+                Err(tarit_types::OrchError::BadRequest(_))
+            ));
+        }
+    }
 
     fn signed_test_request(
         state: &AppState,
@@ -1191,7 +1257,7 @@ mod tests {
     ) -> Request<Body> {
         let path = "/internal/v1/vms/00000000-0000-0000-0000-000000000000";
         let payload_hash = URL_SAFE_NO_PAD.encode(Sha256::digest(b""));
-        let timestamp = Utc::now().timestamp().to_string();
+        let timestamp = Timestamp::now().unix_timestamp().to_string();
         let session = session.to_string();
         let target_session = state.config.host_session_id.to_string();
         let nonce = nonce.to_string();
@@ -1344,6 +1410,101 @@ mod tests {
         });
     }
 
+    fn signed_router_request(
+        state: &AppState,
+        method: &str,
+        path: &str,
+        role: &str,
+        body: String,
+        key: &str,
+        tamper: bool,
+    ) -> Request<Body> {
+        let source = Uuid::new_v4().to_string();
+        let timestamp = Timestamp::now().unix_timestamp().to_string();
+        let identity_nonce = Uuid::new_v4().to_string();
+        let nonce = Uuid::new_v4().to_string();
+        let source_session = Uuid::new_v4().to_string();
+        let target_session = state.config.host_session_id.to_string();
+        let mut identity_mac =
+            Hmac::<Sha256>::new_from_slice(state.config.peer_secret.as_bytes()).unwrap();
+        identity_mac.update(format!("{IDENTITY_SIGNATURE_VERSION}\n{source}\n{timestamp}\n{identity_nonce}\ntenant-a\n{role}\ntest-key-id").as_bytes());
+        let identity_signature = URL_SAFE_NO_PAD.encode(identity_mac.finalize().into_bytes());
+        let payload = URL_SAFE_NO_PAD.encode(Sha256::digest(body.as_bytes()));
+        let mut request_mac =
+            Hmac::<Sha256>::new_from_slice(state.config.peer_secret.as_bytes()).unwrap();
+        for component in [
+            REQUEST_SIGNATURE_VERSION,
+            method,
+            path,
+            &payload,
+            &timestamp,
+            &nonce,
+            &source,
+            &state.config.host_id,
+            &source_session,
+            &target_session,
+            &identity_signature,
+        ] {
+            request_mac.update(component.as_bytes());
+            request_mac.update(b"\n");
+        }
+        let signature = URL_SAFE_NO_PAD.encode(request_mac.finalize().into_bytes());
+        Request::builder()
+            .method(method)
+            .uri(path)
+            .header("Content-Type", "application/json")
+            .header("X-API-Key", key)
+            .header("X-Tarit-Peer-Version", REQUEST_SIGNATURE_VERSION)
+            .header("X-Tarit-Peer-Source", source)
+            .header("X-Tarit-Peer-Target", &state.config.host_id)
+            .header("X-Tarit-Peer-Source-Session", source_session)
+            .header("X-Tarit-Peer-Target-Session", target_session)
+            .header("X-Tarit-Peer-Timestamp", &timestamp)
+            .header("X-Tarit-Peer-Nonce", nonce)
+            .header("X-Tarit-Peer-Body-SHA256", payload)
+            .header(
+                "X-Tarit-Peer-Signature",
+                if tamper { "invalid" } else { &signature },
+            )
+            .header("X-Tarit-Tenant", "tenant-a")
+            .header("X-Tarit-Role", role)
+            .header("X-Tarit-Api-Key-Id", "test-key-id")
+            .header("X-Tarit-Identity-Timestamp", timestamp)
+            .header("X-Tarit-Identity-Nonce", identity_nonce)
+            .header("X-Tarit-Identity-Signature", identity_signature)
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    #[test]
+    fn signed_restore_routes_validate_attribution_before_creating_a_vm() {
+        use tower::ServiceExt;
+        let state = crate::api::tests::test_state();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for path in ["/internal/v1/restore", "/internal/v1/restore-memory-target"] {
+                for (role, owner, key, expected) in [
+                    ("admin", " ", "key", StatusCode::BAD_REQUEST),
+                    ("admin", "owner", "", StatusCode::BAD_REQUEST),
+                    ("user", "foreign", "test-key-id", StatusCode::FORBIDDEN),
+                    ("user", "tenant-a", "foreign-key", StatusCode::FORBIDDEN),
+                ] {
+                    let id = Uuid::new_v4();
+                    let body = serde_json::json!({"id":id,"snapshot_path":"missing","owner_key":owner,"api_key_id":key}).to_string();
+                    let request = signed_router_request(&state, "POST", path, role, body, "unused", false);
+                    let response = internal_router(state.clone()).oneshot(request).await.unwrap();
+                    assert_eq!(response.status(), expected);
+                    let store = state.store.lock().unwrap();
+                    assert!(matches!(store.get_vm(id), Err(tarit_store::StoreError::NotFound)));
+                    assert!(store.get_billing_watermark(id).unwrap().is_none());
+                }
+            }
+        });
+    }
+
     #[test]
     fn signed_peer_requests_use_global_admission_and_reject_tampering() {
         use tower::ServiceExt;
@@ -1352,59 +1513,7 @@ mod tests {
         crate::api::tests::insert_vm(&state, id, "tenant-a", VmStatus::Running);
         let path = format!("/internal/v1/vms/{id}");
         let signed_request = |key: &str, tamper: bool| {
-            let source = Uuid::new_v4().to_string();
-            let timestamp = Utc::now().timestamp().to_string();
-            let identity_nonce = Uuid::new_v4().to_string();
-            let nonce = Uuid::new_v4().to_string();
-            let source_session = Uuid::new_v4().to_string();
-            let target_session = state.config.host_session_id.to_string();
-            let mut identity_mac =
-                Hmac::<Sha256>::new_from_slice(state.config.peer_secret.as_bytes()).unwrap();
-            identity_mac.update(format!("{IDENTITY_SIGNATURE_VERSION}\n{source}\n{timestamp}\n{identity_nonce}\ntenant-a\nuser\ntest-key-id").as_bytes());
-            let identity_signature = URL_SAFE_NO_PAD.encode(identity_mac.finalize().into_bytes());
-            let payload = URL_SAFE_NO_PAD.encode(Sha256::digest(b""));
-            let mut request_mac =
-                Hmac::<Sha256>::new_from_slice(state.config.peer_secret.as_bytes()).unwrap();
-            for component in [
-                REQUEST_SIGNATURE_VERSION,
-                "GET",
-                &path,
-                &payload,
-                &timestamp,
-                &nonce,
-                &source,
-                &state.config.host_id,
-                &source_session,
-                &target_session,
-                &identity_signature,
-            ] {
-                request_mac.update(component.as_bytes());
-                request_mac.update(b"\n");
-            }
-            let signature = URL_SAFE_NO_PAD.encode(request_mac.finalize().into_bytes());
-            Request::builder()
-                .uri(&path)
-                .header("X-API-Key", key)
-                .header("X-Tarit-Peer-Version", REQUEST_SIGNATURE_VERSION)
-                .header("X-Tarit-Peer-Source", source)
-                .header("X-Tarit-Peer-Target", &state.config.host_id)
-                .header("X-Tarit-Peer-Source-Session", source_session)
-                .header("X-Tarit-Peer-Target-Session", target_session)
-                .header("X-Tarit-Peer-Timestamp", &timestamp)
-                .header("X-Tarit-Peer-Nonce", nonce)
-                .header("X-Tarit-Peer-Body-SHA256", payload)
-                .header(
-                    "X-Tarit-Peer-Signature",
-                    if tamper { "invalid" } else { &signature },
-                )
-                .header("X-Tarit-Tenant", "tenant-a")
-                .header("X-Tarit-Role", "user")
-                .header("X-Tarit-Api-Key-Id", "test-key-id")
-                .header("X-Tarit-Identity-Timestamp", timestamp)
-                .header("X-Tarit-Identity-Nonce", identity_nonce)
-                .header("X-Tarit-Identity-Signature", identity_signature)
-                .body(Body::empty())
-                .unwrap()
+            signed_router_request(&state, "GET", &path, "user", String::new(), key, tamper)
         };
         let valid = signed_request("junk", false);
         let exhausted = signed_request("tenant-b-key", false);
@@ -1640,8 +1749,8 @@ mod tests {
             runtime_layout: None,
             socket_path: Some("/run/taritd/vm.sock".into()),
             pid: Some(42),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: Timestamp::now(),
+            updated_at: Timestamp::now(),
         }
     }
 
@@ -1666,7 +1775,7 @@ mod tests {
 
     #[test]
     fn peer_source_session_must_match_the_current_healthy_heartbeat() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let session = Uuid::new_v4();
         let mut host = HostRecord {
             host_id: "node-a".into(),
@@ -1709,7 +1818,7 @@ mod tests {
             now
         ));
         host.healthy = true;
-        host.last_heartbeat = now - chrono::Duration::seconds(16);
+        host.last_heartbeat = now - time::SignedDuration::seconds(16);
         assert!(!current_peer_source(
             &host,
             "node-a",
@@ -1717,7 +1826,7 @@ mod tests {
             "certificate-a",
             now
         ));
-        host.last_heartbeat = now + chrono::Duration::seconds(6);
+        host.last_heartbeat = now + time::SignedDuration::seconds(6);
         assert!(!current_peer_source(
             &host,
             "node-a",

@@ -808,11 +808,11 @@ mod tests {
     use crate::pty::PtyRegistry;
     use crate::scheduler::Scheduler;
     use crate::supervisor::VmmSupervisor;
-    use chrono::Utc;
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex, RwLock};
     use tarit_store::Store;
+    use tarit_types::Timestamp;
     use tarit_types::VmRecord;
     use uuid::Uuid;
 
@@ -836,7 +836,7 @@ mod tests {
         state.metrics.inc_exec_total();
 
         let vm_id = Uuid::new_v4();
-        let now = Utc::now();
+        let now = Timestamp::now();
         state.vm_cache.write().unwrap().insert(
             vm_id,
             VmRecord {

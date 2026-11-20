@@ -1,5 +1,4 @@
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Duration, Utc};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::env;
@@ -9,7 +8,9 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tarit_store::{ImageRecord, SnapshotRecord, Store, StoreError};
+use tarit_types::Timestamp;
 use tarit_types::{CreateVmRequest, OrchError, VmRecord, VmStatus};
+use time::SignedDuration as Duration;
 
 use crate::config::{expand_path, load_warm_pool_config, Config, WarmPoolConfig};
 
@@ -191,7 +192,7 @@ pub fn build_image(opts: BuildImageOptions) -> Result<ImageRecord> {
         ".build-{}-{}-{}.ext4",
         sanitize_component(&opts.image_ref.name),
         std::process::id(),
-        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        Timestamp::now().unix_timestamp_nanos()
     ));
     let result = build_image_inner(&opts, &store, &temp_path, &final_path);
     if result.is_err() {
@@ -264,7 +265,7 @@ fn build_image_inner(
         name: opts.image_ref.name.clone(),
         tag: opts.image_ref.tag.clone(),
         rootfs_path: final_path.display().to_string(),
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
         size_bytes,
         source_ref: resolved.pinned_ref,
         source_digest: Some(resolved.digest),
@@ -275,7 +276,7 @@ fn build_image_inner(
             .admission_policy
             .cosign_key
             .as_ref()
-            .map(|_| Utc::now()),
+            .map(|_| Timestamp::now()),
         golden_snapshot_path: None,
         prewarm: opts.prewarm.clone(),
     };
@@ -791,8 +792,13 @@ pub fn gc_images(
     let candidates = select_gc_candidates(
         &images,
         &protected,
-        Utc::now(),
-        Duration::days(older_than_days as i64),
+        Timestamp::now(),
+        Duration::seconds(
+            i64::try_from(older_than_days)
+                .ok()
+                .and_then(|days| days.checked_mul(86_400))
+                .context("image retention exceeds supported duration")?,
+        ),
         pattern,
     );
     if !dry_run {
@@ -807,14 +813,14 @@ pub fn gc_images(
 pub fn select_gc_candidates(
     images: &[ImageRecord],
     protected_paths: &HashSet<String>,
-    now: DateTime<Utc>,
+    now: Timestamp,
     min_age: Duration,
     pattern: Option<&str>,
 ) -> Vec<ImageRecord> {
     images
         .iter()
         .filter(|image| !protected_paths.contains(&image.rootfs_path))
-        .filter(|image| now.signed_duration_since(image.created_at) >= min_age)
+        .filter(|image| (now - image.created_at) >= min_age)
         .filter(|image| {
             pattern
                 .map(|p| wildcard_match(p, &format!("{}:{}", image.name, image.tag)))
@@ -993,7 +999,7 @@ mod tests {
                 name: "test".into(),
                 tag: "latest".into(),
                 rootfs_path: path.display().to_string(),
-                created_at: Utc::now(),
+                created_at: Timestamp::now(),
                 size_bytes: bytes.len() as u64,
                 source_ref: format!("docker://test@{source}"),
                 source_digest: Some(source),
@@ -1132,7 +1138,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "tarit-image-agent-path-{}-{}",
             std::process::id(),
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+            Timestamp::now().unix_timestamp_nanos()
         ));
         let vmm = root.join("vmm/target/release/vmm");
         let agent = root.join("vmm/guest/agent/vmm-agent");
@@ -1146,7 +1152,7 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    fn image(name: &str, tag: &str, path: &str, created_at: DateTime<Utc>) -> ImageRecord {
+    fn image(name: &str, tag: &str, path: &str, created_at: Timestamp) -> ImageRecord {
         ImageRecord {
             name: name.into(),
             tag: tag.into(),
@@ -1242,7 +1248,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "tarit-image-admission-{}-{}",
             std::process::id(),
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+            Timestamp::now().unix_timestamp_nanos()
         ));
         std::fs::create_dir_all(&root).unwrap();
         let rootfs = root.join("ubuntu.ext4");
@@ -1256,14 +1262,14 @@ mod tests {
             name: "ubuntu".into(),
             tag: "24.04".into(),
             rootfs_path: rootfs.display().to_string(),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             size_bytes: std::fs::metadata(&rootfs).unwrap().len(),
             source_ref: format!("docker://docker.io/library/ubuntu@{source_digest}"),
             source_digest: Some(source_digest),
             rootfs_digest: Some(sha256_regular_file(&rootfs).unwrap()),
             agent_digest: Some(format!("sha256:{}", "c".repeat(64))),
             provenance_key_digest: Some(sha256_regular_file(&trusted_key).unwrap()),
-            provenance_verified_at: Some(Utc::now()),
+            provenance_verified_at: Some(Timestamp::now()),
             golden_snapshot_path: None,
             prewarm: None,
         };
@@ -1301,7 +1307,7 @@ mod tests {
 
     #[test]
     fn gc_candidates_skip_protected_and_apply_age_and_pattern() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let images = vec![
             image(
                 "node",
@@ -1333,7 +1339,7 @@ mod tests {
 
     #[test]
     fn hibernated_vms_and_snapshots_protect_their_base_rootfs() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let vm = |status: VmStatus, rootfs: &str| VmRecord {
             id: uuid::Uuid::new_v4(),
             host_id: "host-a".into(),

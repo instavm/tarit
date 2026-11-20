@@ -56,7 +56,7 @@ pub fn record(
         action: action.to_string(),
         outcome: outcome.to_string(),
         detail,
-        created_at: chrono::Utc::now(),
+        created_at: tarit_types::Timestamp::now(),
     };
     if let Err(error) = state.store_tx.try_send(StoreWrite::Audit(event.clone())) {
         state.metrics.inc_store_enqueue_failure();
@@ -86,7 +86,7 @@ pub(crate) fn record_required(
         action: action.to_string(),
         outcome: outcome.to_string(),
         detail,
-        created_at: chrono::Utc::now(),
+        created_at: tarit_types::Timestamp::now(),
     };
     state.audit_outbox.enqueue(&event)
 }
@@ -111,7 +111,7 @@ pub fn record_parts(
         action: action.to_string(),
         outcome: outcome.to_string(),
         detail,
-        created_at: chrono::Utc::now(),
+        created_at: tarit_types::Timestamp::now(),
     };
     if let Err(error) = state.store_tx.try_send(StoreWrite::Audit(event.clone())) {
         state.metrics.inc_store_enqueue_failure();

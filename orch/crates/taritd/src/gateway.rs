@@ -295,41 +295,12 @@ impl GatewayHandler {
             }
         }
     }
-}
 
-impl Drop for GatewayHandler {
-    fn drop(&mut self) {
-        for (_, mut state) in self.channels.drain() {
-            if let Some(task) = state.vmm_task.take() {
-                task.abort();
-            }
-        }
-    }
-}
-
-impl server::Handler for GatewayHandler {
-    type Error = russh::Error;
-
-    /// Answer every offered key the same way. Whether a key is registered is
-    /// looked up only once the client has signed with it (`auth_publickey`),
-    /// so an offer, which needs no private key, cannot be used to find out
-    /// which public keys some tenant has registered.
-    async fn auth_publickey_offered(
-        &mut self,
-        user: &str,
-        _key: &PublicKey,
-    ) -> Result<server::Auth, Self::Error> {
-        if parse_target_vm_id(user).is_err() {
-            return Ok(server::Auth::reject());
-        }
-        Ok(server::Auth::Accept)
-    }
-
-    async fn auth_publickey(
+    async fn authorize_verified_key(
         &mut self,
         user: &str,
         key: &PublicKey,
-    ) -> Result<server::Auth, Self::Error> {
+    ) -> Result<server::Auth, russh::Error> {
         let vm_id = match parse_target_vm_id(user) {
             Ok(vm_id) => vm_id,
             Err(msg) => {
@@ -382,14 +353,50 @@ impl server::Handler for GatewayHandler {
             }
         }
     }
+}
+
+impl Drop for GatewayHandler {
+    fn drop(&mut self) {
+        for (_, mut state) in self.channels.drain() {
+            if let Some(task) = state.vmm_task.take() {
+                task.abort();
+            }
+        }
+    }
+}
+
+impl server::Handler for GatewayHandler {
+    type Error = russh::Error;
+
+    /// Answer every offered key the same way. Whether a key is registered is
+    /// looked up only once the client has signed with it (`auth_publickey`),
+    /// so an offer, which needs no private key, cannot be used to find out
+    /// which public keys some tenant has registered.
+    async fn auth_publickey_offered(
+        &mut self,
+        user: &str,
+        _key: server::PublicKeyOffer<'_>,
+    ) -> Result<server::Auth, Self::Error> {
+        Ok(auth_publickey_offer(user))
+    }
+
+    async fn auth_publickey(
+        &mut self,
+        user: &str,
+        key: server::VerifiedPublicKey<'_>,
+    ) -> Result<server::Auth, Self::Error> {
+        self.authorize_verified_key(user, key.public_key).await
+    }
 
     async fn channel_open_session(
         &mut self,
         channel: Channel<Msg>,
+        reply: server::ChannelOpenHandle,
         _session: &mut Session,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<(), Self::Error> {
         self.channels.insert(channel.id(), ChannelState::default());
-        Ok(true)
+        reply.accept().await;
+        Ok(())
     }
 
     async fn pty_request(
@@ -515,6 +522,16 @@ impl Default for ChannelState {
             vmm_task: None,
             connection_permit: None,
         }
+    }
+}
+
+// Only the username influences an unsigned offer; tenant-key lookup occurs
+// only once russh verifies possession of the private key.
+fn auth_publickey_offer(user: &str) -> server::Auth {
+    if parse_target_vm_id(user).is_ok() {
+        server::Auth::Accept
+    } else {
+        server::Auth::reject()
     }
 }
 
@@ -840,13 +857,12 @@ mod tests {
     use crate::pty::PtyRegistry;
     use crate::scheduler::Scheduler;
     use crate::supervisor::VmmSupervisor;
-    use chrono::Utc;
     use russh::keys::{EcdsaCurve, HashAlg};
-    use russh::server::Handler as _;
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::{Mutex, RwLock};
     use tarit_store::Store;
+    use tarit_types::Timestamp;
 
     #[tokio::test]
     async fn transient_accept_failures_back_off_then_accept_a_real_connection() {
@@ -887,7 +903,7 @@ mod tests {
     }
 
     #[test]
-    fn ssh_accept_loop_serves_key_exchange_and_disconnects_on_shutdown() {
+    fn ssh_accept_loop_authenticates_opens_channel_and_disconnects_on_shutdown() {
         let state = test_state();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -897,7 +913,10 @@ mod tests {
             struct TrustTestKey;
             impl russh::client::Handler for TrustTestKey {
                 type Error = russh::Error;
-                async fn check_server_key(&mut self, _: &PublicKey) -> Result<bool, Self::Error> {
+                async fn check_server_key(
+                    &mut self,
+                    _: &russh::keys::PublicKeyOrCertificate,
+                ) -> Result<bool, Self::Error> {
                     Ok(true)
                 }
             }
@@ -909,7 +928,24 @@ mod tests {
                 keys: vec![key],
                 ..Default::default()
             });
-            let state = state.clone();
+            let auth_key =
+                PrivateKey::random(&mut russh::keys::key::safe_rng(), Algorithm::Ed25519).unwrap();
+            let vm_id = Uuid::new_v4();
+            insert_vm_record(&state, vm_id, "tenant-a");
+            state
+                .store
+                .lock()
+                .unwrap()
+                .insert_ssh_key(&SshKeyRecord {
+                    id: Uuid::new_v4(),
+                    owner_key: "tenant-a".into(),
+                    fingerprint: public_key_fingerprint_sha256(auth_key.public_key()).unwrap(),
+                    public_key: auth_key.public_key().to_openssh().unwrap(),
+                    key_type: "ssh-ed25519".into(),
+                    created_at: Timestamp::now(),
+                    is_active: true,
+                })
+                .unwrap();
             let server = tokio::spawn(async move {
                 serve_ssh(config, &listener, &mut GatewayServer { state }).await
             });
@@ -924,8 +960,27 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-            let authentication = client.authenticate_none("test").await.unwrap();
-            assert!(!authentication.success());
+            let user = vm_id.to_string();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                assert!(!client.authenticate_none(&user).await.unwrap().success());
+                let authentication = client
+                    .authenticate_publickey(
+                        &user,
+                        russh::keys::PrivateKeyWithHashAlg::new(Arc::new(auth_key), None),
+                    )
+                    .await
+                    .unwrap();
+                assert!(authentication.success());
+                client
+                    .channel_open_session()
+                    .await
+                    .unwrap()
+                    .close()
+                    .await
+                    .unwrap();
+            })
+            .await
+            .unwrap();
             server.abort();
             let _ = server.await;
             tokio::time::timeout(std::time::Duration::from_secs(3), async {
@@ -1002,7 +1057,7 @@ mod tests {
                 fingerprint,
                 public_key: ED25519_KEY.into(),
                 key_type: "ssh-ed25519".into(),
-                created_at: Utc::now(),
+                created_at: Timestamp::now(),
                 is_active: true,
             })
             .unwrap();
@@ -1015,7 +1070,7 @@ mod tests {
             .unwrap();
 
         let auth = runtime
-            .block_on(handler.auth_publickey(&vm_id.to_string(), &key))
+            .block_on(handler.authorize_verified_key(&vm_id.to_string(), &key))
             .unwrap();
 
         assert!(matches!(auth, server::Auth::Accept));
@@ -1031,7 +1086,7 @@ mod tests {
     }
 
     fn insert_vm_record(state: &AppState, id: Uuid, tenant: &str) {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let record = VmRecord {
             id,
             host_id: state.config.host_id.clone(),
@@ -1210,7 +1265,7 @@ mod tests {
                 fingerprint: ED25519_FINGERPRINT.into(),
                 public_key: ED25519_KEY.into(),
                 key_type: "ssh-ed25519".into(),
-                created_at: Utc::now(),
+                created_at: Timestamp::now(),
                 is_active: true,
             })
             .unwrap();
@@ -1233,29 +1288,16 @@ mod tests {
                 fingerprint: ED25519_FINGERPRINT.into(),
                 public_key: ED25519_KEY.into(),
                 key_type: "ssh-ed25519".into(),
-                created_at: Utc::now() + chrono::Duration::seconds(1),
+                created_at: Timestamp::now() + time::SignedDuration::seconds(1),
                 is_active: true,
             })
             .unwrap();
         let mut handler = GatewayHandler::new(state, None);
         let vm = vm_id.to_string();
 
-        let offered = |handler: &mut GatewayHandler, user: &str, key: &PublicKey| {
-            runtime
-                .block_on(handler.auth_publickey_offered(user, key))
-                .unwrap()
-        };
-        assert_eq!(
-            offered(&mut handler, &vm, &registered),
-            server::Auth::Accept
-        );
-        assert_eq!(
-            offered(&mut handler, &vm, &other),
-            server::Auth::Accept,
-            "an unregistered key gets the same answer as a registered one"
-        );
+        assert_eq!(auth_publickey_offer(&vm), server::Auth::Accept);
         assert_ne!(
-            offered(&mut handler, "root", &registered),
+            auth_publickey_offer("root"),
             server::Auth::Accept,
             "the user must name a VM"
         );
@@ -1263,7 +1305,9 @@ mod tests {
 
         // Only a signed attempt is checked against the registry.
         let signed = |handler: &mut GatewayHandler, key: &PublicKey| {
-            runtime.block_on(handler.auth_publickey(&vm, key)).unwrap()
+            runtime
+                .block_on(handler.authorize_verified_key(&vm, key))
+                .unwrap()
         };
         assert_ne!(signed(&mut handler, &other), server::Auth::Accept);
         assert!(handler.auth.is_none());
