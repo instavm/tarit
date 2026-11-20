@@ -961,17 +961,37 @@ async fn internal_restore(
     Json(req): Json<InternalRestoreRequest>,
 ) -> Result<(StatusCode, Json<InternalVmRecord>), ApiError> {
     let identity = require_peer_identity(identity.as_ref().map(|i| &i.0))?;
+    let (owner_key, api_key_id) =
+        peer_restore_attribution(identity, req.owner_key, req.api_key_id)?;
     let rec = ops::restore_local_with_target(
         &state,
         &req.snapshot_path,
         Some(req.id),
-        Some(req.owner_key),
-        Some(req.api_key_id),
+        Some(owner_key),
+        Some(api_key_id),
         identity.is_admin(),
         req.target_memory_mib,
     )
     .await?;
     Ok((StatusCode::CREATED, Json(rec.into())))
+}
+
+fn peer_restore_attribution(
+    identity: &ApiIdentity,
+    owner_key: String,
+    api_key_id: String,
+) -> Result<(String, String), tarit_types::OrchError> {
+    // Only admins can delegate restore ownership and attribution. For other
+    // callers the wire fields remain for compatibility, not authorization.
+    if identity.is_admin() {
+        return Ok((owner_key, api_key_id));
+    }
+    if owner_key != identity.tenant || api_key_id != identity.api_key_id {
+        return Err(tarit_types::OrchError::Forbidden(
+            "restore attribution must match the forwarded caller".into(),
+        ));
+    }
+    Ok((identity.tenant.clone(), identity.api_key_id.clone()))
 }
 
 async fn internal_exec(
@@ -1182,6 +1202,41 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use tarit_types::VmStatus;
+
+    #[test]
+    fn peer_restore_attribution_is_bound_for_non_admins() {
+        let identity = ApiIdentity {
+            tenant: "owner".into(),
+            api_key_id: "key-id".into(),
+            role: ApiRole::User,
+            max_vms: None,
+        };
+        assert_eq!(
+            peer_restore_attribution(&identity, "owner".into(), "key-id".into()).unwrap(),
+            (identity.tenant.clone(), identity.api_key_id.clone()),
+        );
+        for (owner, key_id) in [("different-owner", "key-id"), ("owner", "different-key-id")] {
+            assert!(matches!(
+                peer_restore_attribution(&identity, owner.into(), key_id.into()),
+                Err(tarit_types::OrchError::Forbidden(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn peer_restore_attribution_preserves_admin_delegation() {
+        let identity = ApiIdentity {
+            tenant: "admin".into(),
+            api_key_id: "admin-key-id".into(),
+            role: ApiRole::Admin,
+            max_vms: None,
+        };
+        assert_eq!(
+            peer_restore_attribution(&identity, "delegate".into(), "delegate-key-id".into())
+                .unwrap(),
+            ("delegate".to_string(), "delegate-key-id".to_string()),
+        );
+    }
 
     fn signed_test_request(
         state: &AppState,
