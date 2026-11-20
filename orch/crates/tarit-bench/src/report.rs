@@ -1,8 +1,8 @@
 use std::{fs, path::PathBuf, time::Duration};
 
 use anyhow::Result;
-use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
+use time::{macros::format_description, OffsetDateTime};
 
 use crate::{args, stats};
 
@@ -253,7 +253,9 @@ impl ModeOutcome {
 }
 
 pub fn write_report(ctx: &RunContext, outcome: ModeOutcome) -> Result<PathBuf> {
-    let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let timestamp = OffsetDateTime::now_utc().format(format_description!(
+        "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
+    ))?;
     let report = Report {
         version: "1.1",
         timestamp: timestamp.clone(),

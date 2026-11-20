@@ -14,7 +14,6 @@ use axum::{
     },
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use hmac::{Hmac, Mac};
 use reqwest::blocking::Client;
@@ -27,6 +26,7 @@ use std::{
     str::FromStr,
     time::Duration,
 };
+use tarit_types::Timestamp;
 use tarit_types::{
     CreateVmRequest, EgressPolicyRecord, EgressUpdateRequest, OrchError, PutEgressPolicyRequest,
     VmRecord,
@@ -126,7 +126,7 @@ pub(crate) struct ArtifactTransferDescriptor {
     pub rootfs_bytes: u64,
     pub image_source_ref: String,
     pub provenance_key_digest: Option<String>,
-    pub provenance_verified_at: Option<DateTime<Utc>>,
+    pub provenance_verified_at: Option<Timestamp>,
     pub creation_revision: u64,
     pub integrity_manifest_digest: String,
     pub chunk_size_bytes: u64,
@@ -295,7 +295,7 @@ impl PeerClient {
     }
 
     fn sign_identity(&self, identity: &ApiIdentity) -> SignedIdentity {
-        let issued_at = Utc::now().timestamp();
+        let issued_at = Timestamp::now().unix_timestamp();
         let nonce = Uuid::new_v4().to_string();
         let signature = self.identity_signature(identity, issued_at, &nonce);
         SignedIdentity {
@@ -319,7 +319,7 @@ impl PeerClient {
             .as_ref()
             .map(|(_, signed)| signed.signature.as_str())
             .unwrap_or("");
-        let issued_at = Utc::now().timestamp();
+        let issued_at = Timestamp::now().unix_timestamp();
         let nonce = Uuid::new_v4().to_string();
         let request = request
             .header("X-Tarit-Peer-Version", REQUEST_SIGNATURE_VERSION)
@@ -371,7 +371,7 @@ impl PeerClient {
         payload_hash: &str,
         identity_signature: &str,
     ) -> Result<(), OrchError> {
-        let issued_at = Utc::now().timestamp();
+        let issued_at = Timestamp::now().unix_timestamp();
         let nonce = Uuid::new_v4().to_string();
         let signature = self.request_signature(
             method,

@@ -181,7 +181,7 @@ fn reconcile_legacy_creating_records(
             })?;
         record.status = VmStatus::Error;
         record.revision = fenced_revision;
-        record.updated_at = chrono::Utc::now();
+        record.updated_at = tarit_types::Timestamp::now();
         persist_startup_vm_observation(
             store,
             record,
@@ -215,7 +215,7 @@ fn backfill_legacy_runtime_layouts(
                 record.id
             )
         })?;
-        record.updated_at = chrono::Utc::now();
+        record.updated_at = tarit_types::Timestamp::now();
         persist_startup_vm_observation(
             store,
             record,
@@ -362,7 +362,7 @@ async fn run_server(
                     );
                 }
             };
-            vm.updated_at = chrono::Utc::now();
+            vm.updated_at = tarit_types::Timestamp::now();
             if recoverable_hibernation.is_some() {
                 vm.runtime_layout = None;
                 vm.socket_path = None;
@@ -499,7 +499,7 @@ async fn run_server(
             free_vcpus: cap.free_vcpus,
             free_memory_mib: cap.free_memory_mib,
             healthy: true,
-            last_heartbeat: chrono::Utc::now(),
+            last_heartbeat: tarit_types::Timestamp::now(),
         };
         store.upsert_host(&host).ok();
     }
@@ -513,7 +513,7 @@ async fn run_server(
         Arc::new(RwLock::new(HashMap::new()));
     {
         let mut c = vm_cache.write().unwrap();
-        let now = chrono::Utc::now();
+        let now = tarit_types::Timestamp::now();
         // Deleted VMs past the cache grace are only kept on disk (see
         // usage::evict_stopped_vms_from_cache).
         for vm in persisted_vms
@@ -908,13 +908,13 @@ fn spawn_artifact_gc(
             };
             if let Some(fleet) = state.fleet.as_ref() {
                 let mut removed_ids = HashSet::new();
-                let minimum_age = chrono::Duration::seconds(
+                let minimum_age = time::SignedDuration::seconds(
                     i64::try_from(state.config.disk_pressure.artifact_min_age_secs)
                         .unwrap_or(i64::MAX),
                 );
                 for snapshot in &snapshots {
                     if snapshot.host_id != state.config.host_id
-                        || chrono::Utc::now() - snapshot.created_at < minimum_age
+                        || tarit_types::Timestamp::now() - snapshot.created_at < minimum_age
                     {
                         continue;
                     }
@@ -1030,7 +1030,7 @@ fn spawn_artifact_repair(
                         &state.config.host_id,
                         state.config.host_session_id,
                         &state.config.zone,
-                        chrono::Utc::now() + chrono::Duration::seconds(30),
+                        tarit_types::Timestamp::now() + time::SignedDuration::seconds(30),
                     )
                     .await
                 {
@@ -1057,7 +1057,7 @@ fn spawn_artifact_repair(
                                 &renew_host,
                                 renew_session,
                                 lease_token,
-                                chrono::Utc::now() + chrono::Duration::seconds(30),
+                                tarit_types::Timestamp::now() + time::SignedDuration::seconds(30),
                             )
                             .await
                         {
@@ -1913,7 +1913,7 @@ mod tests {
 
     #[test]
     fn artifact_gc_uses_persisted_runtime_layout_paths() {
-        let now = chrono::Utc::now();
+        let now = tarit_types::Timestamp::now();
         let persisted_overlay = PathBuf::from("/old-layout/overlays/vm.cow");
         let persisted_jail = PathBuf::from("/old-layout/jails/vm");
         let vm = tarit_types::VmRecord {
@@ -1955,7 +1955,7 @@ mod tests {
         socket_path: PathBuf,
         pid: Option<u32>,
     ) -> tarit_types::VmRecord {
-        let now = chrono::Utc::now();
+        let now = tarit_types::Timestamp::now();
         tarit_types::VmRecord {
             id,
             host_id: config.host_id.clone(),

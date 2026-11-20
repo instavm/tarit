@@ -59,12 +59,12 @@ use axum::{
     routing::{delete, get, patch, post},
     Json, Router,
 };
-use chrono::Utc;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, RwLock};
 use tarit_store::{Store, VolumeTransition};
+use tarit_types::Timestamp;
 use tarit_types::{
     AuditEvent, BranchRecord, CreateBranchRequest, CreateShareRequest, CreateVmRequest,
     CreateVolumeRequest, EgressPolicyRecord, EgressUpdateRequest, ErrorBody, ExecuteRequest,
@@ -128,7 +128,7 @@ pub(crate) enum LifecycleState {
     /// release have all converged; retries must not resume the captured guest.
     Hibernating {
         record: VmRecord,
-        stopped_at: Option<chrono::DateTime<Utc>>,
+        stopped_at: Option<tarit_types::Timestamp>,
     },
     /// A live VMM transition could not be rolled back or observed. The record
     /// stays registered so the lifecycle sweeper retries VMM observation and
@@ -1074,7 +1074,7 @@ async fn issue_share_token(
         pre_mutation,
         audit_outcome::ATTEMPT,
     )?;
-    match crate::shares::issue_token(&state, &identity, id, Utc::now()).await {
+    match crate::shares::issue_token(&state, &identity, id, Timestamp::now()).await {
         Ok(token) => {
             record_share_audit(
                 &state,
@@ -1376,7 +1376,7 @@ async fn create_volume(
     let provider = crate::volume_provider::open(&state.config, &request.provider)?;
     let placement = crate::volume_provider::placement(&state.config, &request.provider)?;
     let capabilities = provider.capabilities();
-    let now = Utc::now();
+    let now = Timestamp::now();
     let desired = VolumeRecord {
         id,
         owner_key: identity.tenant.clone(),
@@ -1448,7 +1448,7 @@ async fn create_volume(
                             expected_revision: persisted.revision,
                             status: VolumeStatus::Available,
                             last_error: None,
-                            updated_at: Utc::now(),
+                            updated_at: Timestamp::now(),
                         },
                     )
                     .await
@@ -1466,7 +1466,7 @@ async fn create_volume(
                             expected_revision: persisted.revision,
                             status: VolumeStatus::Available,
                             last_error: None,
-                            updated_at: Utc::now(),
+                            updated_at: Timestamp::now(),
                         },
                     )
                     .map_err(store_err)?
@@ -1484,7 +1484,7 @@ async fn create_volume(
                             expected_revision: local_persisted.revision,
                             status: VolumeStatus::Available,
                             last_error: None,
-                            updated_at: Utc::now(),
+                            updated_at: Timestamp::now(),
                         },
                     )
                     .map_err(store_err)?;
@@ -1504,7 +1504,7 @@ async fn create_volume(
                                 expected_revision: persisted.revision,
                                 status: VolumeStatus::Error,
                                 last_error: Some(&safe_error),
-                                updated_at: Utc::now(),
+                                updated_at: Timestamp::now(),
                             },
                         )
                         .await
@@ -1525,7 +1525,7 @@ async fn create_volume(
                             expected_revision: persisted.revision,
                             status: VolumeStatus::Error,
                             last_error: Some(&safe_error),
-                            updated_at: Utc::now(),
+                            updated_at: Timestamp::now(),
                         },
                     );
                 if let Err(transition_error) = transition_result {
@@ -1671,7 +1671,7 @@ pub(crate) async fn delete_volume_local(
                         id,
                         current.status,
                         current.revision,
-                        Utc::now(),
+                        Timestamp::now(),
                     )
                     .await
                     .map_err(volume_fleet_err)?
@@ -1685,7 +1685,7 @@ pub(crate) async fn delete_volume_local(
                         id,
                         current.status,
                         current.revision,
-                        Utc::now(),
+                        Timestamp::now(),
                     )
                     .map_err(store_err)?
             }
@@ -1718,7 +1718,7 @@ pub(crate) async fn delete_volume_local(
                     id,
                     local.status,
                     local.revision,
-                    Utc::now(),
+                    Timestamp::now(),
                 )
                 .map_err(store_err)?;
         }
@@ -1740,7 +1740,7 @@ pub(crate) async fn delete_volume_local(
                             expected_revision: deleting.revision,
                             status: VolumeStatus::Error,
                             last_error: Some(&safe_error),
-                            updated_at: Utc::now(),
+                            updated_at: Timestamp::now(),
                         },
                     )
                     .await
@@ -1761,7 +1761,7 @@ pub(crate) async fn delete_volume_local(
                         expected_revision: deleting.revision,
                         status: VolumeStatus::Error,
                         last_error: Some(&safe_error),
-                        updated_at: Utc::now(),
+                        updated_at: Timestamp::now(),
                     },
                 );
             if let Err(transition_error) = transition_result {
@@ -2319,7 +2319,7 @@ pub(crate) fn running_record(
     socket_path: &std::path::Path,
     owner_key: Option<String>,
     api_key_id: Option<String>,
-    now: chrono::DateTime<Utc>,
+    now: tarit_types::Timestamp,
 ) -> VmRecord {
     VmRecord {
         id,
@@ -2342,7 +2342,7 @@ pub(crate) fn running_record(
         socket_path: Some(socket_path.display().to_string()),
         pid: Some(pid),
         created_at: now,
-        updated_at: Utc::now(),
+        updated_at: Timestamp::now(),
     }
 }
 
@@ -2399,7 +2399,7 @@ async fn reserve_vm_quota(
         .admission_timeout_ms
         .saturating_add(5 * 60 * 1_000)
         .min(i64::MAX as u64) as i64;
-    let expires_at = Utc::now() + chrono::Duration::milliseconds(ttl_ms);
+    let expires_at = Timestamp::now() + time::SignedDuration::milliseconds(ttl_ms);
     if let Some(fleet) = &state.fleet {
         return match fleet
             .reserve_vm_quota(&identity.tenant, id, max_vms, expires_at)
@@ -2892,11 +2892,11 @@ async fn get_vm_for_fork_replay(
 
 fn fork_child_incarnation_matches(
     fleet_precision: bool,
-    expected: chrono::DateTime<Utc>,
-    actual: chrono::DateTime<Utc>,
+    expected: tarit_types::Timestamp,
+    actual: tarit_types::Timestamp,
 ) -> bool {
     if fleet_precision {
-        expected.timestamp_micros() == actual.timestamp_micros()
+        expected.to_microsecond_precision() == actual.to_microsecond_precision()
     } else {
         expected == actual
     }
@@ -2905,7 +2905,7 @@ fn fork_child_incarnation_matches(
 async fn commit_fork_operation(
     state: &AppState,
     operation: &ForkOperationRecord,
-    child_created_at: chrono::DateTime<Utc>,
+    child_created_at: tarit_types::Timestamp,
 ) -> Result<(), OrchError> {
     if let Some(fleet) = &state.fleet {
         return fleet
@@ -2914,7 +2914,7 @@ async fn commit_fork_operation(
                 operation.source_vm_id,
                 &operation.owner_key,
                 child_created_at,
-                Utc::now(),
+                Timestamp::now(),
             )
             .await
             .map_err(|error| OrchError::Internal(format!("commit fork operation: {error}")));
@@ -2928,7 +2928,7 @@ async fn commit_fork_operation(
             operation.source_vm_id,
             &operation.owner_key,
             child_created_at,
-            Utc::now(),
+            Timestamp::now(),
         )
         .map_err(store_err)
 }
@@ -2943,7 +2943,7 @@ async fn claim_fork_operation(
         .admission_timeout_ms
         .saturating_add(5 * 60 * 1_000)
         .min(i64::MAX as u64) as i64;
-    let expires_at = Utc::now() + chrono::Duration::milliseconds(ttl_ms);
+    let expires_at = Timestamp::now() + time::SignedDuration::milliseconds(ttl_ms);
     let max_vms = identity.max_vms.unwrap_or(usize::MAX);
     if let Some(fleet) = &state.fleet {
         return match fleet
@@ -3189,7 +3189,7 @@ async fn fork_vm(
         }
     }
     let source_resolution_us = elapsed_micros(fork_started);
-    let now = Utc::now();
+    let now = Timestamp::now();
     let mut operation = existing_operation.unwrap_or(ForkOperationRecord {
         child_vm_id: child_id,
         source_vm_id: source_id,
@@ -3479,7 +3479,7 @@ async fn execute_async_impl(
     let vm = authorize_vm_action(&state, &owner, req.vm_id, &identity).await?;
     let permit = admission.admit(tenant, req.vm_id)?;
 
-    let now = Utc::now();
+    let now = Timestamp::now();
     let exec_id = Uuid::new_v4();
     let record = ExecutionRecord {
         id: exec_id,
@@ -3561,7 +3561,7 @@ async fn execute_async_impl(
                     duration_ms: Some(duration_ms),
                     error: None,
                     created_at: now,
-                    updated_at: Utc::now(),
+                    updated_at: Timestamp::now(),
                 };
                 if let Err(error) = persist_exec(&state2, &rec, &identity).await {
                     tracing::error!(execution = %exec_id, %error, "persist completed execution state");
@@ -3635,7 +3635,7 @@ async fn execute_impl(
     let gate_deadline = ops::exec_gate_deadline(&state.config, req.timeout_ms);
     let owner = ops::resolve_owner_for_activation(state, req.vm_id, identity).await?;
     let vm = authorize_vm_action(state, &owner, req.vm_id, identity).await?;
-    let now = Utc::now();
+    let now = Timestamp::now();
     let exec_id = Uuid::new_v4();
     let vm_id = req.vm_id;
     let command = req.command.clone();
@@ -3675,7 +3675,7 @@ async fn execute_impl(
             duration_ms: Some(duration_ms),
             error: None,
             created_at: now,
-            updated_at: Utc::now(),
+            updated_at: Timestamp::now(),
         },
         // Precondition rejections (e.g. exec against a suspended VM) are API
         // errors, not execution outcomes: no command ran, so no record.
@@ -3698,7 +3698,7 @@ async fn execute_impl(
                 duration_ms: None,
                 error: Some(public_operation_error(&e)),
                 created_at: now,
-                updated_at: Utc::now(),
+                updated_at: Timestamp::now(),
             }
         }
     };
@@ -3893,7 +3893,7 @@ async fn create_branch(
 ) -> Result<(StatusCode, Json<BranchRecord>), ApiError> {
     request.validate()?;
     let branch_id = request.branch_id.unwrap_or_else(Uuid::new_v4);
-    let now = Utc::now();
+    let now = Timestamp::now();
     let proposed = BranchRecord {
         branch_id,
         owner_key: identity.tenant.clone(),
@@ -4066,7 +4066,7 @@ async fn update_branch_head(
                 id,
                 request.expected_revision,
                 request.head_artifact_id,
-                Utc::now(),
+                Timestamp::now(),
             )
             .await
             .map_err(branch_fleet_err)?
@@ -4080,7 +4080,7 @@ async fn update_branch_head(
                 id,
                 request.expected_revision,
                 request.head_artifact_id,
-                Utc::now(),
+                Timestamp::now(),
             )
             .map_err(store_err)?
     };
@@ -4101,7 +4101,7 @@ async fn update_branch_head(
 pub(crate) struct PublicSnapshot {
     snapshot_id: Uuid,
     source_vm_id: Uuid,
-    created_at: chrono::DateTime<Utc>,
+    created_at: tarit_types::Timestamp,
     #[serde(skip_serializing_if = "Option::is_none")]
     size_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4379,7 +4379,7 @@ async fn cluster_status(
             .store
             .lock()
             .map_err(|_| OrchError::Internal("store lock".into()))?;
-        (chrono::Utc::now(), store.list_hosts().map_err(store_err)?)
+        (Timestamp::now(), store.list_hosts().map_err(store_err)?)
     };
 
     let mut healthy_nodes = 0usize;
@@ -4483,8 +4483,8 @@ async fn warm_pool_status(
 
 #[derive(serde::Deserialize)]
 struct UsageQuery {
-    from: Option<chrono::DateTime<Utc>>,
-    to: Option<chrono::DateTime<Utc>>,
+    from: Option<tarit_types::Timestamp>,
+    to: Option<tarit_types::Timestamp>,
     api_key_id: Option<String>,
 }
 
@@ -4496,8 +4496,10 @@ async fn usage_stats(
     Extension(identity): Extension<ApiIdentity>,
     Query(q): Query<UsageQuery>,
 ) -> Result<Json<Vec<UsageSummary>>, ApiError> {
-    let to = q.to.unwrap_or_else(Utc::now);
-    let from = q.from.unwrap_or_else(|| to - chrono::Duration::days(30));
+    let to = q.to.unwrap_or_else(Timestamp::now);
+    let from = q
+        .from
+        .unwrap_or_else(|| to - time::SignedDuration::days(30));
     let key_filter = if identity.is_admin() {
         q.api_key_id.as_deref()
     } else {
@@ -4579,7 +4581,7 @@ fn execution_cache_bytes(record: &ExecutionRecord) -> usize {
 }
 
 fn reject_expired_execution(state: &AppState, record: &ExecutionRecord) -> Result<(), OrchError> {
-    if usage::execution_retention_cutoff(state.config.execution_retention_hours, Utc::now())
+    if usage::execution_retention_cutoff(state.config.execution_retention_hours, Timestamp::now())
         .is_some_and(|cutoff| record.is_expired(cutoff))
     {
         if let Ok(mut cache) = state.exec_cache.write() {
@@ -4646,7 +4648,7 @@ async fn persist_exec(
     let mut normalized = rec.clone();
     normalized.vm_created_at = normalized
         .vm_created_at
-        .and_then(|at| chrono::DateTime::from_timestamp_micros(at.timestamp_micros()));
+        .map(Timestamp::to_microsecond_precision);
     let rec = &normalized;
     if let Some(fleet) = &state.fleet {
         fleet
@@ -4703,7 +4705,7 @@ async fn update_exec_status(
     };
     rec.status = status;
     rec.error = error;
-    rec.updated_at = Utc::now();
+    rec.updated_at = Timestamp::now();
     persist_exec(state, &rec, identity).await
 }
 
@@ -4757,7 +4759,7 @@ pub(crate) mod tests {
                     1,
                     &["example.com".into()],
                     true,
-                    Utc::now(),
+                    Timestamp::now(),
                 )
                 .unwrap();
             let actual = read_egress_policy(&state, &admin, source).await.unwrap();
@@ -4799,7 +4801,7 @@ pub(crate) mod tests {
             cmdline: None,
             content_digest: None,
             size_bytes: Some(3),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
         };
         state
             .store
@@ -4929,7 +4931,7 @@ pub(crate) mod tests {
                     free_vcpus: 1,
                     free_memory_mib: 256,
                     healthy: true,
-                    last_heartbeat: Utc::now(),
+                    last_heartbeat: Timestamp::now(),
                 })
                 .await
                 .unwrap();
@@ -5342,7 +5344,7 @@ pub(crate) mod tests {
                 let mut cache = state.vm_cache.write().unwrap();
                 let replacement = cache.get_mut(&id).unwrap();
                 replacement.owner_key = Some("tenant-b".into());
-                replacement.created_at += chrono::Duration::seconds(1);
+                replacement.created_at += time::SignedDuration::seconds(1);
             }
             drop(held);
             assert!(matches!(queued.await, Err(OrchError::Conflict(_))));
@@ -5366,7 +5368,7 @@ pub(crate) mod tests {
             persist_exec(&state, &record, &identity).await.unwrap();
             let mut replacement = state.vm_cache.read().unwrap().get(&vm).unwrap().clone();
             replacement.owner_key = Some("tenant-b".into());
-            replacement.created_at += chrono::Duration::seconds(1);
+            replacement.created_at += time::SignedDuration::seconds(1);
             state.store.lock().unwrap().delete_vm(vm).unwrap();
             state.store.lock().unwrap().insert_vm(&replacement).unwrap();
             state.vm_cache.write().unwrap().insert(vm, replacement);
@@ -5441,7 +5443,7 @@ pub(crate) mod tests {
             ));
             let identity = state.config.api_keys.resolve("tenant-a-key").unwrap();
             let mut old = test_execution(Uuid::new_v4(), ExecutionStatus::Completed);
-            old.updated_at -= chrono::Duration::hours(48);
+            old.updated_at -= time::SignedDuration::hours(48);
             old.created_at = old.updated_at;
             persist_exec(&state, &old, &identity).await.unwrap();
             assert!(state
@@ -5607,7 +5609,7 @@ pub(crate) mod tests {
     }
 
     fn test_execution(vm_id: Uuid, status: ExecutionStatus) -> ExecutionRecord {
-        let now = Utc::now();
+        let now = Timestamp::now();
         ExecutionRecord {
             id: Uuid::new_v4(),
             vm_id,
@@ -5693,7 +5695,7 @@ pub(crate) mod tests {
         let vm_id = Uuid::new_v4();
         insert_vm(&state, vm_id, "tenant-a", VmStatus::Running);
         let mut execution = test_execution(vm_id, ExecutionStatus::Completed);
-        execution.created_at = Utc::now() - chrono::Duration::days(2);
+        execution.created_at = Timestamp::now() - time::SignedDuration::days(2);
         execution.updated_at = execution.created_at;
         test_runtime().block_on(async {
             let identity = state.config.api_keys.resolve("tenant-a-key").unwrap();
@@ -5811,7 +5813,7 @@ pub(crate) mod tests {
             owner: &str,
             state: tarit_types::ArtifactReplicationState,
         ) -> tarit_types::ArtifactRecord {
-            let now = Utc::now();
+            let now = Timestamp::now();
             tarit_types::ArtifactRecord {
                 artifact_id: Uuid::new_v4(),
                 owner_key: owner.into(),
@@ -6137,8 +6139,8 @@ pub(crate) mod tests {
 
     #[test]
     fn fleet_fork_incarnation_fence_uses_postgres_microsecond_precision() {
-        let persisted = chrono::DateTime::from_timestamp(1_700_000_000, 123_456_000).unwrap();
-        let local_cache = chrono::DateTime::from_timestamp(1_700_000_000, 123_456_789).unwrap();
+        let persisted = Timestamp::from_timestamp(1_700_000_000, 123_456_000).unwrap();
+        let local_cache = Timestamp::from_timestamp(1_700_000_000, 123_456_789).unwrap();
         assert!(fork_child_incarnation_matches(true, persisted, local_cache));
         assert!(!fork_child_incarnation_matches(
             false,
@@ -6152,7 +6154,7 @@ pub(crate) mod tests {
         let state = test_state();
         let source_id = Uuid::new_v4();
         let child_id = Uuid::new_v4();
-        let now = Utc::now();
+        let now = Timestamp::now();
         let operation = ForkOperationRecord {
             child_vm_id: child_id,
             source_vm_id: source_id,
@@ -6169,7 +6171,7 @@ pub(crate) mod tests {
             let store = state.store.lock().unwrap();
             assert_eq!(
                 store
-                    .claim_fork_operation(&operation, 2, now + chrono::Duration::minutes(1))
+                    .claim_fork_operation(&operation, 2, now + time::SignedDuration::minutes(1))
                     .unwrap(),
                 tarit_store::ForkOperationClaimOutcome::New
             );
@@ -6241,8 +6243,8 @@ pub(crate) mod tests {
             target_boot_session_id: Some(state_check.config.host_session_id),
             status: ForkOperationStatus::Preparing,
             child_created_at: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: Timestamp::now(),
+            updated_at: Timestamp::now(),
         };
         state_check
             .store
@@ -6251,7 +6253,7 @@ pub(crate) mod tests {
             .claim_fork_operation(
                 &failed_operation,
                 3,
-                Utc::now() + chrono::Duration::minutes(1),
+                Timestamp::now() + time::SignedDuration::minutes(1),
             )
             .unwrap();
         insert_vm(&state_check, failed_child, "tenant-a", VmStatus::Error);
@@ -6282,7 +6284,7 @@ pub(crate) mod tests {
         let state = test_state();
         let source_id = Uuid::new_v4();
         let child_id = Uuid::new_v4();
-        let now = Utc::now();
+        let now = Timestamp::now();
         insert_vm(&state, source_id, "tenant-a", VmStatus::Running);
         let old_session = Uuid::new_v4();
         assert_ne!(old_session, state.config.host_session_id);
@@ -6303,7 +6305,7 @@ pub(crate) mod tests {
                 .store
                 .lock()
                 .unwrap()
-                .claim_fork_operation(&operation, 2, now + chrono::Duration::minutes(1))
+                .claim_fork_operation(&operation, 2, now + time::SignedDuration::minutes(1))
                 .unwrap(),
             tarit_store::ForkOperationClaimOutcome::New
         );
@@ -6345,7 +6347,7 @@ pub(crate) mod tests {
             .claim_fork_operation(
                 &foreign_target,
                 2,
-                Utc::now() + chrono::Duration::minutes(1),
+                Timestamp::now() + time::SignedDuration::minutes(1),
             )
             .unwrap();
         let response = rt.block_on(request_json(
@@ -8200,7 +8202,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn insert_vm(state: &AppState, id: Uuid, tenant: &str, status: VmStatus) {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let record = VmRecord {
             id,
             host_id: state.config.host_id.clone(),
@@ -8265,7 +8267,7 @@ pub(crate) mod tests {
     }
 
     async fn insert_share(state: &AppState, id: Uuid, owner_key: &str) {
-        let now = Utc::now();
+        let now = Timestamp::now();
         state
             .shares
             .insert(&ShareRecord {

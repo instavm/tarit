@@ -1,9 +1,9 @@
 //! SQLite persistence for VM and execution records.
 
-use chrono::{DateTime, Utc};
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use std::path::Path;
 use std::time::Duration;
+use tarit_types::Timestamp;
 use tarit_types::{
     ArtifactKind, ArtifactRecord, ArtifactReplicaRecord, ArtifactReplicaStatus,
     ArtifactReplicationState, ArtifactStatus, AuditEvent, BranchRecord, EgressPolicyRecord,
@@ -31,7 +31,7 @@ pub struct HostRecord {
     pub free_vcpus: u64,
     pub free_memory_mib: u64,
     pub healthy: bool,
-    pub last_heartbeat: DateTime<Utc>,
+    pub last_heartbeat: Timestamp,
 }
 
 /// Registered immutable rootfs image.
@@ -40,7 +40,7 @@ pub struct ImageRecord {
     pub name: String,
     pub tag: String,
     pub rootfs_path: String,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     pub size_bytes: u64,
     pub source_ref: String,
     /// Registry manifest digest resolved exactly once at admission. Legacy
@@ -52,7 +52,7 @@ pub struct ImageRecord {
     pub agent_digest: Option<String>,
     /// SHA-256 of the trusted cosign public key used for verification.
     pub provenance_key_digest: Option<String>,
-    pub provenance_verified_at: Option<DateTime<Utc>>,
+    pub provenance_verified_at: Option<Timestamp>,
     pub golden_snapshot_path: Option<String>,
     /// Command a warm golden VM of this image runs before its snapshot, so
     /// clones start with the image's runtime already read in.
@@ -90,7 +90,7 @@ pub struct SnapshotRecord {
     /// exact open inodes before publication. Absent only on legacy rows.
     pub content_digest: Option<String>,
     pub size_bytes: Option<u64>,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,8 +98,8 @@ pub struct HibernationRecord {
     pub vm_id: Uuid,
     pub owner_key: String,
     pub snapshot_path: String,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -139,7 +139,7 @@ pub struct VolumeTransition<'a> {
     pub expected_revision: u64,
     pub status: VolumeStatus,
     pub last_error: Option<&'a str>,
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
 }
 
 const UNBOUND_HIBERNATION_SNAPSHOTS_QUERY: &str = "SELECT path, overlay_path, host_id, owner_key, api_key_id, vm_id, ephemeral_owner_vm_id, memory_mib, vcpus,
@@ -636,7 +636,7 @@ impl Store {
         conn.execute(
             "INSERT OR IGNORE INTO billing_watermark (vm_id, last_billed_at)
              SELECT id, ?1 FROM vms WHERE status IN ('running','paused','suspended')",
-            params![Utc::now().to_rfc3339()],
+            params![Timestamp::now().to_rfc3339()],
         )?;
         Ok(Self { conn })
     }
@@ -1324,7 +1324,7 @@ impl Store {
         branch_id: Uuid,
         expected_revision: u64,
         new_head_artifact_id: Uuid,
-        updated_at: DateTime<Utc>,
+        updated_at: Timestamp,
     ) -> Result<BranchRecord, StoreError> {
         let tx = self.conn.unchecked_transaction()?;
         let current = tx
@@ -1430,7 +1430,7 @@ impl Store {
             params![
                 branch.head_artifact_id.to_string(),
                 owner_key,
-                Utc::now().to_rfc3339()
+                Timestamp::now().to_rfc3339()
             ],
         )?;
         if released != 1 {
@@ -1479,7 +1479,11 @@ impl Store {
             let released = tx.execute(
                 "UPDATE artifacts SET reference_count = reference_count - 1, updated_at = ?3
                  WHERE artifact_id = ?1 AND owner_key = ?2 AND reference_count > 0",
-                params![parent_id.to_string(), owner_key, Utc::now().to_rfc3339()],
+                params![
+                    parent_id.to_string(),
+                    owner_key,
+                    Timestamp::now().to_rfc3339()
+                ],
             )?;
             if released != 1 {
                 return Err(StoreError::Conflict(
@@ -1542,7 +1546,11 @@ impl Store {
             if tx.execute(
                 "UPDATE artifacts SET reference_count = reference_count - 1, updated_at = ?3
                   WHERE artifact_id = ?1 AND owner_key = ?2 AND reference_count > 0",
-                params![parent_id.to_string(), owner_key, Utc::now().to_rfc3339()],
+                params![
+                    parent_id.to_string(),
+                    owner_key,
+                    Timestamp::now().to_rfc3339()
+                ],
             )? != 1
             {
                 return Err(StoreError::Conflict(
@@ -1581,7 +1589,7 @@ impl Store {
         expected_revision: u64,
         allowlist: &[String],
         allow_existing: bool,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> Result<EgressPolicyRecord, StoreError> {
         if expected_revision == 0 {
             return Err(StoreError::Conflict(
@@ -1887,10 +1895,10 @@ impl Store {
         owner_key: &str,
         id: Uuid,
         max_vms: usize,
-        expires_at: DateTime<Utc>,
+        expires_at: Timestamp,
     ) -> Result<VmQuotaReservationOutcome, StoreError> {
         let tx = self.conn.unchecked_transaction()?;
-        let now = Utc::now().to_rfc3339();
+        let now = Timestamp::now().to_rfc3339();
         tx.execute(
             "DELETE FROM vm_quota_reservations WHERE expires_at <= ?1",
             params![now],
@@ -1954,10 +1962,10 @@ impl Store {
         &self,
         operation: &ForkOperationRecord,
         max_vms: usize,
-        expires_at: DateTime<Utc>,
+        expires_at: Timestamp,
     ) -> Result<ForkOperationClaimOutcome, StoreError> {
         let tx = self.conn.unchecked_transaction()?;
-        let now = Utc::now().to_rfc3339();
+        let now = Timestamp::now().to_rfc3339();
         tx.execute(
             "DELETE FROM vm_quota_reservations WHERE expires_at <= ?1",
             params![now],
@@ -2116,8 +2124,8 @@ impl Store {
         child_vm_id: Uuid,
         source_vm_id: Uuid,
         owner_key: &str,
-        child_created_at: DateTime<Utc>,
-        updated_at: DateTime<Utc>,
+        child_created_at: Timestamp,
+        updated_at: Timestamp,
     ) -> Result<(), StoreError> {
         let changed = self.conn.execute(
             "UPDATE vm_fork_operations
@@ -2670,7 +2678,7 @@ impl Store {
         id: Uuid,
         expected_status: VolumeStatus,
         expected_revision: u64,
-        updated_at: DateTime<Utc>,
+        updated_at: Timestamp,
     ) -> Result<VolumeRecord, StoreError> {
         let tx = self.conn.unchecked_transaction()?;
         let attached: bool = tx.query_row(
@@ -2989,8 +2997,8 @@ impl Store {
     pub fn freeze_billing_end(
         &self,
         vm_id: Uuid,
-        end: DateTime<Utc>,
-    ) -> Result<Option<DateTime<Utc>>, StoreError> {
+        end: Timestamp,
+    ) -> Result<Option<Timestamp>, StoreError> {
         self.conn.execute(
             "INSERT OR IGNORE INTO billing_runtime_end (vm_id, ended_at)
              SELECT vm_id, ?2 FROM billing_watermark WHERE vm_id = ?1",
@@ -2999,7 +3007,7 @@ impl Store {
         self.get_billing_end(vm_id)
     }
 
-    pub fn get_billing_end(&self, vm_id: Uuid) -> Result<Option<DateTime<Utc>>, StoreError> {
+    pub fn get_billing_end(&self, vm_id: Uuid) -> Result<Option<Timestamp>, StoreError> {
         self.conn
             .query_row(
                 "SELECT ended_at FROM billing_runtime_end WHERE vm_id = ?1",
@@ -3031,7 +3039,7 @@ impl Store {
         Ok(())
     }
 
-    pub fn set_billing_watermark(&self, vm_id: Uuid, ts: DateTime<Utc>) -> Result<(), StoreError> {
+    pub fn set_billing_watermark(&self, vm_id: Uuid, ts: Timestamp) -> Result<(), StoreError> {
         self.conn.execute(
             "INSERT INTO billing_watermark (vm_id, last_billed_at) VALUES (?1,?2)
              ON CONFLICT(vm_id) DO UPDATE SET last_billed_at = excluded.last_billed_at",
@@ -3040,7 +3048,7 @@ impl Store {
         Ok(())
     }
 
-    pub fn get_billing_watermark(&self, vm_id: Uuid) -> Result<Option<DateTime<Utc>>, StoreError> {
+    pub fn get_billing_watermark(&self, vm_id: Uuid) -> Result<Option<Timestamp>, StoreError> {
         self.conn
             .query_row(
                 "SELECT last_billed_at FROM billing_watermark WHERE vm_id = ?1",
@@ -3069,8 +3077,8 @@ impl Store {
     pub fn local_usage_summary(
         &self,
         api_key_id: Option<&str>,
-        from: DateTime<Utc>,
-        to: DateTime<Utc>,
+        from: Timestamp,
+        to: Timestamp,
     ) -> Result<Vec<UsageSummary>, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT api_key_id, owner_key,
@@ -3124,7 +3132,7 @@ impl Store {
 
     /// Drop every outbox row older than `older_than`, sent or not. Only for a
     /// host with no fleet store, where nothing is ever marked sent.
-    pub fn prune_local_outbox(&self, older_than: DateTime<Utc>) -> Result<(), StoreError> {
+    pub fn prune_local_outbox(&self, older_than: Timestamp) -> Result<(), StoreError> {
         let older_than = older_than.to_rfc3339();
         self.conn.execute(
             "DELETE FROM usage_outbox WHERE created_at < ?1",
@@ -3142,7 +3150,7 @@ impl Store {
     /// can prune a large backlog in short batches.
     pub fn prune_finished_executions(
         &self,
-        older_than: DateTime<Utc>,
+        older_than: Timestamp,
         limit: usize,
     ) -> Result<usize, StoreError> {
         let deleted = self.conn.execute(
@@ -3167,7 +3175,7 @@ impl Store {
     /// many rows were deleted.
     pub fn prune_stopped_vms(
         &self,
-        older_than: DateTime<Utc>,
+        older_than: Timestamp,
         limit: usize,
     ) -> Result<usize, StoreError> {
         let deleted = self.conn.execute(
@@ -3196,7 +3204,7 @@ impl Store {
     /// that child id is then treated as a new fork.
     pub fn prune_committed_fork_operations(
         &self,
-        older_than: DateTime<Utc>,
+        older_than: Timestamp,
         limit: usize,
     ) -> Result<usize, StoreError> {
         let deleted = self.conn.execute(
@@ -3214,7 +3222,7 @@ impl Store {
         Ok(deleted)
     }
 
-    pub fn prune_sent_outbox(&self, older_than: DateTime<Utc>) -> Result<(), StoreError> {
+    pub fn prune_sent_outbox(&self, older_than: Timestamp) -> Result<(), StoreError> {
         let older_than = older_than.to_rfc3339();
         self.conn.execute(
             "DELETE FROM usage_outbox WHERE sent = 1 AND created_at < ?1",
@@ -3585,7 +3593,7 @@ fn recompute_artifact_replication_sqlite(
     artifact_id: Uuid,
     min_replicas: u64,
     min_failure_domains: u64,
-    updated_at: DateTime<Utc>,
+    updated_at: Timestamp,
 ) -> Result<ArtifactReplicationState, StoreError> {
     let (available, failure_domains): (i64, i64) = tx.query_row(
         "SELECT COUNT(*), COUNT(DISTINCT failure_domain)
@@ -3840,12 +3848,10 @@ fn constraint_conflict(error: rusqlite::Error, message: &str) -> StoreError {
     }
 }
 
-fn parse_ts(s: &str) -> Result<DateTime<Utc>, rusqlite::Error> {
-    DateTime::parse_from_rfc3339(s)
-        .map(|dt| dt.with_timezone(&Utc))
-        .map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
-        })
+fn parse_ts(s: &str) -> Result<Timestamp, rusqlite::Error> {
+    s.parse::<Timestamp>().map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })
 }
 
 #[cfg(test)]
@@ -3879,7 +3885,7 @@ mod tests {
     }
 
     fn test_share(slug: &str, owner_key: &str) -> ShareRecord {
-        let now = Utc::now();
+        let now = Timestamp::now();
         ShareRecord {
             id: Uuid::new_v4(),
             slug: slug.into(),
@@ -3895,7 +3901,7 @@ mod tests {
     }
 
     fn test_vm(id: Uuid, owner_key: &str) -> VmRecord {
-        let now = Utc::now();
+        let now = Timestamp::now();
         VmRecord {
             id,
             host_id: "host-a".into(),
@@ -3919,7 +3925,7 @@ mod tests {
     }
 
     fn test_artifact(owner_key: &str, locator: &str) -> ArtifactRecord {
-        let now = Utc::now();
+        let now = Timestamp::now();
         ArtifactRecord {
             artifact_id: Uuid::new_v4(),
             owner_key: owner_key.into(),
@@ -3972,7 +3978,7 @@ mod tests {
             store.get_artifact("tenant-b", first.artifact_id),
             Err(StoreError::NotFound)
         ));
-        let now = Utc::now();
+        let now = Timestamp::now();
         let branch = BranchRecord {
             branch_id: Uuid::new_v4(),
             owner_key: "tenant-a".into(),
@@ -3999,7 +4005,7 @@ mod tests {
                 branch.branch_id,
                 1,
                 second.artifact_id,
-                Utc::now(),
+                Timestamp::now(),
             )
             .unwrap();
         assert_eq!(updated.revision, 2);
@@ -4024,7 +4030,7 @@ mod tests {
                 branch.branch_id,
                 1,
                 first.artifact_id,
-                Utc::now()
+                Timestamp::now()
             ),
             Err(StoreError::Conflict(_))
         ));
@@ -4034,7 +4040,7 @@ mod tests {
                 branch.branch_id,
                 2,
                 foreign.artifact_id,
-                Utc::now()
+                Timestamp::now()
             ),
             Err(StoreError::NotFound)
         ));
@@ -4109,7 +4115,7 @@ mod tests {
             "idempotent replay must not duplicate the primary replica"
         );
 
-        let now = Utc::now();
+        let now = Timestamp::now();
         let replica = ArtifactReplicaRecord {
             artifact_id: artifact.artifact_id,
             owner_key: artifact.owner_key.clone(),
@@ -4139,7 +4145,7 @@ mod tests {
         let mut corrupt = replica.clone();
         corrupt.status = ArtifactReplicaStatus::Corrupt;
         corrupt.verified_at = None;
-        corrupt.updated_at = Utc::now();
+        corrupt.updated_at = Timestamp::now();
         assert_eq!(
             store.upsert_artifact_replica(&corrupt, 2, 2).unwrap(),
             ArtifactReplicationState::Degraded
@@ -4180,15 +4186,15 @@ mod tests {
             cmdline: Some("console=ttyS0".into()),
             content_digest: Some("sha256:test".into()),
             size_bytes: Some(42),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
         };
         store.insert_snapshot(&snapshot).unwrap();
         let record = HibernationRecord {
             vm_id,
             owner_key: "tenant-a".into(),
             snapshot_path: snapshot.path.clone(),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: Timestamp::now(),
+            updated_at: Timestamp::now(),
         };
         store.upsert_hibernation(&record).unwrap();
         assert_eq!(store.get_hibernation("tenant-a", vm_id).unwrap(), record);
@@ -4235,7 +4241,7 @@ mod tests {
             cmdline: Some("console=ttyS0".into()),
             content_digest: Some("sha256:test".into()),
             size_bytes: Some(42),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
         };
         store.insert_snapshot(&snapshot).unwrap();
         assert_eq!(
@@ -4250,8 +4256,8 @@ mod tests {
                 vm_id: bound_id,
                 owner_key: "tenant-b".into(),
                 snapshot_path: snapshot.path.clone(),
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
+                created_at: Timestamp::now(),
+                updated_at: Timestamp::now(),
             })
             .unwrap();
         assert!(store
@@ -4370,7 +4376,7 @@ mod tests {
             fingerprint: "SHA256:conflict-test".into(),
             public_key: "ssh-ed25519 AAAA conflict-test".into(),
             key_type: "ssh-ed25519".into(),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             is_active: true,
         };
         store.insert_ssh_key(&key).unwrap();
@@ -4384,9 +4390,9 @@ mod tests {
     fn share_listing_is_tenant_scoped_ordered_and_updatable() {
         let store = Store::open(":memory:").unwrap();
         let mut older = test_share("older-share", "tenant-a");
-        older.created_at -= chrono::Duration::seconds(1);
+        older.created_at -= time::SignedDuration::seconds(1);
         let mut newer = test_share("newer-share", "tenant-a");
-        newer.revoked_at = Some(Utc::now());
+        newer.revoked_at = Some(Timestamp::now());
         let other_tenant = test_share("other-tenant-share", "tenant-b");
         store.insert_share(&older).unwrap();
         store.insert_share(&newer).unwrap();
@@ -4406,7 +4412,7 @@ mod tests {
         newer.guest_port = 9090;
         newer.visibility = ShareVisibility::Public;
         newer.token_version += 1;
-        newer.updated_at = Utc::now();
+        newer.updated_at = Timestamp::now();
         newer.owner_key = "tenant-b".into();
         store.update_share(&newer).unwrap();
         let persisted = store.get_share(newer.id).unwrap();
@@ -4446,7 +4452,7 @@ mod tests {
             cmdline: Some("console=ttyS0".into()),
             content_digest: Some("sha256:test".into()),
             size_bytes: Some(42),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
         };
         store.insert_snapshot(&snap).unwrap();
         assert_eq!(
@@ -4513,7 +4519,7 @@ mod tests {
         let owner = "tenant-a";
         let first = Uuid::new_v4();
         let second = Uuid::new_v4();
-        let expiry = Utc::now() + chrono::Duration::minutes(1);
+        let expiry = Timestamp::now() + time::SignedDuration::minutes(1);
 
         assert_eq!(
             store.reserve_vm_quota(owner, first, 1, expiry).unwrap(),
@@ -4535,7 +4541,7 @@ mod tests {
         );
         store.release_vm_quota(owner, second).unwrap();
 
-        let expired = Utc::now() - chrono::Duration::seconds(1);
+        let expired = Timestamp::now() - time::SignedDuration::seconds(1);
         assert_eq!(
             store
                 .reserve_vm_quota(owner, Uuid::new_v4(), 1, expired)
@@ -4562,7 +4568,7 @@ mod tests {
             if change_host {
                 stale.host_id.push_str("-previous");
             } else {
-                stale.created_at -= chrono::Duration::days(1);
+                stale.created_at -= time::SignedDuration::days(1);
             }
             assert!(matches!(
                 store.update_vm(&stale),
@@ -4577,7 +4583,7 @@ mod tests {
         let store = Store::open(":memory:").unwrap();
         let mut vm = test_vm(Uuid::new_v4(), "tenant-a");
         vm.status = VmStatus::Running;
-        vm.created_at = Utc::now() - chrono::Duration::days(3);
+        vm.created_at = Timestamp::now() - time::SignedDuration::days(3);
         store.insert_vm(&vm).unwrap();
         let share = ShareRecord {
             vm_id: vm.id,
@@ -4600,7 +4606,7 @@ mod tests {
             )
             .is_err());
         vm = store.get_vm(vm.id).unwrap();
-        vm.updated_at = Utc::now() - chrono::Duration::days(2);
+        vm.updated_at = Timestamp::now() - time::SignedDuration::days(2);
         vm.revision += 1;
         store.insert_vm(&vm).unwrap();
         // Legacy/orphaned shares created before the fix are also fenced by deletion.
@@ -4612,7 +4618,7 @@ mod tests {
         store.insert_share(&legacy).unwrap();
         assert_eq!(
             store
-                .prune_stopped_vms(Utc::now() - chrono::Duration::days(1), 10)
+                .prune_stopped_vms(Timestamp::now() - time::SignedDuration::days(1), 10)
                 .unwrap(),
             1
         );
@@ -4639,9 +4645,9 @@ mod tests {
     #[test]
     fn stopped_vms_past_retention_are_pruned_unless_still_referenced() {
         let store = Store::open(":memory:").unwrap();
-        let now = Utc::now();
-        let old = now - chrono::Duration::days(2);
-        let insert = |id: Uuid, status: VmStatus, updated_at: DateTime<Utc>| {
+        let now = Timestamp::now();
+        let old = now - time::SignedDuration::days(2);
+        let insert = |id: Uuid, status: VmStatus, updated_at: Timestamp| {
             let vm = VmRecord {
                 status,
                 updated_at,
@@ -4655,7 +4661,7 @@ mod tests {
         let recent = insert(
             Uuid::new_v4(),
             VmStatus::Stopped,
-            now - chrono::Duration::hours(1),
+            now - time::SignedDuration::hours(1),
         );
         let running = insert(Uuid::new_v4(), VmStatus::Running, old);
         // A fork that never committed still names its child.
@@ -4672,14 +4678,14 @@ mod tests {
             created_at: old,
             updated_at: old,
         };
-        let expiry = now + chrono::Duration::minutes(1);
+        let expiry = now + time::SignedDuration::minutes(1);
         store
             .claim_fork_operation(&operation, usize::MAX, expiry)
             .unwrap();
         store.release_vm_quota("tenant-a", forking).unwrap();
         insert(forking, VmStatus::Stopped, old);
 
-        let cutoff = now - chrono::Duration::days(1);
+        let cutoff = now - time::SignedDuration::days(1);
         assert_eq!(store.prune_stopped_vms(cutoff, 10).unwrap(), 1);
         assert!(matches!(store.get_vm(expired), Err(StoreError::NotFound)));
         for kept in [recent, running, forking] {
@@ -4698,8 +4704,8 @@ mod tests {
     #[test]
     fn committed_fork_records_are_pruned_only_after_their_child() {
         let store = Store::open(":memory:").unwrap();
-        let now = Utc::now();
-        let old = now - chrono::Duration::days(2);
+        let now = Timestamp::now();
+        let old = now - time::SignedDuration::days(2);
         let child = VmRecord {
             status: VmStatus::Stopped,
             created_at: old,
@@ -4718,7 +4724,7 @@ mod tests {
             created_at: old,
             updated_at: old,
         };
-        let expiry = now + chrono::Duration::minutes(1);
+        let expiry = now + time::SignedDuration::minutes(1);
         store
             .claim_fork_operation(&operation, usize::MAX, expiry)
             .unwrap();
@@ -4734,7 +4740,7 @@ mod tests {
         store.release_vm_quota("tenant-a", child.id).unwrap();
         store.insert_vm(&child).unwrap();
 
-        let cutoff = now - chrono::Duration::days(1);
+        let cutoff = now - time::SignedDuration::days(1);
         assert_eq!(
             store.prune_committed_fork_operations(cutoff, 10).unwrap(),
             0
@@ -4750,7 +4756,7 @@ mod tests {
     #[test]
     fn fork_operation_is_source_bound_recoverable_and_incarnation_fenced() {
         let store = Store::open(":memory:").unwrap();
-        let now = Utc::now();
+        let now = Timestamp::now();
         let operation = ForkOperationRecord {
             child_vm_id: Uuid::new_v4(),
             source_vm_id: Uuid::new_v4(),
@@ -4763,7 +4769,7 @@ mod tests {
             created_at: now,
             updated_at: now,
         };
-        let expiry = now + chrono::Duration::minutes(1);
+        let expiry = now + time::SignedDuration::minutes(1);
 
         assert_eq!(
             store.claim_fork_operation(&operation, 2, expiry).unwrap(),
@@ -4776,7 +4782,7 @@ mod tests {
 
         let restarted_operation = ForkOperationRecord {
             target_boot_session_id: Some(Uuid::new_v4()),
-            updated_at: now + chrono::Duration::seconds(1),
+            updated_at: now + time::SignedDuration::seconds(1),
             ..operation.clone()
         };
         assert_eq!(
@@ -4817,14 +4823,14 @@ mod tests {
             ForkOperationClaimOutcome::Resumed
         );
 
-        let child_created_at = now + chrono::Duration::seconds(1);
+        let child_created_at = now + time::SignedDuration::seconds(1);
         store
             .commit_fork_operation(
                 operation.child_vm_id,
                 operation.source_vm_id,
                 &operation.owner_key,
                 child_created_at,
-                Utc::now(),
+                Timestamp::now(),
             )
             .unwrap();
         let committed = store
@@ -4838,8 +4844,8 @@ mod tests {
                 operation.child_vm_id,
                 operation.source_vm_id,
                 &operation.owner_key,
-                Utc::now(),
-                Utc::now(),
+                Timestamp::now(),
+                Timestamp::now(),
             ),
             Err(StoreError::Conflict(_))
         ));
@@ -4864,7 +4870,7 @@ mod tests {
     #[test]
     fn image_registry_crud_round_trips_records() {
         let store = Store::open(":memory:").unwrap();
-        let created_at = Utc::now();
+        let created_at = Timestamp::now();
         let image = ImageRecord {
             name: "node".into(),
             tag: "20".into(),
@@ -4905,9 +4911,9 @@ mod tests {
     #[test]
     fn finished_executions_past_retention_are_pruned_in_batches() {
         let store = Store::open(":memory:").unwrap();
-        let now = Utc::now();
+        let now = Timestamp::now();
         let record = |age_hours: i64, status: ExecutionStatus| {
-            let at = now - chrono::Duration::hours(age_hours);
+            let at = now - time::SignedDuration::hours(age_hours);
             let exec = ExecutionRecord {
                 id: Uuid::new_v4(),
                 vm_id: Uuid::new_v4(),
@@ -4934,7 +4940,7 @@ mod tests {
         let old_running = record(48, ExecutionStatus::Running);
         let recent = record(1, ExecutionStatus::Completed);
 
-        let cutoff = now - chrono::Duration::hours(24);
+        let cutoff = now - time::SignedDuration::hours(24);
         assert_eq!(store.prune_finished_executions(cutoff, 4).unwrap(), 4);
         assert_eq!(store.prune_finished_executions(cutoff, 4).unwrap(), 2);
         assert_eq!(store.prune_finished_executions(cutoff, 4).unwrap(), 0);
@@ -5008,7 +5014,7 @@ mod tests {
     #[test]
     fn volume_crud_is_tenant_scoped_idempotent_and_revision_fenced() {
         let store = Store::open(":memory:").unwrap();
-        let now = Utc::now();
+        let now = Timestamp::now();
         let volume = VolumeRecord {
             id: Uuid::new_v4(),
             owner_key: "tenant-a".into(),
@@ -5109,7 +5115,7 @@ mod tests {
     #[test]
     fn volume_attachments_are_atomic_tenant_scoped_and_single_writer_fenced() {
         let store = Store::open(":memory:").unwrap();
-        let now = Utc::now();
+        let now = Timestamp::now();
         let volume = VolumeRecord {
             id: Uuid::new_v4(),
             owner_key: "tenant-a".into(),
@@ -5190,7 +5196,7 @@ mod tests {
     #[test]
     fn read_write_many_volume_allows_multiple_writers() {
         let store = Store::open(":memory:").unwrap();
-        let now = Utc::now();
+        let now = Timestamp::now();
         let first_vm = Uuid::new_v4();
         let second_vm = Uuid::new_v4();
         store.insert_vm(&test_vm(first_vm, "tenant-a")).unwrap();
@@ -5250,7 +5256,7 @@ mod tests {
             fingerprint: "SHA256:test".into(),
             public_key: "ssh-ed25519 AAAA test".into(),
             key_type: "ssh-ed25519".into(),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             is_active: true,
         };
         store.insert_ssh_key(&key).unwrap();
@@ -5275,7 +5281,7 @@ mod tests {
             fingerprint: "SHA256:test".into(),
             public_key: "ssh-ed25519 AAAA test".into(),
             key_type: "ssh-ed25519".into(),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             is_active: true,
         };
         store.insert_ssh_key(&key).unwrap();
@@ -5288,7 +5294,7 @@ mod tests {
         let other = SshKeyRecord {
             id: Uuid::new_v4(),
             owner_key: "owner-b".into(),
-            created_at: key.created_at + chrono::Duration::seconds(1),
+            created_at: key.created_at + time::SignedDuration::seconds(1),
             ..key.clone()
         };
         store.insert_ssh_key(&other).unwrap();
@@ -5323,7 +5329,7 @@ mod tests {
     #[test]
     fn usage_and_audit_outboxes_round_trip_and_mark_sent() {
         let store = Store::open(":memory:").unwrap();
-        let now = Utc::now();
+        let now = Timestamp::now();
         let vm_id = Uuid::new_v4();
         let usage = UsageEvent {
             id: Uuid::new_v4(),
@@ -5378,7 +5384,7 @@ mod tests {
     #[test]
     fn local_outbox_serves_usage_and_audit_without_a_fleet() {
         let store = Store::open(":memory:").unwrap();
-        let now = Utc::now();
+        let now = Timestamp::now();
         let vm_id = Uuid::new_v4();
         let usage = |key: &str, kind, seconds, duration_ms, at| UsageEvent {
             id: Uuid::new_v4(),
@@ -5393,7 +5399,7 @@ mod tests {
             window_end: at,
             created_at: at,
         };
-        let old = now - chrono::Duration::days(40);
+        let old = now - time::SignedDuration::days(40);
         store
             .enqueue_usage(&usage("a", UsageKind::VmRuntime, Some(10.0), None, now))
             .unwrap();
@@ -5410,8 +5416,8 @@ mod tests {
             .enqueue_usage(&usage("a", UsageKind::VmRuntime, Some(99.0), None, old))
             .unwrap();
 
-        let from = now - chrono::Duration::days(30);
-        let to = now + chrono::Duration::seconds(1);
+        let from = now - time::SignedDuration::days(30);
+        let to = now + time::SignedDuration::seconds(1);
         let all = store.local_usage_summary(None, from, to).unwrap();
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].api_key_id, "a");
@@ -5451,11 +5457,11 @@ mod tests {
         );
 
         store
-            .prune_local_outbox(now - chrono::Duration::days(30))
+            .prune_local_outbox(now - time::SignedDuration::days(30))
             .unwrap();
         assert_eq!(store.list_local_audit(None, None, 10).unwrap().len(), 2);
         let wide = store
-            .local_usage_summary(Some("a"), old - chrono::Duration::days(1), to)
+            .local_usage_summary(Some("a"), old - time::SignedDuration::days(1), to)
             .unwrap();
         assert_eq!(wide[0].vm_runtime_seconds, 12.5);
     }
@@ -5464,7 +5470,7 @@ mod tests {
     fn billing_activation_is_durable_and_does_not_reset_on_live_updates() {
         let store = Store::open(":memory:").unwrap();
         let mut vm = test_vm(Uuid::new_v4(), "owner");
-        vm.created_at = Utc::now() - chrono::Duration::days(7);
+        vm.created_at = Timestamp::now() - time::SignedDuration::days(7);
         store.insert_vm(&vm).unwrap();
         assert_eq!(store.get_billing_watermark(vm.id).unwrap(), None);
         vm.status = VmStatus::Running;
@@ -5474,7 +5480,7 @@ mod tests {
             store.get_billing_watermark(vm.id).unwrap(),
             Some(vm.updated_at)
         );
-        let advanced = vm.updated_at + chrono::Duration::seconds(5);
+        let advanced = vm.updated_at + time::SignedDuration::seconds(5);
         store.set_billing_watermark(vm.id, advanced).unwrap();
         vm.status = VmStatus::Paused;
         vm.revision += 1;
@@ -5493,12 +5499,48 @@ mod tests {
         assert_eq!(destination.get_billing_watermark(vm.id).unwrap(), None);
         vm.status = VmStatus::Running;
         vm.revision += 1;
-        vm.updated_at = advanced + chrono::Duration::hours(1);
+        vm.updated_at = advanced + time::SignedDuration::hours(1);
         destination.insert_vm(&vm).unwrap();
         assert_eq!(
             destination.get_billing_watermark(vm.id).unwrap(),
             Some(vm.updated_at)
         );
+    }
+
+    #[test]
+    fn final_billing_reads_existing_sqlite_timestamp_text() {
+        let store = Store::open(":memory:").unwrap();
+        let mut vm = test_vm(Uuid::new_v4(), "owner");
+        vm.api_key_id = Some("key".into());
+        vm.status = VmStatus::Running;
+        store.insert_vm(&vm).unwrap();
+
+        // Literal rows in the format written by releases before the time migration.
+        let id = vm.id.to_string();
+        store.conn.execute(
+            "UPDATE billing_watermark SET last_billed_at = '2026-01-01T23:59:59.100+00:00' WHERE vm_id = ?1", [&id],
+        ).unwrap();
+        store.conn.execute(
+            "INSERT INTO billing_runtime_end (vm_id, ended_at) VALUES (?1, '2026-01-02T00:00:09.225+00:00')", [&id],
+        ).unwrap();
+        vm.status = VmStatus::Stopped;
+        vm.revision += 1;
+        vm.updated_at = "2026-01-02T12:00:00Z".parse().unwrap();
+        store.update_vm(&vm).unwrap();
+
+        let events = store.list_unsent_usage(10).unwrap();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(
+            serde_json::to_value(event.window_start).unwrap(),
+            "2026-01-01T23:59:59.100Z"
+        );
+        assert_eq!(
+            serde_json::to_value(event.window_end).unwrap(),
+            "2026-01-02T00:00:09.225Z"
+        );
+        assert_eq!(event.seconds, Some(10.125));
+        assert_eq!(store.get_billing_watermark(vm.id).unwrap(), None);
     }
 
     #[test]
@@ -5508,9 +5550,9 @@ mod tests {
             let mut vm = test_vm(Uuid::new_v4(), "owner");
             vm.api_key_id = Some("key".into());
             vm.status = VmStatus::Running;
-            vm.updated_at = Utc::now() - chrono::Duration::hours(2);
+            vm.updated_at = Timestamp::now() - time::SignedDuration::hours(2);
             let start = vm.updated_at;
-            let end = start + chrono::Duration::seconds(10);
+            let end = start + time::SignedDuration::seconds(10);
             store.insert_vm(&vm).unwrap();
             store.freeze_billing_end(vm.id, end).unwrap();
             store.conn.execute_batch("CREATE TRIGGER reject_final_usage BEFORE INSERT ON usage_outbox BEGIN SELECT RAISE(ABORT, 'injected failure'); END;").unwrap();
@@ -5521,7 +5563,7 @@ mod tests {
                     let mut hibernated = vm.clone();
                     hibernated.status = VmStatus::Hibernated;
                     hibernated.revision += 1;
-                    hibernated.updated_at = Utc::now();
+                    hibernated.updated_at = Timestamp::now();
                     store.update_vm(&hibernated)
                 }
             };
@@ -5544,7 +5586,7 @@ mod tests {
                 let mut errored = vm.clone();
                 errored.status = VmStatus::Error;
                 errored.revision += 2;
-                errored.updated_at = Utc::now();
+                errored.updated_at = Timestamp::now();
                 store.update_vm(&errored).unwrap();
                 assert_eq!(store.list_unsent_usage(10).unwrap().len(), 1);
             }
@@ -5555,8 +5597,8 @@ mod tests {
     fn billing_event_and_watermark_rollback_together() {
         let store = Store::open(":memory:").unwrap();
         let id = Uuid::new_v4();
-        let start = Utc::now() - chrono::Duration::seconds(5);
-        let end = Utc::now();
+        let start = Timestamp::now() - time::SignedDuration::seconds(5);
+        let end = Timestamp::now();
         store.set_billing_watermark(id, start).unwrap();
         let event = UsageEvent {
             id: Uuid::new_v4(),
@@ -5579,7 +5621,7 @@ mod tests {
         // Advancing retry time cannot bill the stopped gap, even though the
         // final outbox transaction rolled back and its watermark remains open.
         let retried_end = store
-            .freeze_billing_end(id, end + chrono::Duration::hours(8))
+            .freeze_billing_end(id, end + time::SignedDuration::hours(8))
             .unwrap()
             .unwrap();
         assert_eq!(retried_end, end);
@@ -5602,16 +5644,16 @@ mod tests {
         let store = Store::open(&path).unwrap();
         let mut vm = test_vm(id, "owner");
         vm.status = VmStatus::Running;
-        vm.created_at = Utc::now() - chrono::Duration::days(30);
+        vm.created_at = Timestamp::now() - time::SignedDuration::days(30);
         store.insert_vm(&vm).unwrap();
-        let billed = Utc::now() - chrono::Duration::seconds(2);
+        let billed = Timestamp::now() - time::SignedDuration::seconds(2);
         store.set_billing_watermark(id, billed).unwrap();
         drop(store);
         let store = Store::open(&path).unwrap();
         assert_eq!(store.get_billing_watermark(id).unwrap(), Some(billed));
         store.clear_billing_watermark(id).unwrap();
         drop(store);
-        let observation = Utc::now();
+        let observation = Timestamp::now();
         let store = Store::open(&path).unwrap();
         assert!(store.get_billing_watermark(id).unwrap().unwrap() >= observation);
         drop(store);
@@ -5622,7 +5664,7 @@ mod tests {
     fn billing_watermark_round_trips_and_clears() {
         let store = Store::open(":memory:").unwrap();
         let vm_id = Uuid::new_v4();
-        let ts = Utc::now();
+        let ts = Timestamp::now();
 
         assert_eq!(store.get_billing_watermark(vm_id).unwrap(), None);
         store.set_billing_watermark(vm_id, ts).unwrap();
@@ -5634,7 +5676,7 @@ mod tests {
     #[test]
     fn vm_api_key_id_round_trips() {
         let store = Store::open(":memory:").unwrap();
-        let now = Utc::now();
+        let now = Timestamp::now();
         let vm = VmRecord {
             id: Uuid::new_v4(),
             host_id: "host-a".into(),
@@ -5677,7 +5719,7 @@ mod tests {
         let mut updated = vm.clone();
         updated.api_key_id = Some("api-key-b".into());
         updated.revision += 1;
-        updated.updated_at += chrono::Duration::milliseconds(1);
+        updated.updated_at += time::SignedDuration::milliseconds(1);
         store.update_vm(&updated).unwrap();
         assert_eq!(
             store.list_vms().unwrap()[0].api_key_id,
@@ -5704,7 +5746,7 @@ mod tests {
             Uuid::new_v4()
         ));
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let created_at = Utc::now();
+        let created_at = Timestamp::now();
         {
             let conn = Connection::open(&path).unwrap();
             conn.execute_batch(
@@ -5772,7 +5814,7 @@ mod tests {
             free_vcpus: 7,
             free_memory_mib: 4096,
             healthy: true,
-            last_heartbeat: Utc::now(),
+            last_heartbeat: Timestamp::now(),
         };
         store.upsert_host(&host).unwrap();
         assert_eq!(
@@ -5803,7 +5845,7 @@ mod tests {
     fn egress_policy_is_tenant_scoped_revisioned_and_deletable() {
         let store = Store::open(":memory:").unwrap();
         let vm_id = Uuid::new_v4();
-        let now = Utc::now();
+        let now = Timestamp::now();
         assert_eq!(store.get_egress_policy("tenant-a", vm_id).unwrap(), None);
 
         let first = store
@@ -5819,12 +5861,12 @@ mod tests {
         assert_eq!(first.revision, 2);
         assert_eq!(first.allowlist, vec!["1.1.1.1:443/tcp"]);
         assert!(matches!(
-            store.update_egress_policy("tenant-a", vm_id, 1, &[], false, Utc::now()),
+            store.update_egress_policy("tenant-a", vm_id, 1, &[], false, Timestamp::now()),
             Err(StoreError::Conflict(_))
         ));
         assert_eq!(store.get_egress_policy("tenant-b", vm_id).unwrap(), None);
         assert!(matches!(
-            store.update_egress_policy("tenant-b", vm_id, 1, &[], false, Utc::now()),
+            store.update_egress_policy("tenant-b", vm_id, 1, &[], false, Timestamp::now()),
             Err(StoreError::NotFound)
         ));
 
@@ -5835,7 +5877,7 @@ mod tests {
                 first.revision,
                 &["10.0.0.0/8".into()],
                 true,
-                Utc::now(),
+                Timestamp::now(),
             )
             .unwrap();
         assert_eq!(second.revision, 3);
@@ -5849,7 +5891,7 @@ mod tests {
             allowlist: vec!["203.0.113.9/32:443/tcp".into()],
             allow_existing: false,
             created_at: now,
-            updated_at: Utc::now(),
+            updated_at: Timestamp::now(),
         };
         store.upsert_recovered_egress_policy(&recovered).unwrap();
         assert_eq!(

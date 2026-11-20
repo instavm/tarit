@@ -22,7 +22,7 @@ vmm-sys-util.workspace = true
 postcard = { workspace = true, optional = true }
 libc.workspace = true
 tempfile = "3"
-env_logger = "0.10"
+env_logger.workspace = true
 crc32fast.workspace = true
 tarit-proto = { path = "../../../proto" }
 sha2.workspace = true

@@ -1058,7 +1058,7 @@ impl Drop for NetworkLease {
     }
 }
 
-type RuntimeDeathObservation = (chrono::DateTime<chrono::Utc>, Instant);
+type RuntimeDeathObservation = (tarit_types::Timestamp, Instant);
 
 #[derive(Debug, Clone)]
 struct ManagedProcess {
@@ -2814,7 +2814,7 @@ impl ManagedProcess {
         self.stopped_at
             .lock()
             .map_err(|_| OrchError::Internal("process death boundary poisoned".into()))?
-            .get_or_insert_with(|| (chrono::Utc::now(), Instant::now()));
+            .get_or_insert_with(|| (tarit_types::Timestamp::now(), Instant::now()));
         Ok(())
     }
 
@@ -3474,7 +3474,7 @@ fn shutdown_error() -> OrchError {
 pub struct VmmSupervisor {
     config: Config,
     running: Mutex<HashMap<Uuid, RunningVm>>,
-    runtime_deaths: Mutex<HashMap<Uuid, chrono::DateTime<chrono::Utc>>>,
+    runtime_deaths: Mutex<HashMap<Uuid, tarit_types::Timestamp>>,
     /// Authoritative ownership for UUID-scoped runtime artifacts. An id enters
     /// before any jail/overlay can be created and leaves only after teardown
     /// succeeds, so registry-to-registry lifecycle handoffs cannot expose a GC
@@ -3757,7 +3757,7 @@ impl VmmSupervisor {
     pub(crate) fn runtime_stopped_at(
         &self,
         id: Uuid,
-    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, OrchError> {
+    ) -> Result<Option<tarit_types::Timestamp>, OrchError> {
         if let Some(end) = self
             .runtime_deaths
             .lock()
@@ -3772,8 +3772,10 @@ impl VmmSupervisor {
             .join("runtime-deaths")
             .join(id.to_string());
         match std::fs::read_to_string(path) {
-            Ok(value) => chrono::DateTime::parse_from_rfc3339(value.trim())
-                .map(|end| Some(end.with_timezone(&chrono::Utc)))
+            Ok(value) => value
+                .trim()
+                .parse::<tarit_types::Timestamp>()
+                .map(Some)
                 .map_err(|error| {
                     OrchError::Internal(format!("read runtime death boundary for {id}: {error}"))
                 }),
@@ -3786,7 +3788,7 @@ impl VmmSupervisor {
 
     #[cfg(test)]
     pub(crate) fn record_runtime_stopped(&self, id: Uuid) -> Result<(), OrchError> {
-        self.record_runtime_stopped_at(id, (chrono::Utc::now(), Instant::now()))
+        self.record_runtime_stopped_at(id, (tarit_types::Timestamp::now(), Instant::now()))
     }
 
     fn record_runtime_stopped_at(
@@ -8099,7 +8101,7 @@ impl VmmSupervisor {
         };
         record.status = observed;
         record.revision = revision;
-        record.updated_at = chrono::Utc::now();
+        record.updated_at = tarit_types::Timestamp::now();
         Ok(())
     }
 
@@ -11263,7 +11265,7 @@ mod tests {
     }
 
     fn restart_record(supervisor: &VmmSupervisor, id: Uuid, socket_path: &Path) -> VmRecord {
-        let now = chrono::Utc::now();
+        let now = tarit_types::Timestamp::now();
         let runtime_layout =
             supervisor.runtime_layout_for_config(id, &spawn_config(true, Some("/rootfs".into())));
         VmRecord {
@@ -11305,7 +11307,7 @@ mod tests {
         let db_path = root.join("billing.sqlite");
         let store = tarit_store::Store::open(&db_path).unwrap();
         let mut record = restart_record(&supervisor, id, &socket);
-        record.updated_at = chrono::Utc::now() - chrono::Duration::hours(1);
+        record.updated_at = tarit_types::Timestamp::now() - time::SignedDuration::hours(1);
         store.insert_vm(&record).unwrap();
         drop(store);
         assert!(supervisor.stop_vm(id).is_err());
@@ -11323,7 +11325,7 @@ mod tests {
         let mut hibernated = record.clone();
         hibernated.status = VmStatus::Hibernated;
         hibernated.revision += 1;
-        hibernated.updated_at = chrono::Utc::now();
+        hibernated.updated_at = tarit_types::Timestamp::now();
         reopened.update_vm(&hibernated).unwrap();
         let events = reopened.list_unsent_usage(10).unwrap();
         assert_eq!(events.len(), 1);

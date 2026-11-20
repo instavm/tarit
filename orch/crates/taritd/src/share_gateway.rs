@@ -1875,7 +1875,6 @@ mod tests {
         Router,
     };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-    use chrono::Utc;
     use futures_util::{SinkExt, StreamExt};
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
@@ -1887,6 +1886,7 @@ mod tests {
         sync::{Arc, Mutex},
         time::Duration,
     };
+    use tarit_types::Timestamp;
     use tarit_types::{ShareRecord, ShareVisibility, VmRecord, VmStatus};
     use tokio::{
         net::TcpListener,
@@ -2070,7 +2070,7 @@ mod tests {
         let share = gateway_share(Uuid::new_v4(), 8080, ShareVisibility::Private);
         state.shares.insert(&share).await.unwrap();
         let token = ShareTokenSigner::new([7; 32], Duration::from_secs(300))
-            .issue(&share, Utc::now())
+            .issue(&share, Timestamp::now())
             .unwrap();
         assert!(
             crate::shares::authorize_gateway(&state, &share.slug, Some(&token))
@@ -2477,7 +2477,7 @@ mod tests {
             let mut vms = state.vm_cache.write().unwrap();
             let vm = vms.get_mut(&share.vm_id).unwrap();
             vm.owner_key = Some("tenant-b".into());
-            vm.created_at += chrono::Duration::seconds(1);
+            vm.created_at += time::SignedDuration::seconds(1);
             vm.status = VmStatus::Hibernated;
         }
         // A gate already held by another operation must not even be awaited by
@@ -2541,7 +2541,7 @@ mod tests {
             format!("http://{upstream}/inspect")
         );
         let token = ShareTokenSigner::new([7; 32], Duration::from_secs(300))
-            .issue(&share, Utc::now())
+            .issue(&share, Timestamp::now())
             .unwrap();
         assert!(
             crate::shares::authorize_gateway(&state, &share.slug, Some(&token))
@@ -3179,7 +3179,7 @@ mod tests {
 
         // A validly signed identity envelope captured from another request by
         // the same source must not be combinable with this signed request.
-        let issued_at = Utc::now().timestamp();
+        let issued_at = Timestamp::now().unix_timestamp();
         let nonce = Uuid::new_v4().to_string();
         let identity_id = super::share_peer_identity_id(&cluster.share);
         let mut spliced_mac = Hmac::<Sha256>::new_from_slice(b"peer-secret").unwrap();
@@ -3220,7 +3220,7 @@ mod tests {
         let cluster =
             TestShareCluster::start_with_upstream(upstream, ShareVisibility::Private).await;
         let token = ShareTokenSigner::new([7; 32], Duration::from_secs(300))
-            .issue(&cluster.share, Utc::now())
+            .issue(&cluster.share, Timestamp::now())
             .unwrap();
 
         let missing_token = cluster.request_through_non_owner("/inspect").await;
@@ -3661,7 +3661,7 @@ mod tests {
         source_session: Uuid,
         target_session: Uuid,
     ) -> HeaderMap {
-        let issued_at = Utc::now().timestamp();
+        let issued_at = Timestamp::now().unix_timestamp();
         let identity_nonce = Uuid::new_v4().to_string();
         let request_nonce = Uuid::new_v4().to_string();
         let identity_id = super::share_peer_identity_id(share);
@@ -3844,7 +3844,7 @@ mod tests {
     }
 
     fn gateway_share(vm_id: Uuid, guest_port: u16, visibility: ShareVisibility) -> ShareRecord {
-        let now = Utc::now();
+        let now = Timestamp::now();
         ShareRecord {
             id: Uuid::new_v4(),
             slug: "calm-red-fox".into(),
@@ -3877,7 +3877,7 @@ mod tests {
                 prefix: 30,
             },
         );
-        let now = Utc::now();
+        let now = Timestamp::now();
         state.vm_cache.write().unwrap().insert(
             vm_id,
             VmRecord {

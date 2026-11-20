@@ -211,7 +211,7 @@ pub async fn peer_rpc(state: &AppState, host_id: &str) -> Result<Option<PeerTarg
 
 fn ensure_routable_host(
     host: &HostRecord,
-    now: chrono::DateTime<chrono::Utc>,
+    now: tarit_types::Timestamp,
     purpose: &str,
 ) -> Result<(), OrchError> {
     let fresh = tarit_fleet::host_heartbeat_is_fresh(host.last_heartbeat, now);
@@ -266,7 +266,7 @@ pub async fn clear_ownership(state: &AppState, id: Uuid) -> Result<(), OrchError
 mod tests {
     use super::*;
 
-    fn host(last_heartbeat: chrono::DateTime<chrono::Utc>, healthy: bool) -> HostRecord {
+    fn host(last_heartbeat: tarit_types::Timestamp, healthy: bool) -> HostRecord {
         HostRecord {
             host_id: "node-a".into(),
             boot_session_id: Some(Uuid::nil()),
@@ -282,30 +282,38 @@ mod tests {
 
     #[test]
     fn routing_rejects_stale_unhealthy_and_far_future_hosts() {
-        assert!(
-            ensure_routable_host(&host(chrono::Utc::now(), true), chrono::Utc::now(), "owner")
-                .is_ok()
-        );
+        assert!(ensure_routable_host(
+            &host(tarit_types::Timestamp::now(), true),
+            tarit_types::Timestamp::now(),
+            "owner"
+        )
+        .is_ok());
         assert!(matches!(
             ensure_routable_host(
-                &host(chrono::Utc::now() - chrono::Duration::seconds(16), true),
-                chrono::Utc::now(),
+                &host(
+                    tarit_types::Timestamp::now() - time::SignedDuration::seconds(16),
+                    true
+                ),
+                tarit_types::Timestamp::now(),
                 "owner",
             ),
             Err(OrchError::Unavailable(_))
         ));
         assert!(matches!(
             ensure_routable_host(
-                &host(chrono::Utc::now(), false),
-                chrono::Utc::now(),
+                &host(tarit_types::Timestamp::now(), false),
+                tarit_types::Timestamp::now(),
                 "owner"
             ),
             Err(OrchError::Unavailable(_))
         ));
         assert!(matches!(
             ensure_routable_host(
-                &host(chrono::Utc::now() + chrono::Duration::seconds(6), true),
-                chrono::Utc::now(),
+                &host(
+                    tarit_types::Timestamp::now() + time::SignedDuration::seconds(6),
+                    true
+                ),
+                tarit_types::Timestamp::now(),
                 "owner",
             ),
             Err(OrchError::Unavailable(_))

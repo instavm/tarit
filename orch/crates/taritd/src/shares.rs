@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -11,6 +10,7 @@ use std::{
 };
 use tarit_fleet::{FleetError, PostgresFleet};
 use tarit_store::{Store, StoreError};
+use tarit_types::Timestamp;
 use tarit_types::{
     CreateShareRequest, OrchError, ShareRecord, ShareTokenResponse, ShareVisibility,
     UpdateShareRequest, VmRecord, VmStatus,
@@ -179,7 +179,7 @@ async fn insert_with_generated_slug<F>(
     vm: &VmRecord,
     guest_port: u16,
     visibility: ShareVisibility,
-    now: DateTime<Utc>,
+    now: Timestamp,
     mut next_slug: F,
 ) -> Result<ShareRecord, OrchError>
 where
@@ -220,7 +220,7 @@ fn new_slug() -> String {
 fn apply_update(
     share: &ShareRecord,
     request: &UpdateShareRequest,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<ShareRecord, OrchError> {
     request.validate()?;
     if share.revoked_at.is_some() {
@@ -278,7 +278,7 @@ pub async fn update(
         share_id,
         replacement_vm.as_ref(),
         request,
-        Utc::now(),
+        Timestamp::now(),
     )
     .await
 }
@@ -289,7 +289,7 @@ pub async fn revoke(
     share_id: Uuid,
 ) -> Result<ShareRecord, OrchError> {
     let _mutation = state.shares.mutation_lock.lock().await;
-    revoke_for_share(&state.shares, identity, share_id, Utc::now()).await
+    revoke_for_share(&state.shares, identity, share_id, Timestamp::now()).await
 }
 
 pub async fn list(state: &AppState, identity: &ApiIdentity) -> Result<Vec<ShareRecord>, OrchError> {
@@ -312,7 +312,7 @@ pub async fn issue_token(
     state: &AppState,
     identity: &ApiIdentity,
     share_id: Uuid,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<ShareTokenResponse, OrchError> {
     let share = get_owned_share(&state.shares, identity, share_id).await?;
     let signer = signer_from_state(state)?;
@@ -350,7 +350,7 @@ async fn create_for_vm(
         vm,
         request.guest_port,
         request.visibility,
-        Utc::now(),
+        Timestamp::now(),
         new_slug,
     )
     .await
@@ -362,7 +362,7 @@ async fn update_for_share(
     share_id: Uuid,
     replacement_vm: Option<&VmRecord>,
     request: UpdateShareRequest,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<ShareRecord, OrchError> {
     let share = get_owned_share(repository, identity, share_id).await?;
     if let Some(vm_id) = request.vm_id {
@@ -400,7 +400,7 @@ async fn revoke_for_share(
     repository: &ShareRepository,
     identity: &ApiIdentity,
     share_id: Uuid,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<ShareRecord, OrchError> {
     let share = get_owned_share(repository, identity, share_id).await?;
     if share.revoked_at.is_some() {
@@ -456,7 +456,7 @@ fn authorize_share(
     let token = token.ok_or(OrchError::Unauthorized)?;
     let signer =
         signer.ok_or_else(|| OrchError::Internal("share token signer is unavailable".into()))?;
-    signer.verify(token, share, Utc::now())?;
+    signer.verify(token, share, Timestamp::now())?;
     Ok(share.clone())
 }
 
@@ -524,16 +524,16 @@ fn signer_from_state(state: &AppState) -> Result<ShareTokenSigner, OrchError> {
     ))
 }
 
-fn token_expiry_at(now: DateTime<Utc>, ttl_secs: u64) -> Result<DateTime<Utc>, OrchError> {
+fn token_expiry_at(now: Timestamp, ttl_secs: u64) -> Result<Timestamp, OrchError> {
     let ttl = i64::try_from(ttl_secs)
         .ok()
         .filter(|ttl| *ttl > 0)
         .ok_or_else(|| OrchError::Internal("share token TTL must be positive".into()))?;
     let exp = now
-        .timestamp()
+        .unix_timestamp()
         .checked_add(ttl)
         .ok_or_else(|| OrchError::Internal("share token expiry overflow".into()))?;
-    DateTime::from_timestamp(exp, 0)
+    Timestamp::from_timestamp(exp, 0)
         .ok_or_else(|| OrchError::Internal("share token expiry is invalid".into()))
 }
 
@@ -559,13 +559,13 @@ impl ShareTokenSigner {
         Self { key, ttl }
     }
 
-    pub fn issue(&self, share: &ShareRecord, now: DateTime<Utc>) -> Result<String, OrchError> {
+    pub fn issue(&self, share: &ShareRecord, now: Timestamp) -> Result<String, OrchError> {
         if share.visibility != ShareVisibility::Private || share.revoked_at.is_some() {
             return Err(OrchError::BadRequest(
                 "tokens can only be issued for active private shares".into(),
             ));
         }
-        let iat = now.timestamp();
+        let iat = now.unix_timestamp();
         let exp = iat
             .checked_add(self.ttl_seconds()?)
             .ok_or_else(|| OrchError::Internal("share token expiry overflow".into()))?;
@@ -588,7 +588,7 @@ impl ShareTokenSigner {
         &self,
         token: &str,
         share: &ShareRecord,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> Result<(), OrchError> {
         if token.len() > MAX_SHARE_TOKEN_LEN
             || share.visibility != ShareVisibility::Private
@@ -616,7 +616,7 @@ impl ShareTokenSigner {
         let payload = decode_base64url(payload).ok_or(OrchError::Unauthorized)?;
         let claims: ShareTokenClaims =
             serde_json::from_slice(&payload).map_err(|_| OrchError::Unauthorized)?;
-        let now = now.timestamp();
+        let now = now.unix_timestamp();
         let expected_exp = claims
             .iat
             .checked_add(self.ttl_seconds().map_err(|_| OrchError::Unauthorized)?)
@@ -663,20 +663,21 @@ mod tests {
     };
     use crate::config::{ApiIdentity, ApiRole};
     use base64::Engine as _;
-    use chrono::{Duration as ChronoDuration, TimeZone, Utc};
     use std::{
         sync::{Arc, Mutex},
         time::Duration,
     };
     use tarit_store::Store;
+    use tarit_types::Timestamp;
     use tarit_types::{
         CreateShareRequest, OrchError, ShareRecord, ShareVisibility, UpdateShareRequest, VmRecord,
         VmStatus,
     };
+    use time::SignedDuration;
     use uuid::Uuid;
 
     fn test_private_share(token_version: u64) -> ShareRecord {
-        let now = Utc::now();
+        let now = Timestamp::now();
         ShareRecord {
             id: Uuid::new_v4(),
             slug: "test-share".into(),
@@ -695,16 +696,20 @@ mod tests {
     fn token_rejects_wrong_version_and_expiry() {
         let signer = ShareTokenSigner::new([7u8; 32], Duration::from_secs(300));
         let share = test_private_share(4);
-        let token = signer.issue(&share, Utc::now()).unwrap();
-        assert!(signer.verify(&token, &share, Utc::now()).is_ok());
+        let token = signer.issue(&share, Timestamp::now()).unwrap();
+        assert!(signer.verify(&token, &share, Timestamp::now()).is_ok());
 
         let rotated = ShareRecord {
             token_version: 5,
             ..share.clone()
         };
-        assert!(signer.verify(&token, &rotated, Utc::now()).is_err());
+        assert!(signer.verify(&token, &rotated, Timestamp::now()).is_err());
         assert!(signer
-            .verify(&token, &share, Utc::now() + ChronoDuration::minutes(6))
+            .verify(
+                &token,
+                &share,
+                Timestamp::now() + SignedDuration::minutes(6)
+            )
             .is_err());
     }
 
@@ -712,7 +717,7 @@ mod tests {
     fn token_rejects_malformed_noncanonical_and_wrong_owner_input_without_panicking() {
         let signer = ShareTokenSigner::new([7u8; 32], Duration::from_secs(300));
         let share = test_private_share(4);
-        let token = signer.issue(&share, Utc::now()).unwrap();
+        let token = signer.issue(&share, Timestamp::now()).unwrap();
         let another_owner = ShareRecord {
             owner_key: "tenant-b".into(),
             ..share.clone()
@@ -727,13 +732,20 @@ mod tests {
             "%%%%.%%%%",
             &format!("{token}="),
         ] {
-            let result = std::panic::catch_unwind(|| signer.verify(malformed, &share, Utc::now()));
+            let result =
+                std::panic::catch_unwind(|| signer.verify(malformed, &share, Timestamp::now()));
             assert!(result.is_ok(), "malformed token must not panic");
             assert!(result.unwrap().is_err());
         }
-        assert!(signer.verify(&token, &another_owner, Utc::now()).is_err());
         assert!(signer
-            .verify(&token, &share, Utc::now() + ChronoDuration::seconds(300))
+            .verify(&token, &another_owner, Timestamp::now())
+            .is_err());
+        assert!(signer
+            .verify(
+                &token,
+                &share,
+                Timestamp::now() + SignedDuration::seconds(300)
+            )
             .is_err());
     }
 
@@ -741,8 +753,8 @@ mod tests {
     fn token_requires_exact_audience_and_nonfuture_issued_at() {
         let signer = ShareTokenSigner::new([7u8; 32], Duration::from_secs(300));
         let share = test_private_share(4);
-        let now = Utc::now();
-        let iat = now.timestamp();
+        let now = Timestamp::now();
+        let iat = now.unix_timestamp();
 
         let wrong_audience = signed_token(&signer, &share, "other-audience", iat, iat + 300);
         assert!(signer.verify(&wrong_audience, &share, now).is_err());
@@ -759,10 +771,10 @@ mod tests {
 
     #[test]
     fn token_response_expiry_matches_the_integer_second_in_its_claim() {
-        let issued_at = Utc.timestamp_opt(1_000, 900_000_000).single().unwrap();
+        let issued_at = Timestamp::from_timestamp(1_000, 900_000_000).unwrap();
         assert_eq!(
             token_expiry_at(issued_at, 300).unwrap(),
-            Utc.timestamp_opt(1_300, 0).single().unwrap()
+            Timestamp::from_timestamp(1_300, 0).unwrap()
         );
     }
 
@@ -835,7 +847,7 @@ mod tests {
             &vm,
             8081,
             ShareVisibility::Private,
-            Utc::now(),
+            Timestamp::now(),
             || {
                 attempts += 1;
                 if attempts < MAX_SLUG_ATTEMPTS {
@@ -857,7 +869,7 @@ mod tests {
             &vm,
             8082,
             ShareVisibility::Private,
-            Utc::now(),
+            Timestamp::now(),
             || {
                 exhausted_attempts += 1;
                 "test-share".into()
@@ -924,7 +936,7 @@ mod tests {
                     vm_id: Some(replacement.id),
                     ..Default::default()
                 },
-                Utc::now(),
+                Timestamp::now(),
             )
             .await,
             Err(OrchError::Forbidden(_))
@@ -934,7 +946,8 @@ mod tests {
     #[test]
     fn update_rotates_token_version_only_for_authorization_relevant_changes() {
         let share = test_private_share(4);
-        let unchanged = apply_update(&share, &UpdateShareRequest::default(), Utc::now()).unwrap();
+        let unchanged =
+            apply_update(&share, &UpdateShareRequest::default(), Timestamp::now()).unwrap();
         assert_eq!(unchanged.token_version, 4);
 
         let updated = apply_update(
@@ -943,7 +956,7 @@ mod tests {
                 guest_port: Some(9090),
                 ..Default::default()
             },
-            Utc::now(),
+            Timestamp::now(),
         )
         .unwrap();
         assert_eq!(updated.guest_port, 9090);
@@ -997,13 +1010,13 @@ mod tests {
                 guest_port: Some(9090),
                 ..Default::default()
             },
-            Utc::now(),
+            Timestamp::now(),
         )
         .await
         .unwrap();
         assert_eq!(updated.token_version, created.token_version + 1);
 
-        let revoked = revoke_for_share(&repository, &identity, updated.id, Utc::now())
+        let revoked = revoke_for_share(&repository, &identity, updated.id, Timestamp::now())
             .await
             .unwrap();
         assert!(revoked.revoked_at.is_some());
@@ -1018,7 +1031,7 @@ mod tests {
                     guest_port: Some(10000),
                     ..Default::default()
                 },
-                Utc::now(),
+                Timestamp::now(),
             )
             .await,
             Err(OrchError::Conflict(_))
@@ -1032,7 +1045,7 @@ mod tests {
         let private = test_private_share(0);
         repository.insert(&private).await.unwrap();
         let signer = ShareTokenSigner::new([3u8; 32], Duration::from_secs(300));
-        let token = signer.issue(&private, Utc::now()).unwrap();
+        let token = signer.issue(&private, Timestamp::now()).unwrap();
         assert_eq!(
             authorize_with_repository(
                 &repository,
@@ -1068,7 +1081,7 @@ mod tests {
     }
 
     fn test_vm(owner_key: &str, status: VmStatus) -> VmRecord {
-        let now = Utc::now();
+        let now = Timestamp::now();
         VmRecord {
             id: Uuid::new_v4(),
             host_id: "test-host".into(),
