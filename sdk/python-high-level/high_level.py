@@ -4,8 +4,8 @@ import asyncio
 import json
 import math
 import ssl
-import time
 import threading
+import time
 from concurrent.futures import Future, wait
 from contextlib import suppress
 from dataclasses import dataclass
@@ -116,7 +116,7 @@ def _fork_result(client: AuthenticatedClient, response: httpx.Response, child_id
         return _parsed(fork_vm_api._build_response(client=client, response=response), ForkVmResponse, "fork VM")
     except (ValueError, KeyError, TypeError, AttributeError, OverflowError) as error:
         # Existing callers can still catch the decoder's original exception.
-        error.child_id = child_id
+        error.__dict__["child_id"] = child_id
         error.add_note(f"Fork may have completed as child {child_id}")
         raise
 
@@ -400,7 +400,7 @@ class TaritClient:
                                 break
                         raise TaritApiError("delete PTY session", response.status_code, _error_message(bytes(body)))
                 result.set_result(None)
-            except BaseException as error:
+            except BaseException as error:  # noqa: BLE001 - forward the worker failure to the caller
                 result.set_exception(error)
             finally:
                 _CLEANUP_SLOTS.release()

@@ -163,18 +163,22 @@ class SyncDeadlineTests(unittest.TestCase):
     def test_malformed_fork_preserves_id_and_default_deadline(self) -> None:
         for late in (False, True):
             clock = Clock()
-            ids = []
+            ids: list[UUID] = []
 
-            def handler(request):
+            def handler(
+                request: httpx.Request, ids: list[UUID] = ids, late: bool = late, clock: Clock = clock
+            ) -> httpx.Response:
                 ids.append(UUID(json.loads(request.content)["id"]))
                 if late:
                     clock.advance(2)
                 return httpx.Response(201, json={})
 
-            with clock.patched():
-                with TaritClient("https://tarit.test", "key", transport=httpx.MockTransport(handler)) as client:
-                    with self.assertRaises(TaritDeadlineExceeded if late else KeyError) as caught:
-                        client.fork(VM_ID, deadline_seconds=1)
+            with (
+                clock.patched(),
+                TaritClient("https://tarit.test", "key", transport=httpx.MockTransport(handler)) as client,
+                self.assertRaises(TaritDeadlineExceeded if late else KeyError) as caught,
+            ):
+                client.fork(VM_ID, deadline_seconds=1)
             self.assertEqual(ids, [caught.exception.child_id])
 
     def test_fork_honors_late_final_responses_without_replay(self) -> None:
@@ -517,9 +521,11 @@ class AsyncDeadlineTests(unittest.IsolatedAsyncioTestCase):
     async def test_malformed_fork_preserves_id_and_default_deadline(self) -> None:
         for late in (False, True):
             clock = Clock()
-            ids = []
+            ids: list[UUID] = []
 
-            def handler(request):
+            def handler(
+                request: httpx.Request, ids: list[UUID] = ids, late: bool = late, clock: Clock = clock
+            ) -> httpx.Response:
                 ids.append(UUID(json.loads(request.content)["id"]))
                 if late:
                     clock.advance(2)

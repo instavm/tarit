@@ -5,7 +5,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from uuid import uuid4
 
 import httpx
-
 from tarit_sdk.api.default import get_health, list_snapshots
 from tarit_sdk.client import Client
 from tarit_sdk.errors import UnexpectedStatus
