@@ -984,6 +984,11 @@ fn peer_restore_attribution(
     // Only admins can delegate restore ownership and attribution. For other
     // callers the wire fields remain for compatibility, not authorization.
     if identity.is_admin() {
+        if owner_key.trim().is_empty() || api_key_id.trim().is_empty() {
+            return Err(tarit_types::OrchError::BadRequest(
+                "delegated restore requires a nonempty tenant and billing key ID".into(),
+            ));
+        }
         return Ok((owner_key, api_key_id));
     }
     if owner_key != identity.tenant || api_key_id != identity.api_key_id {
@@ -1236,6 +1241,12 @@ mod tests {
                 .unwrap(),
             ("delegate".to_string(), "delegate-key-id".to_string()),
         );
+        for (owner, key) in [("", "key"), ("owner", "  ")] {
+            assert!(matches!(
+                peer_restore_attribution(&identity, owner.into(), key.into()),
+                Err(tarit_types::OrchError::BadRequest(_))
+            ));
+        }
     }
 
     fn signed_test_request(
@@ -1399,6 +1410,101 @@ mod tests {
         });
     }
 
+    fn signed_router_request(
+        state: &AppState,
+        method: &str,
+        path: &str,
+        role: &str,
+        body: String,
+        key: &str,
+        tamper: bool,
+    ) -> Request<Body> {
+        let source = Uuid::new_v4().to_string();
+        let timestamp = Utc::now().timestamp().to_string();
+        let identity_nonce = Uuid::new_v4().to_string();
+        let nonce = Uuid::new_v4().to_string();
+        let source_session = Uuid::new_v4().to_string();
+        let target_session = state.config.host_session_id.to_string();
+        let mut identity_mac =
+            Hmac::<Sha256>::new_from_slice(state.config.peer_secret.as_bytes()).unwrap();
+        identity_mac.update(format!("{IDENTITY_SIGNATURE_VERSION}\n{source}\n{timestamp}\n{identity_nonce}\ntenant-a\n{role}\ntest-key-id").as_bytes());
+        let identity_signature = URL_SAFE_NO_PAD.encode(identity_mac.finalize().into_bytes());
+        let payload = URL_SAFE_NO_PAD.encode(Sha256::digest(body.as_bytes()));
+        let mut request_mac =
+            Hmac::<Sha256>::new_from_slice(state.config.peer_secret.as_bytes()).unwrap();
+        for component in [
+            REQUEST_SIGNATURE_VERSION,
+            method,
+            path,
+            &payload,
+            &timestamp,
+            &nonce,
+            &source,
+            &state.config.host_id,
+            &source_session,
+            &target_session,
+            &identity_signature,
+        ] {
+            request_mac.update(component.as_bytes());
+            request_mac.update(b"\n");
+        }
+        let signature = URL_SAFE_NO_PAD.encode(request_mac.finalize().into_bytes());
+        Request::builder()
+            .method(method)
+            .uri(path)
+            .header("Content-Type", "application/json")
+            .header("X-API-Key", key)
+            .header("X-Tarit-Peer-Version", REQUEST_SIGNATURE_VERSION)
+            .header("X-Tarit-Peer-Source", source)
+            .header("X-Tarit-Peer-Target", &state.config.host_id)
+            .header("X-Tarit-Peer-Source-Session", source_session)
+            .header("X-Tarit-Peer-Target-Session", target_session)
+            .header("X-Tarit-Peer-Timestamp", &timestamp)
+            .header("X-Tarit-Peer-Nonce", nonce)
+            .header("X-Tarit-Peer-Body-SHA256", payload)
+            .header(
+                "X-Tarit-Peer-Signature",
+                if tamper { "invalid" } else { &signature },
+            )
+            .header("X-Tarit-Tenant", "tenant-a")
+            .header("X-Tarit-Role", role)
+            .header("X-Tarit-Api-Key-Id", "test-key-id")
+            .header("X-Tarit-Identity-Timestamp", timestamp)
+            .header("X-Tarit-Identity-Nonce", identity_nonce)
+            .header("X-Tarit-Identity-Signature", identity_signature)
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    #[test]
+    fn signed_restore_routes_validate_attribution_before_creating_a_vm() {
+        use tower::ServiceExt;
+        let state = crate::api::tests::test_state();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for path in ["/internal/v1/restore", "/internal/v1/restore-memory-target"] {
+                for (role, owner, key, expected) in [
+                    ("admin", " ", "key", StatusCode::BAD_REQUEST),
+                    ("admin", "owner", "", StatusCode::BAD_REQUEST),
+                    ("user", "foreign", "test-key-id", StatusCode::FORBIDDEN),
+                    ("user", "tenant-a", "foreign-key", StatusCode::FORBIDDEN),
+                ] {
+                    let id = Uuid::new_v4();
+                    let body = serde_json::json!({"id":id,"snapshot_path":"missing","owner_key":owner,"api_key_id":key}).to_string();
+                    let request = signed_router_request(&state, "POST", path, role, body, "unused", false);
+                    let response = internal_router(state.clone()).oneshot(request).await.unwrap();
+                    assert_eq!(response.status(), expected);
+                    let store = state.store.lock().unwrap();
+                    assert!(matches!(store.get_vm(id), Err(tarit_store::StoreError::NotFound)));
+                    assert!(store.get_billing_watermark(id).unwrap().is_none());
+                }
+            }
+        });
+    }
+
     #[test]
     fn signed_peer_requests_use_global_admission_and_reject_tampering() {
         use tower::ServiceExt;
@@ -1407,59 +1513,7 @@ mod tests {
         crate::api::tests::insert_vm(&state, id, "tenant-a", VmStatus::Running);
         let path = format!("/internal/v1/vms/{id}");
         let signed_request = |key: &str, tamper: bool| {
-            let source = Uuid::new_v4().to_string();
-            let timestamp = Utc::now().timestamp().to_string();
-            let identity_nonce = Uuid::new_v4().to_string();
-            let nonce = Uuid::new_v4().to_string();
-            let source_session = Uuid::new_v4().to_string();
-            let target_session = state.config.host_session_id.to_string();
-            let mut identity_mac =
-                Hmac::<Sha256>::new_from_slice(state.config.peer_secret.as_bytes()).unwrap();
-            identity_mac.update(format!("{IDENTITY_SIGNATURE_VERSION}\n{source}\n{timestamp}\n{identity_nonce}\ntenant-a\nuser\ntest-key-id").as_bytes());
-            let identity_signature = URL_SAFE_NO_PAD.encode(identity_mac.finalize().into_bytes());
-            let payload = URL_SAFE_NO_PAD.encode(Sha256::digest(b""));
-            let mut request_mac =
-                Hmac::<Sha256>::new_from_slice(state.config.peer_secret.as_bytes()).unwrap();
-            for component in [
-                REQUEST_SIGNATURE_VERSION,
-                "GET",
-                &path,
-                &payload,
-                &timestamp,
-                &nonce,
-                &source,
-                &state.config.host_id,
-                &source_session,
-                &target_session,
-                &identity_signature,
-            ] {
-                request_mac.update(component.as_bytes());
-                request_mac.update(b"\n");
-            }
-            let signature = URL_SAFE_NO_PAD.encode(request_mac.finalize().into_bytes());
-            Request::builder()
-                .uri(&path)
-                .header("X-API-Key", key)
-                .header("X-Tarit-Peer-Version", REQUEST_SIGNATURE_VERSION)
-                .header("X-Tarit-Peer-Source", source)
-                .header("X-Tarit-Peer-Target", &state.config.host_id)
-                .header("X-Tarit-Peer-Source-Session", source_session)
-                .header("X-Tarit-Peer-Target-Session", target_session)
-                .header("X-Tarit-Peer-Timestamp", &timestamp)
-                .header("X-Tarit-Peer-Nonce", nonce)
-                .header("X-Tarit-Peer-Body-SHA256", payload)
-                .header(
-                    "X-Tarit-Peer-Signature",
-                    if tamper { "invalid" } else { &signature },
-                )
-                .header("X-Tarit-Tenant", "tenant-a")
-                .header("X-Tarit-Role", "user")
-                .header("X-Tarit-Api-Key-Id", "test-key-id")
-                .header("X-Tarit-Identity-Timestamp", timestamp)
-                .header("X-Tarit-Identity-Nonce", identity_nonce)
-                .header("X-Tarit-Identity-Signature", identity_signature)
-                .body(Body::empty())
-                .unwrap()
+            signed_router_request(&state, "GET", &path, "user", String::new(), key, tamper)
         };
         let valid = signed_request("junk", false);
         let exhausted = signed_request("tenant-b-key", false);
