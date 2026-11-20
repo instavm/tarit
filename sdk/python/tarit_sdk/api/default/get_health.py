@@ -5,7 +5,7 @@ import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
-from ...models.probe_status import ProbeStatus
+from ...models.health_status import HealthStatus
 from ...types import Response
 
 
@@ -19,14 +19,14 @@ def _get_kwargs() -> dict[str, Any]:
     return _kwargs
 
 
-def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> ProbeStatus | None:
+def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> HealthStatus | None:
     if response.status_code == 200:
-        response_200 = ProbeStatus.from_dict(response.json())
+        response_200 = HealthStatus.from_dict(response.json())
 
         return response_200
 
     if response.status_code == 503:
-        response_503 = ProbeStatus.from_dict(response.json())
+        response_503 = HealthStatus.from_dict(response.json())
 
         return response_503
 
@@ -36,7 +36,7 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         return None
 
 
-def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[ProbeStatus]:
+def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[HealthStatus]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -48,7 +48,7 @@ def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Res
 def sync_detailed(
     *,
     client: AuthenticatedClient | Client,
-) -> Response[ProbeStatus]:
+) -> Response[HealthStatus]:
     """Check liveness (alias for /livez)
 
     Raises:
@@ -56,7 +56,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[ProbeStatus]
+        Response[HealthStatus]
     """
 
     kwargs = _get_kwargs()
@@ -71,7 +71,7 @@ def sync_detailed(
 def sync(
     *,
     client: AuthenticatedClient | Client,
-) -> ProbeStatus | None:
+) -> HealthStatus | None:
     """Check liveness (alias for /livez)
 
     Raises:
@@ -79,7 +79,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        ProbeStatus
+        HealthStatus
     """
 
     return sync_detailed(
@@ -90,7 +90,7 @@ def sync(
 async def asyncio_detailed(
     *,
     client: AuthenticatedClient | Client,
-) -> Response[ProbeStatus]:
+) -> Response[HealthStatus]:
     """Check liveness (alias for /livez)
 
     Raises:
@@ -98,7 +98,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[ProbeStatus]
+        Response[HealthStatus]
     """
 
     kwargs = _get_kwargs()
@@ -111,7 +111,7 @@ async def asyncio_detailed(
 async def asyncio(
     *,
     client: AuthenticatedClient | Client,
-) -> ProbeStatus | None:
+) -> HealthStatus | None:
     """Check liveness (alias for /livez)
 
     Raises:
@@ -119,7 +119,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        ProbeStatus
+        HealthStatus
     """
 
     return (

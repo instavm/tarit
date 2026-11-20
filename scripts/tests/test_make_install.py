@@ -27,7 +27,7 @@ class MakeInstallTests(unittest.TestCase):
         self.repo = (self.tmp / "checkout").resolve()
         (self.repo / "scripts").mkdir(parents=True)
         shutil.copy(ROOT / "Makefile", self.repo / "Makefile")
-        for name in ("check-install-artifact.sh", "vmm-build-features.sh"):
+        for name in ("check-install-artifact.sh", "vmm-build-features.sh", "build-vmm.py"):
             shutil.copy(ROOT / "scripts" / name, self.repo / "scripts")
         agent = self.repo / "vmm/guest/agent"
         agent.mkdir(parents=True)
@@ -109,6 +109,34 @@ class MakeInstallTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         for path in ("usr/bin/vmm", "usr/bin/taritd", "usr/libexec/tarit/vmm-agent"):
             self.assertTrue((dest / path).is_file(), path)
+
+    def test_overlapping_redirected_builds_publish_the_reported_artifact(self):
+        fake = self.tmp / "cargo"
+        fake.write_text("""#!/usr/bin/env python3
+import json, pathlib, sys
+args = sys.argv[1:]
+features = args[args.index("--features")+1].split(",") if "--features" in args else []
+target = pathlib.Path(args[args.index("--target-dir")+1])
+exe = target / "triple/release/vmm"
+exe.parent.mkdir(parents=True, exist_ok=True)
+exe.write_text(",".join(features) or "host")
+exe.chmod(0o755)
+exe.with_suffix(".d").write_text(f"{exe}: {pathlib.Path.cwd()}/vmm/src/main.rs")
+print(json.dumps(dict(reason="compiler-artifact", target=dict(name="vmm",kind=["bin"]),
+    executable=str(exe), features=features)))
+""")
+        fake.chmod(0o755)
+        env = dict(os.environ, CARGO_TARGET_DIR=str(self.tmp / "redirected"))
+        builds = [subprocess.Popen(["make", "-s", "-o", "agent", "vmm", f"CARGO={fake}", f"VMM_FEATURES={f}"],
+                                   cwd=self.repo, env=env) for f in ["boot", ""]]
+        self.assertEqual([p.wait() for p in builds], [0, 0])
+        current = (self.repo / "vmm/target/release/vmm").read_text()
+        features = "" if current == "host" else "boot"
+        result, dest = self.make("install-vmm", features)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((dest / "usr/bin/vmm").read_text(), current)
+        wrong, _ = self.make("install-vmm", "boot" if not features else "")
+        self.assertNotEqual(wrong.returncode, 0)
 
     def test_refuses_a_host_only_build_when_boot_is_expected(self):
         self.record_features("")

@@ -16,6 +16,18 @@ components:
       name: X-API-Key
       description: API key mapped by taritd to a tenant and role (admin or user).
   schemas:
+    HealthStatus:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok, unhealthy]
+        checks:
+          type: object
+          description: Named checks when provided. Servers running v0.1.0 return only status.
+          additionalProperties:
+            type: string
     ProbeStatus:
       type: object
       required: [status, checks]
@@ -680,13 +692,13 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ProbeStatus"
+                $ref: "#/components/schemas/HealthStatus"
         "503":
           description: One or more checks failed
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ProbeStatus"
+                $ref: "#/components/schemas/HealthStatus"
   /livez:
     get:
       operationId: getLiveness

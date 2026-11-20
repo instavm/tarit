@@ -30,6 +30,9 @@ from .get_cluster_response_200 import GetClusterResponse200
 from .get_cluster_response_200_nodes_item import GetClusterResponse200NodesItem
 from .get_vm_status_response_200 import GetVmStatusResponse200
 from .get_vm_status_response_200_state import GetVmStatusResponse200State
+from .health_status import HealthStatus
+from .health_status_checks import HealthStatusChecks
+from .health_status_status import HealthStatusStatus
 from .list_pty_sessions_response_200 import ListPtySessionsResponse200
 from .list_ssh_keys_response_200 import ListSshKeysResponse200
 from .patch_vm_egress_policy_body import PatchVmEgressPolicyBody
@@ -99,6 +102,9 @@ __all__ = (
     "GetClusterResponse200NodesItem",
     "GetVmStatusResponse200",
     "GetVmStatusResponse200State",
+    "HealthStatus",
+    "HealthStatusChecks",
+    "HealthStatusStatus",
     "ListPtySessionsResponse200",
     "ListSshKeysResponse200",
     "PatchVmEgressPolicyBody",

@@ -5,6 +5,8 @@ import json
 import math
 import ssl
 import time
+import threading
+from concurrent.futures import Future, wait
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Self, TypeVar
@@ -33,6 +35,9 @@ from .types import Response
 
 T = TypeVar("T")
 RETRYABLE_STATUS = {429, 502, 503, 504}
+# A custom sync transport or DNS resolver can outlive the caller's deadline.
+# Bound outstanding cleanup workers across clients, including timed-out calls.
+_CLEANUP_SLOTS = threading.BoundedSemaphore(16)
 TERMINAL_EXECUTION_STATUS = {"completed", "failed"}
 
 
@@ -104,6 +109,16 @@ def _parsed(response: Response[object], expected: type[T], operation: str) -> T:
         status_code=int(response.status_code),
         message=_error_message(response.content),
     )
+
+
+def _fork_result(client: AuthenticatedClient, response: httpx.Response, child_id: UUID) -> ForkVmResponse:
+    try:
+        return _parsed(fork_vm_api._build_response(client=client, response=response), ForkVmResponse, "fork VM")
+    except (ValueError, KeyError, TypeError, AttributeError, OverflowError) as error:
+        # Existing callers can still catch the decoder's original exception.
+        error.child_id = child_id
+        error.add_note(f"Fork may have completed as child {child_id}")
+        raise
 
 
 def _retry_delay(attempt: int) -> float:
@@ -366,17 +381,42 @@ class TaritClient:
 
     def delete_pty_session(self, vm_id: UUID, pty_id: UUID, *, deadline_seconds: float = 5.0) -> None:
         """Delete a PTY lease; a lease that is already gone is not an error."""
-        response = self._request(
-            _deadline(deadline_seconds),
-            f"delete PTY session {pty_id}",
-            **delete_pty_session_api._get_kwargs(vm_id, pty_id),
-        )
-        if int(response.status_code) not in {204, 404}:
-            raise TaritApiError(
-                operation="delete PTY session",
-                status_code=int(response.status_code),
-                message=_error_message(response.content),
-            )
+        deadline = _deadline(deadline_seconds)
+        operation = f"delete PTY session {pty_id}"
+        client = self.raw.get_httpx_client()
+        result: Future[None] = Future()
+
+        def delete() -> None:
+            try:
+                timeout = _request_timeout(client.timeout, _remaining(deadline, operation))
+                with client.stream(**delete_pty_session_api._get_kwargs(vm_id, pty_id), timeout=timeout) as response:
+                    _remaining(deadline, operation)
+                    if response.status_code not in {204, 404}:
+                        body = bytearray()
+                        for chunk in response.iter_bytes():
+                            _remaining(deadline, operation)
+                            body.extend(chunk[:1024 - len(body)])
+                            if len(body) == 1024:
+                                break
+                        raise TaritApiError("delete PTY session", response.status_code, _error_message(bytes(body)))
+                result.set_result(None)
+            except BaseException as error:
+                result.set_exception(error)
+            finally:
+                _CLEANUP_SLOTS.release()
+
+        if not _CLEANUP_SLOTS.acquire(timeout=_remaining(deadline, operation)):
+            raise TaritDeadlineExceeded(f"{operation} exceeded its deadline")
+        try:
+            threading.Thread(target=delete, name="tarit-pty-cleanup", daemon=True).start()
+        except BaseException:
+            _CLEANUP_SLOTS.release()
+            raise
+        done, _ = wait([result], timeout=_remaining(deadline, operation))
+        if not done:
+            raise TaritDeadlineExceeded(f"{operation} exceeded its deadline")
+        _remaining(deadline, operation)
+        result.result()
 
     def open_pty(
         self,
@@ -445,6 +485,7 @@ class TaritClient:
         *,
         child_id: UUID | None = None,
         deadline_seconds: float = 30.0,
+        accept_late_response: bool = False,
     ) -> ForkVmResponse:
         """Fork with one retry id, also exposed on TaritDeadlineExceeded.child_id."""
         deadline = _deadline(deadline_seconds)
@@ -457,16 +498,16 @@ class TaritClient:
                     response = self._request(
                         deadline,
                         operation,
-                        check_response_deadline=False,
+                        check_response_deadline=not accept_late_response,
                         **fork_vm_api._get_kwargs(vm_id, body=ForkVmRequest(id=child_id)),
                     )
                 except httpx.TransportError:
                     response = None
                 if response is not None and response.status_code not in RETRYABLE_STATUS:
-                    # A complete success or rejection is definitive even if received late.
-                    return _parsed(
-                        fork_vm_api._build_response(client=self.raw, response=response), ForkVmResponse, "fork VM"
-                    )
+                    result = _fork_result(self.raw, response, child_id)
+                    if not accept_late_response:
+                        _remaining(deadline, operation)
+                    return result
                 time.sleep(min(_retry_delay(attempt), _remaining(deadline, operation)))
                 attempt += 1
         except TaritDeadlineExceeded as error:
@@ -672,6 +713,7 @@ class AsyncTaritClient:
         *,
         child_id: UUID | None = None,
         deadline_seconds: float = 30.0,
+        accept_late_response: bool = False,
     ) -> ForkVmResponse:
         deadline = _deadline(deadline_seconds)
         child_id = child_id or uuid4()
@@ -683,16 +725,16 @@ class AsyncTaritClient:
                     response = await self._request(
                         deadline,
                         operation,
-                        check_response_deadline=False,
+                        check_response_deadline=not accept_late_response,
                         **fork_vm_api._get_kwargs(vm_id, body=ForkVmRequest(id=child_id)),
                     )
                 except httpx.TransportError:
                     response = None
                 if response is not None and response.status_code not in RETRYABLE_STATUS:
-                    # A complete success or rejection is definitive even if received late.
-                    return _parsed(
-                        fork_vm_api._build_response(client=self.raw, response=response), ForkVmResponse, "fork VM"
-                    )
+                    result = _fork_result(self.raw, response, child_id)
+                    if not accept_late_response:
+                        _remaining(deadline, operation)
+                    return result
                 await asyncio.sleep(min(_retry_delay(attempt), _remaining(deadline, operation)))
                 attempt += 1
         except TaritDeadlineExceeded as error:

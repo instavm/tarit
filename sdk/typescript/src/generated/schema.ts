@@ -908,6 +908,14 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        HealthStatus: {
+            /** @enum {string} */
+            status: "ok" | "unhealthy";
+            /** @description Named checks when provided. Servers running v0.1.0 return only status. */
+            checks?: {
+                [key: string]: string;
+            };
+        };
         ProbeStatus: {
             /** @enum {string} */
             status: "ok" | "unhealthy";
@@ -1355,7 +1363,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ProbeStatus"];
+                    "application/json": components["schemas"]["HealthStatus"];
                 };
             };
             /** @description One or more checks failed */
@@ -1364,7 +1372,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ProbeStatus"];
+                    "application/json": components["schemas"]["HealthStatus"];
                 };
             };
         };
