@@ -13,7 +13,7 @@
 use std::time::Duration;
 use tokio::sync::watch;
 
-use chrono::{DateTime, Utc};
+use tarit_types::Timestamp;
 use uuid::Uuid;
 
 use tarit_fleet::PostgresFleet;
@@ -66,7 +66,7 @@ fn meter_runtime_once(state: &AppState) {
             .collect(),
         Err(_) => return,
     };
-    meter_runtime_snapshot(state, alive, Utc::now());
+    meter_runtime_snapshot(state, alive, Timestamp::now());
 }
 
 // A UUID can be reused once its old durable row is pruned. Revalidate the
@@ -79,7 +79,7 @@ fn same_billing_incarnation(captured: &VmRecord, current: &VmRecord) -> bool {
         && captured.api_key_id == current.api_key_id
 }
 
-fn meter_runtime_snapshot(state: &AppState, alive: Vec<VmRecord>, now: DateTime<Utc>) {
+fn meter_runtime_snapshot(state: &AppState, alive: Vec<VmRecord>, now: Timestamp) {
     if alive.is_empty() {
         return;
     }
@@ -144,7 +144,7 @@ fn meter_runtime_snapshot(state: &AppState, alive: Vec<VmRecord>, now: DateTime<
         let Ok(Some(start)) = store.get_billing_watermark(vm_id) else {
             continue;
         };
-        let seconds = (now - start).num_milliseconds() as f64 / 1000.0;
+        let seconds = (now - start).whole_milliseconds() as f64 / 1000.0;
         if seconds <= 0.0 {
             continue;
         }
@@ -157,13 +157,13 @@ fn meter_runtime_snapshot(state: &AppState, alive: Vec<VmRecord>, now: DateTime<
 /// Called after successful teardown; failures keep the interval open for retry.
 #[cfg(test)]
 pub fn meter_vm_final(state: &AppState, vm_id: Uuid) -> Result<(), tarit_types::OrchError> {
-    meter_vm_final_at(state, vm_id, Utc::now())
+    meter_vm_final_at(state, vm_id, Timestamp::now())
 }
 
 pub(crate) fn meter_vm_final_at(
     state: &AppState,
     vm_id: Uuid,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<(), tarit_types::OrchError> {
     use tarit_types::OrchError;
     let vm = state
@@ -229,7 +229,7 @@ pub fn meter_exec(
     vm_id: Uuid,
     duration_ms: u64,
 ) {
-    let now = Utc::now();
+    let now = Timestamp::now();
     let event = UsageEvent {
         id: Uuid::new_v4(),
         api_key_id: api_key_id.to_string(),
@@ -261,8 +261,8 @@ fn runtime_event(
     vm_id: Uuid,
     api_key_id: String,
     owner_key: String,
-    start: DateTime<Utc>,
-    end: DateTime<Utc>,
+    start: Timestamp,
+    end: Timestamp,
 ) -> UsageEvent {
     UsageEvent {
         id: Uuid::new_v4(),
@@ -271,11 +271,11 @@ fn runtime_event(
         host_id: state.config.host_id.clone(),
         vm_id,
         kind: UsageKind::VmRuntime,
-        seconds: Some((end - start).num_milliseconds() as f64 / 1000.0),
+        seconds: Some((end - start).whole_milliseconds() as f64 / 1000.0),
         duration_ms: None,
         window_start: start,
         window_end: end,
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
     }
 }
 
@@ -327,12 +327,14 @@ fn prune_outbox(state: &AppState, has_fleet: bool, local_retention_days: u64) {
         return;
     };
     let result = if has_fleet {
-        store.prune_sent_outbox(Utc::now() - chrono::Duration::days(1))
+        store.prune_sent_outbox(Timestamp::now() - time::SignedDuration::days(1))
     } else if local_retention_days > 0 {
         let days = i64::try_from(local_retention_days).unwrap_or(i64::MAX);
-        let cutoff = chrono::Duration::try_days(days)
-            .and_then(|age| Utc::now().checked_sub_signed(age))
-            .unwrap_or(DateTime::<Utc>::MIN_UTC);
+        let cutoff = days
+            .checked_mul(86_400)
+            .map(time::SignedDuration::seconds)
+            .and_then(|age| Timestamp::now().checked_sub(age))
+            .unwrap_or(Timestamp::MIN);
         store.prune_local_outbox(cutoff)
     } else {
         Ok(())
@@ -350,21 +352,23 @@ const EXECUTION_PRUNE_BATCH: usize = 2_000;
 /// and commands are not held off the store behind one large delete.
 pub(crate) fn execution_retention_cutoff(
     retention_hours: u64,
-    now: DateTime<Utc>,
-) -> Option<DateTime<Utc>> {
+    now: Timestamp,
+) -> Option<Timestamp> {
     if retention_hours == 0 {
         return None;
     }
     let hours = i64::try_from(retention_hours).unwrap_or(i64::MAX);
     Some(
-        chrono::Duration::try_hours(hours)
-            .and_then(|age| now.checked_sub_signed(age))
-            .unwrap_or(DateTime::<Utc>::MIN_UTC),
+        hours
+            .checked_mul(3_600)
+            .map(time::SignedDuration::seconds)
+            .and_then(|age| now.checked_sub(age))
+            .unwrap_or(Timestamp::MIN),
     )
 }
 
 pub(crate) async fn prune_executions(state: &AppState, retention_hours: u64) {
-    let Some(cutoff) = execution_retention_cutoff(retention_hours, Utc::now()) else {
+    let Some(cutoff) = execution_retention_cutoff(retention_hours, Timestamp::now()) else {
         return;
     };
     // Independently prune both durable stores. A failed fleet pass must not
@@ -421,13 +425,13 @@ pub(crate) async fn prune_executions(state: &AppState, retention_hours: u64) {
 /// Whether a cached record is a deleted VM old enough to leave the cache.
 pub(crate) fn stopped_vm_is_evictable(
     vm: &tarit_types::VmRecord,
-    now: DateTime<Utc>,
+    now: Timestamp,
     grace: Duration,
 ) -> bool {
     vm.status == VmStatus::Stopped
-        && chrono::Duration::from_std(grace)
+        && time::SignedDuration::try_from(grace)
             .ok()
-            .and_then(|grace| now.checked_sub_signed(grace))
+            .and_then(|grace| now.checked_sub(grace))
             .is_some_and(|cutoff| vm.updated_at < cutoff)
 }
 
@@ -436,7 +440,7 @@ pub(crate) fn stopped_vm_is_evictable(
 /// is stopped, so without this the cache (and every scan of it) grew with
 /// every VM ever deleted. Durable rows are pruned separately.
 pub(crate) fn evict_stopped_vms_from_cache(state: &AppState, grace: Duration) -> usize {
-    let now = Utc::now();
+    let now = Timestamp::now();
     let candidates = match state.vm_cache.read() {
         Ok(cache) => cache
             .values()
@@ -491,9 +495,11 @@ async fn prune_stopped_vms(state: &AppState, retention_hours: u64) {
         return;
     }
     let hours = i64::try_from(retention_hours).unwrap_or(i64::MAX);
-    let cutoff = chrono::Duration::try_hours(hours)
-        .and_then(|age| Utc::now().checked_sub_signed(age))
-        .unwrap_or(DateTime::<Utc>::MIN_UTC);
+    let cutoff = hours
+        .checked_mul(3_600)
+        .map(time::SignedDuration::seconds)
+        .and_then(|age| Timestamp::now().checked_sub(age))
+        .unwrap_or(Timestamp::MIN);
     let mut vms = 0usize;
     let mut forks = 0usize;
     for prune_forks in [false, true] {
@@ -611,7 +617,7 @@ mod tests {
             .is_empty());
 
         let running = owned_vm(&state, VmStatus::Running);
-        let start = Utc::now() - chrono::Duration::seconds(10);
+        let start = Timestamp::now() - time::SignedDuration::seconds(10);
         state
             .store
             .lock()
@@ -651,7 +657,7 @@ mod tests {
             // Capture exactly what a tick obtains before it waits for the store.
             let stale = state.vm_cache.read().unwrap()[&id].clone();
             let mut replacement = stale.clone();
-            replacement.created_at += chrono::Duration::seconds(1);
+            replacement.created_at += time::SignedDuration::seconds(1);
             replacement.updated_at = replacement.created_at;
             replacement.revision = 1;
             if !same_tenant {
@@ -659,7 +665,7 @@ mod tests {
                 replacement.api_key_id = Some("replacement-key".into());
             }
             let start = replacement.created_at;
-            let end = start + chrono::Duration::seconds(10);
+            let end = start + time::SignedDuration::seconds(10);
             {
                 let store = state.store.lock().unwrap();
                 // The old interval has already been settled before retention
@@ -705,7 +711,7 @@ mod tests {
     fn confirmed_death_closes_usage_while_cleanup_leaves_status_running() {
         let state = test_state();
         let id = owned_vm(&state, VmStatus::Running);
-        let start = Utc::now() - chrono::Duration::hours(1);
+        let start = Timestamp::now() - time::SignedDuration::hours(1);
         state
             .store
             .lock()
@@ -716,7 +722,7 @@ mod tests {
         let end = state.supervisor.runtime_stopped_at(id).unwrap().unwrap();
         meter_runtime_once(&state);
         meter_runtime_once(&state);
-        meter_vm_final_at(&state, id, end + chrono::Duration::hours(8)).unwrap();
+        meter_vm_final_at(&state, id, end + time::SignedDuration::hours(8)).unwrap();
         let store = state.store.lock().unwrap();
         let events = store.list_unsent_usage(10).unwrap();
         assert_eq!(events.len(), 1);
@@ -733,8 +739,8 @@ mod tests {
     fn runtime_final_retry_keeps_teardown_end_and_meter_cannot_extend_it() {
         let state = test_state();
         let id = owned_vm(&state, VmStatus::Running);
-        let start = Utc::now() - chrono::Duration::seconds(20);
-        let stopped_at = start + chrono::Duration::seconds(10);
+        let start = Timestamp::now() - time::SignedDuration::seconds(20);
+        let stopped_at = start + time::SignedDuration::seconds(10);
         {
             let store = state.store.lock().unwrap();
             store.set_billing_watermark(id, start).unwrap();
@@ -749,7 +755,7 @@ mod tests {
             .list_unsent_usage(100)
             .unwrap()
             .is_empty());
-        meter_vm_final_at(&state, id, stopped_at + chrono::Duration::hours(8)).unwrap();
+        meter_vm_final_at(&state, id, stopped_at + time::SignedDuration::hours(8)).unwrap();
         let events = state.store.lock().unwrap().list_unsent_usage(100).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].window_end, stopped_at);
@@ -760,14 +766,19 @@ mod tests {
     fn runtime_hibernate_wake_bills_only_live_intervals() {
         let state = test_state();
         let id = owned_vm(&state, VmStatus::Running);
-        let first_start = Utc::now() - chrono::Duration::seconds(20);
+        let first_start = Timestamp::now() - time::SignedDuration::seconds(20);
         state
             .store
             .lock()
             .unwrap()
             .set_billing_watermark(id, first_start)
             .unwrap();
-        meter_vm_final_at(&state, id, Utc::now() - chrono::Duration::seconds(10)).unwrap();
+        meter_vm_final_at(
+            &state,
+            id,
+            Timestamp::now() - time::SignedDuration::seconds(10),
+        )
+        .unwrap();
         let mut vm = state.store.lock().unwrap().get_vm(id).unwrap();
         vm.api_key_id = Some("key".into());
         vm.status = VmStatus::Hibernated;
@@ -786,7 +797,7 @@ mod tests {
             .is_none());
         vm.status = VmStatus::Running;
         vm.revision += 1;
-        vm.updated_at = Utc::now() - chrono::Duration::seconds(2);
+        vm.updated_at = Timestamp::now() - time::SignedDuration::seconds(2);
         let wake_start = vm.updated_at;
         state.store.lock().unwrap().insert_vm(&vm).unwrap();
         // Retry publication must not reset an already advanced watermark.

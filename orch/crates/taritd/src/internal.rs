@@ -16,7 +16,6 @@ use axum::{
     Json, Router,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use chrono::Utc;
 use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -29,6 +28,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tarit_store::HostRecord;
+use tarit_types::Timestamp;
 use tarit_types::{
     ArtifactReplicaStatus, ArtifactStatus, CreateVmRequest, EgressPolicyRecord,
     EgressUpdateRequest, PeerSnapshotResponse, PutEgressPolicyRequest, VmRecord,
@@ -537,7 +537,7 @@ async fn verify_peer_request(
     }
     let issued_at = single_header(headers, "X-Tarit-Peer-Timestamp")
         .and_then(|value| value.parse::<i64>().ok())?;
-    if Utc::now().timestamp().abs_diff(issued_at) > MAX_PEER_IDENTITY_AGE_SECS {
+    if Timestamp::now().unix_timestamp().abs_diff(issued_at) > MAX_PEER_IDENTITY_AGE_SECS {
         return None;
     }
     let nonce = single_header(headers, "X-Tarit-Peer-Nonce")
@@ -636,7 +636,7 @@ fn current_peer_source(
     source: &str,
     session: Uuid,
     peer_certificate_sha256: &str,
-    now: chrono::DateTime<Utc>,
+    now: tarit_types::Timestamp,
 ) -> bool {
     host.peer_certificate_sha256.as_deref() == Some(peer_certificate_sha256)
         && current_peer_source_session(host, source, session, now)
@@ -646,7 +646,7 @@ fn current_peer_source_session(
     host: &HostRecord,
     source: &str,
     session: Uuid,
-    now: chrono::DateTime<Utc>,
+    now: tarit_types::Timestamp,
 ) -> bool {
     host.host_id == source
         && host.boot_session_id == Some(session)
@@ -754,7 +754,7 @@ fn peer_identity_from_headers(
     let api_key_id = single_header(headers, "X-Tarit-Api-Key-Id")?;
     let issued_at = single_header(headers, "X-Tarit-Identity-Timestamp")
         .and_then(|value| value.parse::<i64>().ok())?;
-    if Utc::now().timestamp().abs_diff(issued_at) > MAX_PEER_IDENTITY_AGE_SECS {
+    if Timestamp::now().unix_timestamp().abs_diff(issued_at) > MAX_PEER_IDENTITY_AGE_SECS {
         return None;
     }
     let nonce = single_header(headers, "X-Tarit-Identity-Nonce")
@@ -1205,7 +1205,7 @@ async fn internal_put_egress_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
+    use tarit_types::Timestamp;
     use tarit_types::VmStatus;
 
     #[test]
@@ -1257,7 +1257,7 @@ mod tests {
     ) -> Request<Body> {
         let path = "/internal/v1/vms/00000000-0000-0000-0000-000000000000";
         let payload_hash = URL_SAFE_NO_PAD.encode(Sha256::digest(b""));
-        let timestamp = Utc::now().timestamp().to_string();
+        let timestamp = Timestamp::now().unix_timestamp().to_string();
         let session = session.to_string();
         let target_session = state.config.host_session_id.to_string();
         let nonce = nonce.to_string();
@@ -1420,7 +1420,7 @@ mod tests {
         tamper: bool,
     ) -> Request<Body> {
         let source = Uuid::new_v4().to_string();
-        let timestamp = Utc::now().timestamp().to_string();
+        let timestamp = Timestamp::now().unix_timestamp().to_string();
         let identity_nonce = Uuid::new_v4().to_string();
         let nonce = Uuid::new_v4().to_string();
         let source_session = Uuid::new_v4().to_string();
@@ -1749,8 +1749,8 @@ mod tests {
             runtime_layout: None,
             socket_path: Some("/run/taritd/vm.sock".into()),
             pid: Some(42),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: Timestamp::now(),
+            updated_at: Timestamp::now(),
         }
     }
 
@@ -1775,7 +1775,7 @@ mod tests {
 
     #[test]
     fn peer_source_session_must_match_the_current_healthy_heartbeat() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let session = Uuid::new_v4();
         let mut host = HostRecord {
             host_id: "node-a".into(),
@@ -1818,7 +1818,7 @@ mod tests {
             now
         ));
         host.healthy = true;
-        host.last_heartbeat = now - chrono::Duration::seconds(16);
+        host.last_heartbeat = now - time::SignedDuration::seconds(16);
         assert!(!current_peer_source(
             &host,
             "node-a",
@@ -1826,7 +1826,7 @@ mod tests {
             "certificate-a",
             now
         ));
-        host.last_heartbeat = now + chrono::Duration::seconds(6);
+        host.last_heartbeat = now + time::SignedDuration::seconds(6);
         assert!(!current_peer_source(
             &host,
             "node-a",

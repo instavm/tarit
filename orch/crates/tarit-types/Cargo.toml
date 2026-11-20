@@ -4,9 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+postgres = ["dep:bytes", "dep:postgres-types"]
+
 [dependencies]
+bytes = { workspace = true, optional = true }
+postgres-types = { workspace = true, optional = true }
+time.workspace = true
 base64 = { workspace = true }
-chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

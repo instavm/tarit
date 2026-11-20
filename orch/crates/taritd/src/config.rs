@@ -1,6 +1,5 @@
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use chrono::Utc;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -10,6 +9,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
+use tarit_types::Timestamp;
 use uuid::Uuid;
 
 /// One warm-pool VM class: a (vcpus, memory) shape kept pre-booted and ready.
@@ -1320,10 +1320,10 @@ fn parse_positive_share_setting(name: &str, raw: Option<&str>, default: u64) -> 
 fn validate_share_token_ttl(ttl_secs: u64) -> Result<()> {
     let ttl = i64::try_from(ttl_secs)
         .context("TARIT_SHARE_TOKEN_TTL_SECS must fit token timestamp arithmetic")?;
-    let expiry = Utc::now()
-        .timestamp()
+    let expiry = Timestamp::now()
+        .unix_timestamp()
         .checked_add(ttl)
-        .and_then(|timestamp| chrono::DateTime::from_timestamp(timestamp, 0));
+        .and_then(|timestamp| Timestamp::from_timestamp(timestamp, 0));
     if expiry.is_none() {
         bail!("TARIT_SHARE_TOKEN_TTL_SECS must fit token timestamp arithmetic");
     }

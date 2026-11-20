@@ -6,10 +6,10 @@ license.workspace = true
 description = "Global fleet store sync via Postgres (tokio-postgres, MIT/Apache-2.0)"
 
 [dependencies]
-chrono.workspace = true
+time.workspace = true
 deadpool-postgres = { workspace = true }
 tarit-store = { path = "../tarit-store" }
-tarit-types = { path = "../tarit-types" }
+tarit-types = { path = "../tarit-types", features = ["postgres"] }
 serde = { workspace = true }
 serde_json.workspace = true
 thiserror.workspace = true

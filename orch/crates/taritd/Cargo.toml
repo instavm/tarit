@@ -13,10 +13,10 @@ name = "taritd"
 path = "src/main.rs"
 
 [dependencies]
+time.workspace = true
 anyhow = { workspace = true }
 axum = { workspace = true }
 base64 = { workspace = true }
-chrono = { workspace = true }
 clap = { version = "4", features = ["derive", "env"] }
 crossterm = "0.28"
 futures-util = { workspace = true }

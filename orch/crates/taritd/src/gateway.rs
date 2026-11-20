@@ -857,12 +857,12 @@ mod tests {
     use crate::pty::PtyRegistry;
     use crate::scheduler::Scheduler;
     use crate::supervisor::VmmSupervisor;
-    use chrono::Utc;
     use russh::keys::{EcdsaCurve, HashAlg};
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::{Mutex, RwLock};
     use tarit_store::Store;
+    use tarit_types::Timestamp;
 
     #[tokio::test]
     async fn transient_accept_failures_back_off_then_accept_a_real_connection() {
@@ -942,7 +942,7 @@ mod tests {
                     fingerprint: public_key_fingerprint_sha256(auth_key.public_key()).unwrap(),
                     public_key: auth_key.public_key().to_openssh().unwrap(),
                     key_type: "ssh-ed25519".into(),
-                    created_at: Utc::now(),
+                    created_at: Timestamp::now(),
                     is_active: true,
                 })
                 .unwrap();
@@ -1057,7 +1057,7 @@ mod tests {
                 fingerprint,
                 public_key: ED25519_KEY.into(),
                 key_type: "ssh-ed25519".into(),
-                created_at: Utc::now(),
+                created_at: Timestamp::now(),
                 is_active: true,
             })
             .unwrap();
@@ -1086,7 +1086,7 @@ mod tests {
     }
 
     fn insert_vm_record(state: &AppState, id: Uuid, tenant: &str) {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let record = VmRecord {
             id,
             host_id: state.config.host_id.clone(),
@@ -1265,7 +1265,7 @@ mod tests {
                 fingerprint: ED25519_FINGERPRINT.into(),
                 public_key: ED25519_KEY.into(),
                 key_type: "ssh-ed25519".into(),
-                created_at: Utc::now(),
+                created_at: Timestamp::now(),
                 is_active: true,
             })
             .unwrap();
@@ -1288,7 +1288,7 @@ mod tests {
                 fingerprint: ED25519_FINGERPRINT.into(),
                 public_key: ED25519_KEY.into(),
                 key_type: "ssh-ed25519".into(),
-                created_at: Utc::now() + chrono::Duration::seconds(1),
+                created_at: Timestamp::now() + time::SignedDuration::seconds(1),
                 is_active: true,
             })
             .unwrap();

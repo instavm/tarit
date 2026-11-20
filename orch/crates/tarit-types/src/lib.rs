@@ -1,7 +1,9 @@
 //! Shared types for the taritd host orchestrator.
 
+mod timestamp;
+pub use timestamp::Timestamp;
+
 use base64::{engine::general_purpose, Engine as _};
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -121,8 +123,8 @@ pub struct VmRecord {
     pub runtime_layout: Option<VmRuntimeLayout>,
     pub socket_path: Option<String>,
     pub pid: Option<u32>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 
 const fn default_vm_revision() -> u64 {
@@ -144,8 +146,8 @@ pub struct PublicVmRecord {
     pub startup_path: Option<VmStartupPath>,
     pub memory_mib: u64,
     pub vcpus: u8,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 
 impl From<&VmRecord> for PublicVmRecord {
@@ -314,9 +316,9 @@ pub struct ArtifactReplicaRecord {
     pub content_digest: String,
     pub size_bytes: u64,
     pub integrity_manifest_digest: String,
-    pub verified_at: Option<DateTime<Utc>>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub verified_at: Option<Timestamp>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 
 /// Durable metadata for an immutable, tenant-owned artifact.
@@ -352,8 +354,8 @@ pub struct ArtifactRecord {
     pub chunk_count: u64,
     pub replication_state: ArtifactReplicationState,
     pub reference_count: u64,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 
 /// Path-independent boot inputs authenticated by an artifact record. A peer
@@ -399,8 +401,8 @@ pub struct BranchRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_branch_id: Option<Uuid>,
     pub revision: u64,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -550,9 +552,9 @@ pub struct ForkOperationRecord {
     /// the same session remain fenced by the live reservation.
     pub target_boot_session_id: Option<Uuid>,
     pub status: ForkOperationStatus,
-    pub child_created_at: Option<DateTime<Utc>>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub child_created_at: Option<Timestamp>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 
 /// Whether a shared VM port is public or requires a valid private-share token.
@@ -578,9 +580,9 @@ pub struct ShareRecord {
     pub guest_port: u16,
     pub visibility: ShareVisibility,
     pub token_version: u64,
-    pub revoked_at: Option<DateTime<Utc>>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub revoked_at: Option<Timestamp>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 
 /// Request body for creating a shared VM port.
@@ -628,7 +630,7 @@ impl UpdateShareRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShareTokenResponse {
     pub token: String,
-    pub expires_at: DateTime<Utc>,
+    pub expires_at: Timestamp,
 }
 
 /// Persistent public SSH key record scoped to an API caller.
@@ -639,7 +641,7 @@ pub struct SshKeyRecord {
     pub fingerprint: String,
     pub public_key: String,
     pub key_type: String,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     pub is_active: bool,
 }
 
@@ -729,8 +731,8 @@ pub struct VolumeRecord {
     pub generation: u64,
     pub revision: u64,
     pub last_error: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -746,8 +748,8 @@ pub struct PublicVolumeRecord {
     pub zone: Option<String>,
     pub generation: u64,
     pub revision: u64,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 
 impl From<VolumeRecord> for PublicVolumeRecord {
@@ -820,7 +822,7 @@ pub struct VmVolumeAttachmentRecord {
     pub owner_key: String,
     pub mode: VolumeAttachmentMode,
     pub volume_generation: u64,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
 }
 
 fn default_local_block_provider() -> String {
@@ -924,7 +926,7 @@ pub struct ExecutionRecord {
     pub owner_key: Option<String>,
     /// Incarnation authorized when execution was submitted, independent of UUID reuse.
     #[serde(skip)]
-    pub vm_created_at: Option<DateTime<Utc>>,
+    pub vm_created_at: Option<Timestamp>,
     pub command: String,
     pub timeout_ms: u64,
     pub status: ExecutionStatus,
@@ -933,12 +935,12 @@ pub struct ExecutionRecord {
     pub stderr: Option<String>,
     pub duration_ms: Option<u64>,
     pub error: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 
 impl ExecutionRecord {
-    pub fn is_expired(&self, cutoff: DateTime<Utc>) -> bool {
+    pub fn is_expired(&self, cutoff: Timestamp) -> bool {
         self.updated_at < cutoff
             && matches!(
                 self.status,
@@ -990,9 +992,9 @@ pub struct UsageEvent {
     pub seconds: Option<f64>,
     /// Command duration for `Exec` events.
     pub duration_ms: Option<i64>,
-    pub window_start: DateTime<Utc>,
-    pub window_end: DateTime<Utc>,
-    pub created_at: DateTime<Utc>,
+    pub window_start: Timestamp,
+    pub window_end: Timestamp,
+    pub created_at: Timestamp,
 }
 
 /// Aggregated usage stats per API key over a time range.
@@ -1019,7 +1021,7 @@ pub struct AuditEvent {
     pub outcome: String,
     /// Small human/JSON detail string (no secrets).
     pub detail: Option<String>,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
 }
 
 /// Stable audit action verbs.
@@ -1125,8 +1127,8 @@ pub struct EgressPolicyRecord {
     pub revision: u64,
     pub allowlist: Vec<String>,
     pub allow_existing: bool,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1329,7 +1331,7 @@ mod tests {
 
     #[test]
     fn artifact_and_branch_json_hide_tenant_and_host_storage_identity() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let artifact = ArtifactRecord {
             artifact_id: Uuid::new_v4(),
             owner_key: "tenant-secret".into(),
@@ -1380,7 +1382,7 @@ mod tests {
 
     #[test]
     fn egress_policy_peer_response_omits_private_owner_and_still_decodes() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let policy = EgressPolicyRecord {
             vm_id: Uuid::new_v4(),
             owner_key: "tenant-secret".into(),
@@ -1499,7 +1501,7 @@ mod tests {
 
     #[test]
     fn public_vm_record_contains_no_host_runtime_details() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let internal = VmRecord {
             id: Uuid::new_v4(),
             host_id: "node-private".into(),
@@ -1537,7 +1539,7 @@ mod tests {
 
     #[test]
     fn public_volume_record_contains_no_tenant_host_or_provider_locator() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let public = PublicVolumeRecord::from(VolumeRecord {
             id: Uuid::new_v4(),
             owner_key: "tenant-secret".into(),
