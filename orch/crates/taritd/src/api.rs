@@ -135,6 +135,9 @@ pub(crate) enum LifecycleState {
     /// fences the observed state through fleet, SQLite and cache.
     Reconciling {
         record: VmRecord,
+        /// Only an explicit VMM Stopped state (not vcpu_alive=false) freezes
+        /// usage and owns teardown, even if its control socket later disappears.
+        stopped_at: Option<Timestamp>,
     },
     /// A legacy partial warm-registration rollback retained resources. Resources
     /// stay registered until DELETE/stop-all performs the normal terminal
@@ -182,7 +185,7 @@ impl LifecycleState {
             | Self::Publishing { record, .. }
             | Self::Running { record }
             | Self::Hibernating { record, .. }
-            | Self::Reconciling { record }
+            | Self::Reconciling { record, .. }
             | Self::Abandoned { record }
             | Self::Terminal { record, .. } => record,
         }

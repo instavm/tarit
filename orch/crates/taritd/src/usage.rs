@@ -97,10 +97,30 @@ fn meter_runtime_snapshot(state: &AppState, alive: Vec<VmRecord>, now: Timestamp
         let (Some(api_key_id), Some(owner_key)) = (vm.api_key_id, vm.owner_key) else {
             continue;
         };
-        // Process death ends usage even if teardown retains runtime resources
-        // for retry (nftables, journal or conntrack failure). The supervisor
-        // records this boundary before beginning any resource cleanup.
-        match state.supervisor.runtime_stopped_at(vm_id) {
+        // Read the cutoff under the store mutex, before extending usage.
+        // A confirmed guest stop and process death are different observations;
+        // use whichever came first. Unknown reconciliation must still meter.
+        let Ok((stopped, closed)) = state.lifecycle.lock().map(|lifecycle| {
+            let entry = lifecycle.get(&vm_id);
+            let stopped = match entry {
+                Some(LifecycleState::Reconciling { stopped_at, .. }) => *stopped_at,
+                _ => None,
+            };
+            let closed = matches!(
+                entry,
+                Some(
+                    LifecycleState::Terminal { .. }
+                        | LifecycleState::Hibernating {
+                            stopped_at: Some(_),
+                            ..
+                        }
+                )
+            );
+            (stopped, closed)
+        }) else {
+            continue;
+        };
+        match usage_stop_boundary(state, vm_id, stopped) {
             Ok(Some(end)) => {
                 let Ok(Some(start)) = store.get_billing_watermark(vm_id) else {
                     continue;
@@ -119,25 +139,6 @@ fn meter_runtime_snapshot(state: &AppState, alive: Vec<VmRecord>, now: Timestamp
             Err(_) => continue, // Unreadable boundary must never extend billing.
             Ok(None) => {}
         }
-        // Check under the store mutex, immediately before metering, so a
-        // stale cache scan cannot bill a stopped lifecycle if persisting its
-        // frozen end failed. Lifecycle writers release their mutex before I/O.
-        let closed = state
-            .lifecycle
-            .lock()
-            .map(|lifecycle| {
-                matches!(
-                    lifecycle.get(&vm_id),
-                    Some(
-                        LifecycleState::Terminal { .. }
-                            | LifecycleState::Hibernating {
-                                stopped_at: Some(_),
-                                ..
-                            }
-                    )
-                )
-            })
-            .unwrap_or(true);
         if closed || !matches!(store.get_billing_end(vm_id), Ok(None)) {
             continue;
         }
@@ -158,6 +159,21 @@ fn meter_runtime_snapshot(state: &AppState, alive: Vec<VmRecord>, now: Timestamp
 #[cfg(test)]
 pub fn meter_vm_final(state: &AppState, vm_id: Uuid) -> Result<(), tarit_types::OrchError> {
     meter_vm_final_at(state, vm_id, Timestamp::now())
+}
+
+fn usage_stop_boundary(
+    state: &AppState,
+    vm_id: Uuid,
+    confirmed_guest_stop: Option<Timestamp>,
+) -> Result<Option<Timestamp>, tarit_types::OrchError> {
+    match (
+        confirmed_guest_stop,
+        state.supervisor.runtime_stopped_at(vm_id),
+    ) {
+        (Some(guest), Ok(Some(process))) => Ok(Some(guest.min(process))),
+        (Some(guest), _) => Ok(Some(guest)),
+        (None, outcome) => outcome,
+    }
 }
 
 pub(crate) fn meter_vm_final_at(
@@ -193,7 +209,16 @@ pub(crate) fn meter_vm_final_at(
     if !same_billing_incarnation(&vm, &current) {
         return Ok(());
     }
-    let now = state.supervisor.runtime_stopped_at(vm_id)?.unwrap_or(now);
+    let confirmed_guest_stop = match state
+        .lifecycle
+        .lock()
+        .map_err(|_| OrchError::Internal("lifecycle lock poisoned".into()))?
+        .get(&vm_id)
+    {
+        Some(LifecycleState::Reconciling { stopped_at, .. }) => *stopped_at,
+        _ => None,
+    };
+    let now = usage_stop_boundary(state, vm_id, confirmed_guest_stop)?.unwrap_or(now);
     // Missing means never published live, or already finalized. In particular,
     // deleting an Error VM must not reconstruct its entire lifetime.
     let Some(start) = store

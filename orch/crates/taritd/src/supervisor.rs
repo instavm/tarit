@@ -49,10 +49,6 @@ const TEARDOWN_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 /// failed: doubles from the initial delay up to the cap.
 const WARM_CLEANUP_RETRY_INITIAL: Duration = Duration::from_secs(1);
 const WARM_CLEANUP_RETRY_MAX: Duration = Duration::from_secs(300);
-/// Failed teardowns after which a retiring warm VM gives back its capacity
-/// even though its VMM could not be confirmed dead (an operator is alerted).
-/// A VMM confirmed dead gives it back at its first failed teardown.
-const WARM_CLEANUP_ATTEMPTS_HOLDING_CAPACITY: u32 = 5;
 /// Upper bound for VMM ops that copy guest RAM (suspend, snapshot) or fault it
 /// back in (a suspend right after resume). These are silent on the socket for
 /// the whole copy, so they get a generous request deadline instead of the
@@ -2870,10 +2866,23 @@ impl ManagedProcess {
             }
             return Ok(());
         }
-        child
-            .wait()
-            .map(|_| ())
-            .map_err(|error| OrchError::Internal(format!("wait for VMM exit: {error}")))
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if child
+                .try_wait()
+                .map_err(|error| OrchError::Internal(format!("wait for VMM exit: {error}")))?
+                .is_some()
+            {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(OrchError::Internal(format!(
+                    "VMM {} did not exit after SIGKILL",
+                    child.id()
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// Terminate a re-adopted VMM through its pidfd. Signalling the pidfd targets
@@ -5353,11 +5362,9 @@ impl VmmSupervisor {
         Ok(true)
     }
 
-    /// Keep a warm VM whose teardown failed for a backed-off retry, without
-    /// holding its capacity forever: the reservation is given back as soon as
-    /// the VMM is confirmed dead, and after a bounded number of failures even
-    /// when it is not (with an operator alert for the leftover). The flag set
-    /// under the warm lock makes the release happen at most once.
+    /// Keep both cleanup ownership and capacity until the VMM is confirmed
+    /// dead. Once dead, release capacity even if a non-runtime cleanup step
+    /// failed. The flag set under the warm lock makes release happen once.
     fn record_failed_warm_cleanup(&self, id: Uuid, vm: &RunningVm, error: &OrchError) {
         let dead = vm.process.death_confirmed();
         let now = Instant::now();
@@ -5372,23 +5379,19 @@ impl VmmSupervisor {
                 retirement.failed_attempts = retirement.failed_attempts.saturating_add(1);
                 attempts = retirement.failed_attempts;
                 retirement.next_attempt_at = Some(now + warm_cleanup_retry_delay(attempts));
-                if !retirement.capacity_released
-                    && (dead || attempts >= WARM_CLEANUP_ATTEMPTS_HOLDING_CAPACITY)
-                {
+                if dead && !retirement.capacity_released {
                     retirement.capacity_released = true;
                     release = true;
                 }
             }
         }
-        if !release {
-            tracing::error!(vm = %id, pid = vm.pid, attempts, %error, "warm VM teardown incomplete; retaining it for retry");
-            return;
-        }
-        self.release_reservation_after_cleanup(id);
-        if dead {
+        if release {
+            self.release_reservation_after_cleanup(id);
             tracing::error!(vm = %id, pid = vm.pid, attempts, %error, "warm VMM is dead but its cleanup failed; capacity released, cleanup retained for retry");
+        } else if !dead {
+            tracing::error!(vm = %id, pid = vm.pid, attempts, %error, "warm VMM death could not be confirmed; keeping its capacity reserved; operator intervention may be required");
         } else {
-            tracing::error!(vm = %id, pid = vm.pid, attempts, %error, "warm VMM could not be confirmed dead after repeated cleanup failures; capacity released, operator must remove the leftover VMM");
+            tracing::error!(vm = %id, pid = vm.pid, attempts, %error, "warm VM teardown incomplete; retaining it for retry");
         }
     }
 
@@ -13675,12 +13678,10 @@ mod tests {
         }
     }
 
-    /// A warm VMM that cannot be confirmed dead keeps its capacity while its
-    /// cleanup is retried, but only for a bounded number of failures; then the
-    /// capacity is given back exactly once and the entry stays for retry.
+    /// Failed attempts do not establish that resources can be reused.
     #[cfg(target_os = "linux")]
     #[test]
-    fn unconfirmed_warm_vmm_gives_back_capacity_after_bounded_cleanup_failures() {
+    fn unconfirmed_warm_vmm_keeps_capacity_after_repeated_cleanup_failures() {
         let supervisor = test_supervisor();
         let spec = spawn_config(false, Some(PathBuf::from("/images/a.ext4")));
         let id = Uuid::new_v4();
@@ -13707,27 +13708,17 @@ mod tests {
             spec,
         });
         assert!(!supervisor.reclaim_idle_warm());
-        for attempt in 1..=WARM_CLEANUP_ATTEMPTS_HOLDING_CAPACITY + 1 {
+        for attempt in 1..=8 {
             if attempt > 1 {
                 supervisor.make_warm_cleanup_due_for_test(id);
                 supervisor.scan_for_exited_processes();
             }
             let retirement = supervisor.warm.lock().unwrap()[0].retirement;
             assert_eq!(retirement.failed_attempts, attempt);
-            let released = attempt >= WARM_CLEANUP_ATTEMPTS_HOLDING_CAPACITY;
-            assert_eq!(retirement.capacity_released, released, "attempt {attempt}");
-            assert_eq!(
-                supervisor.scheduler.is_reserved(id),
-                !released,
-                "attempt {attempt}"
-            );
-            // The capacity, once given back, is never given back twice.
-            if released {
-                supervisor.reserve_existing_for_test(Uuid::new_v4());
-            }
+            assert!(!retirement.capacity_released, "attempt {attempt}");
+            assert!(supervisor.scheduler.is_reserved(id), "attempt {attempt}");
         }
-        // Both new reservations above are still counted.
-        assert_eq!(supervisor.scheduler.usage().vm_count, 2);
+        assert_eq!(supervisor.scheduler.usage().vm_count, 1);
         supervisor.warm.lock().unwrap().clear();
     }
 

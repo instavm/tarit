@@ -140,16 +140,55 @@ fn control_status(status: tarit_vmm_client::VmState) -> Result<VmStatus, OrchErr
     }
 }
 
+async fn observe_vm_control_state(
+    state: &AppState,
+    id: Uuid,
+) -> Result<tarit_vmm_client::VmState, OrchError> {
+    let supervisor = Arc::clone(&state.supervisor);
+    tokio::task::spawn_blocking(move || supervisor.status_vm(id))
+        .await
+        .map_err(|error| OrchError::Internal(format!("status reconciliation join: {error}")))?
+        .map(|status| status.state)
+}
+
+fn retain_confirmed_guest_stop(
+    state: &AppState,
+    record: VmRecord,
+    stopped_at: Timestamp,
+) -> Result<(), OrchError> {
+    let id = record.id;
+    // Serialize the observation with periodic metering. Keep the in-memory
+    // fence even if persisting it fails so reconciliation can retry.
+    let store = state
+        .store
+        .lock()
+        .map_err(|_| OrchError::Internal("store lock poisoned".into()))?;
+    set_lifecycle_state(
+        state,
+        id,
+        LifecycleState::Reconciling {
+            record,
+            stopped_at: Some(stopped_at),
+        },
+    )?;
+    store
+        .freeze_billing_end(id, stopped_at)
+        .map_err(crate::api::store_err)?;
+    Ok(())
+}
+
 async fn observe_and_compensate_vm_status(
     state: &AppState,
     prior: &VmRecord,
-) -> Result<VmRecord, OrchError> {
-    let supervisor = Arc::clone(&state.supervisor);
-    let id = prior.id;
-    let observed = tokio::task::spawn_blocking(move || supervisor.status_vm(id))
+) -> Result<Option<VmRecord>, OrchError> {
+    let observed = observe_vm_control_state(state, prior.id).await?;
+    if observed == tarit_vmm_client::VmState::Stopped {
+        retain_confirmed_guest_stop(state, prior.clone(), Timestamp::now())?;
+        return Ok(None);
+    }
+    compensate_vm_status(state, prior, control_status(observed)?)
         .await
-        .map_err(|error| OrchError::Internal(format!("status reconciliation join: {error}")))??;
-    compensate_vm_status(state, prior, control_status(observed.state)?).await
+        .map(Some)
 }
 
 async fn reconcile_failed_live_operation(
@@ -157,14 +196,24 @@ async fn reconcile_failed_live_operation(
     prior: &VmRecord,
     primary: OrchError,
 ) -> OrchError {
-    if prior.status != VmStatus::Running {
+    if !matches!(
+        prior.status,
+        VmStatus::Running | VmStatus::Paused | VmStatus::Suspended
+    ) {
         return primary;
     }
-    let supervisor = Arc::clone(&state.supervisor);
-    let id = prior.id;
-    let observed = tokio::task::spawn_blocking(move || supervisor.status_vm(id)).await;
-    let observed = match observed {
-        Ok(Ok(status)) => match control_status(status.state) {
+    let observed = match observe_vm_control_state(state, prior.id).await {
+        Ok(tarit_vmm_client::VmState::Stopped) => {
+            return match retain_confirmed_guest_stop(state, prior.clone(), Timestamp::now()) {
+                Ok(()) => {
+                    OrchError::Internal(format!("{primary}; VMM stopped and teardown is pending"))
+                }
+                Err(error) => OrchError::Internal(format!(
+                    "{primary}; retaining stopped VMM for teardown failed: {error}"
+                )),
+            };
+        }
+        Ok(status) => match control_status(status) {
             Ok(status) => status,
             Err(error) => {
                 return retain_live_operation_reconciliation(
@@ -175,7 +224,7 @@ async fn reconcile_failed_live_operation(
                 );
             }
         },
-        Ok(Err(error)) => {
+        Err(error) => {
             return retain_live_operation_reconciliation(
                 state,
                 prior,
@@ -183,16 +232,8 @@ async fn reconcile_failed_live_operation(
                 format!("VMM state could not be observed: {error}"),
             );
         }
-        Err(error) => {
-            return retain_live_operation_reconciliation(
-                state,
-                prior,
-                primary,
-                format!("VMM status task failed: {error}"),
-            );
-        }
     };
-    if observed == VmStatus::Running {
+    if observed == prior.status {
         return primary;
     }
     match compensate_vm_status(state, prior, observed).await {
@@ -238,6 +279,7 @@ fn retain_live_operation_reconciliation(
         prior.id,
         LifecycleState::Reconciling {
             record: prior.clone(),
+            stopped_at: None,
         },
     )
     .err()
@@ -752,6 +794,9 @@ async fn finish_terminal_transition(state: &AppState, id: Uuid) -> Result<(), Or
                         .store
                         .lock()
                         .map_err(|_| OrchError::Internal("store lock poisoned".into()))?;
+                    store
+                        .delete_egress_policy(owner_key, id)
+                        .map_err(crate::api::store_err)?;
                     // A scale-to-zero VM has no supervisor runtime to clean,
                     // but its durable hibernation relation still owns the
                     // snapshot binding. Remove it as part of the retryable
@@ -1096,40 +1141,17 @@ async fn retry_pending_lifecycle(state: &AppState, terminal_gate_held: bool) -> 
                     Err(error) => Err(error),
                 }
             }
-            LifecycleState::Reconciling { .. } => {
-                let gate = match state.supervisor.operation_gate(id) {
-                    Ok(gate) => gate,
-                    Err(OrchError::NotFound(_))
-                        if !matches!(
-                            lifecycle_state(state, id),
-                            Ok(Some(LifecycleState::Reconciling { .. }))
-                        ) =>
-                    {
-                        continue;
-                    }
-                    Err(error) => {
-                        failures.push(format!(
-                            "VM {id} retained lifecycle state for retry: {error}"
-                        ));
-                        continue;
-                    }
+            // The shutdown sweep already holds the terminal gate and will
+            // contain every runtime. Freeze an observed stop first, without
+            // taking the operation gate in reverse order.
+            LifecycleState::Reconciling { stopped_at, .. } if terminal_gate_held => {
+                let Some(stopped_at) = stopped_at else {
+                    continue;
                 };
-                let _operation = gate.lock_owned().await;
-                let record = match lifecycle_state(state, id) {
-                    Ok(Some(LifecycleState::Reconciling { record })) => record,
-                    Ok(_) => continue,
-                    Err(error) => {
-                        failures.push(format!(
-                            "VM {id} retained lifecycle state for retry: {error}"
-                        ));
-                        continue;
-                    }
-                };
-                observe_and_compensate_vm_status(state, &record)
-                    .await
-                    .and_then(|record| {
-                        set_lifecycle_state(state, id, LifecycleState::Running { record })
-                    })
+                crate::usage::meter_vm_final_at(state, id, stopped_at)
+            }
+            LifecycleState::Reconciling { record, .. } => {
+                retry_live_reconciliation(state, &record).await
             }
             LifecycleState::Creating { .. }
             | LifecycleState::Running { .. }
@@ -1142,6 +1164,60 @@ async fn retry_pending_lifecycle(state: &AppState, terminal_gate_held: bool) -> 
         }
     }
     failures
+}
+
+async fn retry_live_reconciliation(state: &AppState, expected: &VmRecord) -> Result<(), OrchError> {
+    let id = expected.id;
+    // DELETE keeps this lease even after the supervisor withdraws the runtime.
+    // A busy VM will be revisited on the next sweep.
+    let Some(activation) = activation_gate(state, id)?.try_lock_owned() else {
+        return Ok(());
+    };
+    let operation = match state.supervisor.operation_gate(id) {
+        Ok(gate) => Some(gate.lock_owned().await),
+        Err(OrchError::NotFound(_)) => None,
+        Err(error) => return Err(error),
+    };
+    let Some(LifecycleState::Reconciling { record, stopped_at }) = lifecycle_state(state, id)?
+    else {
+        return Ok(());
+    };
+    if record.created_at != expected.created_at || record.pid != expected.pid {
+        return Ok(());
+    }
+    let stopped_at = match (stopped_at, &operation) {
+        (Some(stopped_at), _) => stopped_at,
+        (None, Some(_)) => {
+            if let Some(record) = observe_and_compensate_vm_status(state, &record).await? {
+                return set_lifecycle_state(state, id, LifecycleState::Running { record });
+            }
+            let Some(LifecycleState::Reconciling {
+                stopped_at: Some(stopped_at),
+                ..
+            }) = lifecycle_state(state, id)?
+            else {
+                return Err(OrchError::Internal(format!(
+                    "VM {id} lost its stop observation"
+                )));
+            };
+            stopped_at
+        }
+        (None, None) => {
+            return Err(OrchError::NotFound(format!(
+                "VM {id} has no runtime to observe"
+            )))
+        }
+    };
+
+    // Freeze the usage cutoff before the VMM process is killed. If the store
+    // is unavailable the confirmed-stop fence remains and the next sweep
+    // retries; it cannot fall back to "running" because the UDS vanished.
+    crate::usage::meter_vm_final_at(state, id, stopped_at)?;
+    let (_activation, _operation) = stop_under_vm_gates(state, id, activation, operation).await?;
+    state.pty_registry.close_vm_sessions(id);
+    let _terminal_gate = state.terminal_transition_gate.lock().await;
+    start_terminal_transition(state, id, VmStatus::Stopped, true)?;
+    finish_terminal_transition(state, id).await
 }
 
 fn creating_record(
@@ -2301,8 +2377,7 @@ pub async fn stop_local(state: &AppState, id: Uuid) -> Result<(), OrchError> {
         }
         return Ok(());
     }
-    let activation = activation_gate(state, id)?;
-    let _activation = activation.lock().await;
+    let activation = activation_gate(state, id)?.lock_owned().await;
     let operation_gate = match state.supervisor.operation_gate(id) {
         Ok(gate) => Some(gate),
         Err(OrchError::NotFound(_)) => None,
@@ -2335,18 +2410,14 @@ pub async fn stop_local(state: &AppState, id: Uuid) -> Result<(), OrchError> {
         match lifecycle_state(state, id)? {
             Some(LifecycleState::Terminal { .. }) => {
                 finish_terminal_transition(state, id).await?;
-                if let Some(owner) = policy_owner.as_deref() {
-                    state
-                        .store
-                        .lock()
-                        .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
-                        .delete_egress_policy(owner, id)
-                        .map_err(crate::api::store_err)?;
-                }
                 return Ok(());
             }
             Some(LifecycleState::Publishing { .. }) => finish_publication(state, id).await?,
             Some(LifecycleState::Hibernating { .. }) => finish_hibernation(state, id).await?,
+            Some(LifecycleState::Reconciling {
+                stopped_at: Some(stopped_at),
+                ..
+            }) => crate::usage::meter_vm_final_at(state, id, stopped_at)?,
             Some(
                 LifecycleState::Creating { .. }
                 | LifecycleState::Running { .. }
@@ -2371,23 +2442,32 @@ pub async fn stop_local(state: &AppState, id: Uuid) -> Result<(), OrchError> {
     // withdraws the runtime before signalling the VMM, so its exit is not
     // reported as unexpected.
     //
-    let sup = Arc::clone(&state.supervisor);
-    tokio::task::spawn_blocking(move || sup.stop_vm(id))
-        .await
-        .map_err(|e| OrchError::Internal(format!("join: {e}")))??;
+    let (_activation, _operation) = stop_under_vm_gates(state, id, activation, _operation).await?;
     state.pty_registry.close_vm_sessions(id);
     let _terminal_gate = state.terminal_transition_gate.lock().await;
     start_terminal_transition(state, id, VmStatus::Stopped, true)?;
     finish_terminal_transition(state, id).await?;
-    if let Some(owner) = policy_owner.as_deref() {
-        state
-            .store
-            .lock()
-            .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
-            .delete_egress_policy(owner, id)
-            .map_err(crate::api::store_err)?;
-    }
     Ok(())
+}
+
+// If the request is cancelled, the blocking worker must still own both
+// leases until stop_vm has confirmed death or restored the runtime for retry.
+async fn stop_under_vm_gates(
+    state: &AppState,
+    id: Uuid,
+    activation: OwnedActivationGuard,
+    operation: Option<tokio::sync::OwnedMutexGuard<()>>,
+) -> Result<
+    (
+        OwnedActivationGuard,
+        Option<tokio::sync::OwnedMutexGuard<()>>,
+    ),
+    OrchError,
+> {
+    let supervisor = Arc::clone(&state.supervisor);
+    tokio::task::spawn_blocking(move || supervisor.stop_vm(id).map(|()| (activation, operation)))
+        .await
+        .map_err(|e| OrchError::Internal(format!("VMM teardown join: {e}")))?
 }
 
 /// Detect and persist unexpected VMM exits using one shared bounded scan.
@@ -2938,6 +3018,16 @@ pub(crate) struct ActivationGate {
 }
 
 impl ActivationGate {
+    fn try_lock_owned(self) -> Option<OwnedActivationGuard> {
+        let guard = Arc::clone(self.gate.as_ref().expect("live activation lease"))
+            .try_lock_owned()
+            .ok()?;
+        Some(OwnedActivationGuard {
+            _guard: guard,
+            _lease: self,
+        })
+    }
+
     pub(crate) async fn lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.gate
             .as_ref()
@@ -4667,11 +4757,14 @@ pub async fn status_local(state: &AppState, id: Uuid) -> Result<serde_json::Valu
     ensure_vm_status(state, id, "query live status for", LIVE_CONTROL_STATUSES)?;
     let gate = state.supervisor.operation_gate(id)?;
     let _operation = try_live_operation_gate(gate, id)?;
-    ensure_vm_status(state, id, "query live status for", LIVE_CONTROL_STATUSES)?;
+    let record = ensure_vm_status(state, id, "query live status for", LIVE_CONTROL_STATUSES)?;
     let sup = Arc::clone(&state.supervisor);
     let status = tokio::task::spawn_blocking(move || sup.status_vm(id))
         .await
         .map_err(|e| OrchError::Internal(format!("join: {e}")))??;
+    if status.state == tarit_vmm_client::VmState::Stopped {
+        retain_confirmed_guest_stop(state, record, Timestamp::now())?;
+    }
     serde_json::to_value(status).map_err(|e| OrchError::Internal(format!("status encode: {e}")))
 }
 
@@ -4802,7 +4895,10 @@ where
                 }
                 Err(rollback_error) => {
                     match observe_and_compensate_vm_status(state, &current).await {
-                        Ok(observed) => {
+                        Ok(None) => Err(OrchError::Internal(format!(
+                            "persist VM {id} transition failed: {persist_error}; VMM rollback failed: {rollback_error}; VMM stopped and teardown is pending"
+                        ))),
+                        Ok(Some(observed)) => {
                             let _ = set_lifecycle_state(
                                 state,
                                 id,
@@ -4825,6 +4921,7 @@ where
                                 id,
                                 LifecycleState::Reconciling {
                                     record: current.clone(),
+                                    stopped_at: None,
                                 },
                             )
                             .err()
@@ -5830,10 +5927,222 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn unobservable_snapshot_state_stays_reconciling_until_retry_converges() {
+        snapshot_reconciliation_after_status_outage(
+            tarit_vmm_client::VmState::Paused,
+            VmStatus::Paused,
+        );
+    }
+
+    #[test]
+    fn confirmed_guest_stop_retries_after_runtime_has_been_withdrawn() {
+        // Model the handoff left after containment removed the supervisor's
+        // runtime, but before the stop could be durably published.
         let (state, _) = test_state_with_durable_writer();
         let id = insert_running_vm(&state);
-        let initial = vm_get(&state, id).unwrap();
-        state.store.lock().unwrap().insert_vm(&initial).unwrap();
+        let mut record = vm_get(&state, id).unwrap();
+        record.api_key_id = Some("test-api-key".into());
+        commit_vm_record(&state, record.clone()).unwrap();
+        state.supervisor.reserve_existing_for_test(id);
+        let stopped_at = Timestamp::now() - time::SignedDuration::seconds(5);
+        let billing_start = stopped_at - time::SignedDuration::seconds(10);
+        {
+            let store = state.store.lock().unwrap();
+            store.insert_vm(&record).unwrap();
+            store.set_billing_watermark(id, billing_start).unwrap();
+        }
+        retain_confirmed_guest_stop(&state, record.clone(), stopped_at).unwrap();
+
+        // DELETE has withdrawn the runtime but is still waiting for process death.
+        test_runtime().block_on(async {
+            let held = activation_gate(&state, id).unwrap().lock_owned().await;
+            retry_live_reconciliation(&state, &record).await.unwrap();
+            assert!(state.scheduler.is_reserved(id));
+            assert_eq!(vm_get(&state, id).unwrap().status, VmStatus::Running);
+            assert!(activation_gate(&state, Uuid::new_v4())
+                .unwrap()
+                .try_lock_owned()
+                .is_some());
+            drop(held);
+        });
+        let runtime = test_runtime();
+        for _ in 0..2 {
+            assert!(runtime
+                .block_on(reconcile_unexpected_vmm_exits(&state))
+                .is_empty());
+        }
+        assert!(lifecycle_state(&state, id).unwrap().is_none());
+        assert!(!state.scheduler.is_reserved(id));
+        assert_eq!(vm_get(&state, id).unwrap().status, VmStatus::Stopped);
+        let store = state.store.lock().unwrap();
+        assert_eq!(store.get_vm(id).unwrap().status, VmStatus::Stopped);
+        assert_eq!(store.get_billing_watermark(id).unwrap(), None);
+        let usage = store.list_unsent_usage(10).unwrap();
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].window_start, billing_start);
+        assert_eq!(usage[0].window_end, stopped_at);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retry_during_delete_keeps_withdrawn_runtime_reserved_through_failed_teardown() {
+        let (state, _) = test_state_with_durable_writer();
+        let id = insert_running_vm(&state);
+        let other = insert_running_vm(&state);
+        let record = vm_get(&state, id).unwrap();
+        state.store.lock().unwrap().insert_vm(&record).unwrap();
+        state.supervisor.reserve_existing_for_test(id);
+        retain_confirmed_guest_stop(&state, record.clone(), Timestamp::now()).unwrap();
+
+        test_runtime().block_on(async {
+            let socket = std::env::temp_dir().join(format!("delete-{id}.sock"));
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            state
+                .supervisor
+                .install_test_control_runtime(id, socket.clone());
+            let deleting = tokio::spawn({
+                let state = state.clone();
+                async move { stop_local(&state, id).await }
+            });
+            // stop_vm sends Stop on this socket only after withdrawing the runtime.
+            let (stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                state.supervisor.operation_gate(id),
+                Err(OrchError::NotFound(_))
+            ));
+            retry_live_reconciliation(&state, &record).await.unwrap();
+            stop_local(&state, other).await.unwrap();
+            assert_eq!(vm_get(&state, other).unwrap().status, VmStatus::Stopped);
+            assert_eq!(vm_get(&state, id).unwrap().status, VmStatus::Running);
+            assert!(state.scheduler.is_reserved(id));
+
+            // Force the real cleanup to fail after the stop response is released.
+            drop(listener);
+            std::fs::remove_file(&socket).unwrap();
+            std::fs::create_dir(&socket).unwrap();
+            drop(stream);
+            let err = deleting.await.unwrap().unwrap_err();
+            assert!(err.to_string().contains("remove VMM socket"));
+            assert!(state.supervisor.operation_gate(id).is_ok());
+            assert!(state.scheduler.is_reserved(id));
+            assert_eq!(vm_get(&state, id).unwrap().status, VmStatus::Running);
+
+            std::fs::remove_dir(&socket).unwrap();
+            retry_live_reconciliation(&state, &record).await.unwrap();
+            assert!(!state.scheduler.is_reserved(id));
+            assert_eq!(vm_get(&state, id).unwrap().status, VmStatus::Stopped);
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stopped_vmm_during_snapshot_retry_finalizes_runtime_and_usage() {
+        snapshot_reconciliation_after_status_outage(
+            tarit_vmm_client::VmState::Stopped,
+            VmStatus::Stopped,
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn running_without_vcpu_handle_is_not_a_confirmed_stop() {
+        snapshot_reconciliation_after_status_outage(
+            tarit_vmm_client::VmState::Running,
+            VmStatus::Running,
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resume_failure_from_paused_or_suspended_freezes_confirmed_stop() {
+        for prior in [VmStatus::Paused, VmStatus::Suspended] {
+            let (state, _) = test_state_with_durable_writer();
+            let id = insert_running_vm(&state);
+            let mut vm = vm_get(&state, id).unwrap();
+            vm.status = prior;
+            vm.api_key_id = Some("key".into());
+            commit_vm_record(&state, vm.clone()).unwrap();
+            state.store.lock().unwrap().insert_vm(&vm).unwrap();
+            let socket = std::env::temp_dir().join(format!("resume-{id}.sock"));
+            let listener = UnixListener::bind(&socket).unwrap();
+            state
+                .supervisor
+                .install_test_control_runtime(id, socket.clone());
+            let server = std::thread::spawn(move || {
+                for i in 0..3 {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let mut length = [0; 4];
+                    stream.read_exact(&mut length).unwrap();
+                    let mut body = vec![0; u32::from_be_bytes(length) as usize];
+                    stream.read_exact(&mut body).unwrap();
+                    let req: tarit_vmm_client::ApiRequest = serde_json::from_slice(&body).unwrap();
+                    let response = if i == 1 {
+                        assert!(matches!(req, tarit_vmm_client::ApiRequest::Resume));
+                        tarit_vmm_client::ApiResponse::Err {
+                            msg: "resume failed".into(),
+                        }
+                    } else {
+                        assert!(matches!(req, tarit_vmm_client::ApiRequest::Status));
+                        tarit_vmm_client::ApiResponse::Status(tarit_vmm_client::VmStatus {
+                            state: match (i, prior) {
+                                (0, VmStatus::Paused) => tarit_vmm_client::VmState::Paused,
+                                (0, VmStatus::Suspended) => tarit_vmm_client::VmState::Suspended,
+                                _ => tarit_vmm_client::VmState::Stopped,
+                            },
+                            uptime_ms: 1,
+                            vcpus: 1,
+                            mem_mib: 256,
+                            volumes: 0,
+                            nets: 0,
+                            kernel: "kernel".into(),
+                            vcpu_alive: false,
+                        })
+                    };
+                    let bytes = serde_json::to_vec(&response).unwrap();
+                    stream
+                        .write_all(&(bytes.len() as u32).to_be_bytes())
+                        .unwrap();
+                    stream.write_all(&bytes).unwrap();
+                }
+            });
+            let err = test_runtime()
+                .block_on(resume_local(&state, id))
+                .unwrap_err();
+            assert!(err.to_string().contains("teardown is pending"));
+            server.join().unwrap();
+            assert!(state
+                .store
+                .lock()
+                .unwrap()
+                .get_billing_end(id)
+                .unwrap()
+                .is_some());
+            test_runtime()
+                .block_on(retry_live_reconciliation(&state, &vm))
+                .unwrap();
+            assert_eq!(vm_get(&state, id).unwrap().status, VmStatus::Stopped);
+            assert!(!socket.exists());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn snapshot_reconciliation_after_status_outage(
+        observed: tarit_vmm_client::VmState,
+        expected: VmStatus,
+    ) {
+        let (state, _) = test_state_with_durable_writer();
+        let id = insert_running_vm(&state);
+        let mut initial = vm_get(&state, id).unwrap();
+        initial.api_key_id = Some("test-api-key".into());
+        commit_vm_record(&state, initial.clone()).unwrap();
+        let billing_start = Timestamp::now() - time::SignedDuration::seconds(1);
+        {
+            let store = state.store.lock().unwrap();
+            store.insert_vm(&initial).unwrap();
+            store.set_billing_watermark(id, billing_start).unwrap();
+        }
 
         let socket = PathBuf::from(format!(
             "/tmp/taritd-snapshot-reconcile-{}-{id}.sock",
@@ -5865,14 +6174,14 @@ mod tests {
                             }
                         } else {
                             tarit_vmm_client::ApiResponse::Status(tarit_vmm_client::VmStatus {
-                                state: tarit_vmm_client::VmState::Paused,
+                                state: observed,
                                 uptime_ms: 1,
                                 vcpus: 1,
                                 mem_mib: 256,
                                 volumes: 0,
                                 nets: 0,
                                 kernel: "kernel".into(),
-                                vcpu_alive: true,
+                                vcpu_alive: observed == tarit_vmm_client::VmState::Paused,
                             })
                         }
                     }
@@ -5957,16 +6266,40 @@ mod tests {
         });
         let cached = vm_get(&state, id).unwrap();
         let durable = state.store.lock().unwrap().get_vm(id).unwrap();
-        assert_eq!(cached.status, VmStatus::Paused);
-        assert_eq!(durable.status, VmStatus::Paused);
-        assert_eq!(cached.revision, initial.revision + 2);
-        assert_eq!(durable.revision, initial.revision + 2);
-        assert!(matches!(
-            lifecycle_state(&state, id).unwrap(),
-            Some(LifecycleState::Running { record }) if record.status == VmStatus::Paused
-        ));
-
-        state.supervisor.stop_vm(id).unwrap();
+        assert_eq!(cached.status, expected);
+        assert_eq!(durable.status, expected);
+        if expected == VmStatus::Stopped {
+            assert_eq!(cached.revision, initial.revision + 1);
+            assert_eq!(durable.revision, initial.revision + 1);
+            assert!(lifecycle_state(&state, id).unwrap().is_none());
+            assert!(!state.supervisor.is_running(id));
+            assert!(runtime
+                .block_on(reconcile_unexpected_vmm_exits(&state))
+                .is_empty());
+            let store = state.store.lock().unwrap();
+            assert_eq!(store.get_billing_watermark(id).unwrap(), None);
+            let usage = store.list_unsent_usage(10).unwrap();
+            assert_eq!(usage.len(), 1, "closed usage must be emitted exactly once");
+            assert_eq!(usage[0].window_start, billing_start);
+            assert!(usage[0].window_end <= durable.updated_at);
+        } else {
+            assert_eq!(cached.revision, initial.revision + 2);
+            assert_eq!(durable.revision, initial.revision + 2);
+            assert!(matches!(
+                lifecycle_state(&state, id).unwrap(),
+                Some(LifecycleState::Running { record }) if record.status == expected
+            ));
+            assert_eq!(
+                state
+                    .store
+                    .lock()
+                    .unwrap()
+                    .get_billing_watermark(id)
+                    .unwrap(),
+                Some(billing_start)
+            );
+            state.supervisor.stop_vm(id).unwrap();
+        }
         server.join().unwrap();
         let requests = requests_rx.into_iter().collect::<Vec<_>>();
         assert!(

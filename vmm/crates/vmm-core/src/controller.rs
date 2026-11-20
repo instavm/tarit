@@ -756,7 +756,7 @@ impl VmmController {
                 Ok(paused) => paused,
                 Err(error) => {
                     let resume_error = if paused_here && error.vcpus_may_resume_after_io_error() {
-                        resume_running_vcpus(vm).err()
+                        resume_running_vcpus_or_stop(vm).err()
                     } else {
                         None
                     };
@@ -2391,7 +2391,7 @@ impl VmmController {
                 vm.state = VmState::Paused;
                 return Err(error);
             }
-            return match resume_running_vcpus(vm) {
+            return match resume_running_vcpus_or_stop(vm) {
                 Ok(()) => Err(error),
                 Err(resume) => Err(VmmError::Device(format!(
                     "{error}; failed to resume vCPUs after I/O quiescence failure: {resume}"
@@ -3809,13 +3809,21 @@ fn suspend_vm_in_place(vm: &mut VmInstance) -> Result<()> {
         match pause_running_io(vm) {
             Ok(paused) => paused,
             Err(error) => {
-                if paused_here && error.vcpus_may_resume_after_io_error() {
-                    resume_running_vcpus(vm)?;
-                }
                 if !error.vcpus_may_resume_after_io_error() {
                     vm.state = VmState::Paused;
+                    return Err(error);
                 }
-                return Err(error);
+                let resume = if paused_here {
+                    resume_running_vcpus_or_stop(vm)
+                } else {
+                    Ok(())
+                };
+                return Err(match resume {
+                    Ok(()) => error,
+                    Err(resume) => VmmError::Device(format!(
+                        "{error}; failed to resume vCPUs after I/O quiescence failure: {resume}"
+                    )),
+                });
             }
         }
     } else {
@@ -9641,7 +9649,12 @@ mod tests {
                 }
             }
         }
-        for unconfirmed in [false, true] {
+        for (initial_state, unconfirmed) in [
+            (VmState::Paused, false),
+            (VmState::Paused, true),
+            (VmState::Running, false),
+            (VmState::Running, true),
+        ] {
             let log = Arc::new(Mutex::new(Vec::new()));
             let targets = (0..3)
                 .map(|id| Target {
@@ -9651,7 +9664,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             let refs = targets.iter().collect::<Vec<_>>();
-            let controller = controller_in_state(VmState::Paused);
+            let controller = controller_in_state(initial_state);
             let mut slot = controller.lock();
             let vm = slot.as_mut().unwrap();
             let result = resolve_vcpu_resume(vm, resume_vcpu_group(&refs));
@@ -9662,7 +9675,7 @@ mod tests {
                 if unconfirmed {
                     VmState::Stopped
                 } else {
-                    VmState::Paused
+                    initial_state
                 }
             );
             drop(slot);
