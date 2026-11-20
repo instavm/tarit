@@ -9,8 +9,8 @@ name = "tarit-bench"
 path = "src/main.rs"
 
 [dependencies]
+time.workspace = true
 anyhow = { workspace = true }
-chrono = { workspace = true }
 clap = { version = "4", features = ["derive", "env"] }
 reqwest = { workspace = true }
 serde = { workspace = true }

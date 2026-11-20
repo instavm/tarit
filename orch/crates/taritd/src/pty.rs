@@ -7,7 +7,6 @@ use axum::{
     response::Response,
     Json,
 };
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -18,9 +17,11 @@ use std::{
     },
 };
 use tarit_types::OrchError;
+use tarit_types::Timestamp;
 use tarit_vmm_client::{
     PtyResize, PtyStreamFrame, MAX_FRAME_LEN, TYPE_DATA, TYPE_ERROR, TYPE_EXIT, TYPE_RESIZE,
 };
+use time::SignedDuration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use uuid::Uuid;
 
@@ -127,7 +128,7 @@ pub(crate) struct PtySession {
     cols: u16,
     rows: u16,
     shell: Option<String>,
-    created_at: DateTime<Utc>,
+    created_at: Timestamp,
     /// Unguessable, per-session token issued to the authenticated caller that
     /// created this session. The WebSocket upgrade authenticates with this
     /// token instead of the caller's long-lived API key, so the account
@@ -136,7 +137,7 @@ pub(crate) struct PtySession {
     /// Identity of the caller that created the session, used to re-check VM
     /// access when the WebSocket connects.
     owner: ApiIdentity,
-    connect_token_expires_at: DateTime<Utc>,
+    connect_token_expires_at: Timestamp,
     active_connection: bool,
 }
 
@@ -178,7 +179,7 @@ pub(crate) struct PtySessionResponse {
     cols: u16,
     rows: u16,
     shell: Option<String>,
-    created_at: DateTime<Utc>,
+    created_at: Timestamp,
 }
 
 #[derive(Debug, Serialize)]
@@ -279,10 +280,11 @@ impl PtyRegistry {
             cols,
             rows,
             shell,
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             connect_token: generate_connect_token(),
             owner,
-            connect_token_expires_at: Utc::now() + ChronoDuration::seconds(CONNECT_TOKEN_TTL_SECS),
+            connect_token_expires_at: Timestamp::now()
+                + SignedDuration::seconds(CONNECT_TOKEN_TTL_SECS),
             active_connection: false,
         };
         sessions.insert(session.pty_id, session.clone());
@@ -367,7 +369,7 @@ impl PtyRegistry {
         {
             session.active_connection = false;
             session.connect_token_expires_at =
-                Utc::now() + ChronoDuration::seconds(CONNECT_TOKEN_TTL_SECS);
+                Timestamp::now() + SignedDuration::seconds(CONNECT_TOKEN_TTL_SECS);
         }
         purge_expired_sessions(&mut sessions);
     }
@@ -437,7 +439,7 @@ impl PtyRegistry {
         let session = sessions.get(&pty_id)?;
         (session.vm_id == vm_id
             && !session.active_connection
-            && session.connect_token_expires_at >= Utc::now()
+            && session.connect_token_expires_at >= Timestamp::now()
             && !provided.is_empty()
             && connect_token_matches(provided, &session.connect_token))
         .then(|| session.owner.clone())
@@ -476,7 +478,7 @@ impl PtyRegistry {
             .expect("session exists while its registry lock is held");
         session.active_connection = true;
         session.connect_token_expires_at =
-            Utc::now() + ChronoDuration::seconds(CONNECT_TOKEN_TTL_SECS);
+            Timestamp::now() + SignedDuration::seconds(CONNECT_TOKEN_TTL_SECS);
         let session = session.clone();
         Ok((session, permit))
     }
@@ -495,7 +497,7 @@ impl Drop for PtyConnectionState {
 }
 
 fn purge_expired_sessions(sessions: &mut HashMap<Uuid, PtySession>) {
-    let now = Utc::now();
+    let now = Timestamp::now();
     sessions
         .retain(|_, session| session.active_connection || session.connect_token_expires_at >= now);
 }
@@ -1102,7 +1104,7 @@ mod tests {
             .unwrap()
             .get_mut(&replacement.pty_id)
             .unwrap()
-            .connect_token_expires_at = Utc::now() - ChronoDuration::seconds(1);
+            .connect_token_expires_at = Timestamp::now() - SignedDuration::seconds(1);
         registry
             .create(Uuid::new_v4(), 80, 24, None, test_identity_for("noisy"))
             .unwrap();
@@ -1313,7 +1315,7 @@ mod tests {
             .unwrap()
             .get_mut(&session.pty_id)
             .unwrap()
-            .connect_token_expires_at = Utc::now() - ChronoDuration::seconds(1);
+            .connect_token_expires_at = Timestamp::now() - SignedDuration::seconds(1);
         assert!(state
             .pty_registry
             .connect_identity(vm_id, session.pty_id, &session.connect_token)
@@ -1537,14 +1539,14 @@ mod tests {
     fn connect_token_expires_five_minutes_after_creation() {
         let registry = PtyRegistry::default();
         let vm_id = Uuid::new_v4();
-        let before = Utc::now();
+        let before = Timestamp::now();
         let session = registry
             .create(vm_id, 80, 24, None, test_identity())
             .unwrap();
-        let after = Utc::now();
+        let after = Timestamp::now();
 
-        assert!(session.connect_token_expires_at >= before + chrono::Duration::minutes(5));
-        assert!(session.connect_token_expires_at <= after + chrono::Duration::minutes(5));
+        assert!(session.connect_token_expires_at >= before + time::SignedDuration::minutes(5));
+        assert!(session.connect_token_expires_at <= after + time::SignedDuration::minutes(5));
     }
 
     #[test]
@@ -1560,7 +1562,7 @@ mod tests {
             .unwrap()
             .get_mut(&session.pty_id)
             .unwrap()
-            .connect_token_expires_at = Utc::now() - chrono::Duration::seconds(1);
+            .connect_token_expires_at = Timestamp::now() - time::SignedDuration::seconds(1);
 
         assert!(matches!(
             registry.admit_connect(vm_id, session.pty_id, &session.connect_token),

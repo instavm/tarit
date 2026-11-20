@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use chrono::Utc;
+use tarit_types::Timestamp;
 use tarit_types::{
     ArtifactBootMetadata, ArtifactKind, ArtifactRecord, ArtifactReplicationState, ArtifactStatus,
     CreateVmRequest, EgressPolicyRecord, OrchError, VmRecord, VmStartupPath, VmStatus,
@@ -61,7 +61,7 @@ async fn vm_set_status(
             .revision
             .checked_add(1)
             .ok_or_else(|| OrchError::Internal(format!("VM {id} revision exhausted")))?;
-        r.updated_at = Utc::now();
+        r.updated_at = Timestamp::now();
         r
     };
     // Match boot publication ordering: global ownership first, then durable
@@ -114,7 +114,7 @@ async fn compensate_vm_status(
         .revision
         .checked_add(2)
         .ok_or_else(|| OrchError::Internal(format!("VM {} revision exhausted", prior.id)))?;
-    compensation.updated_at = Utc::now();
+    compensation.updated_at = Timestamp::now();
     claim_lifecycle_ownership(state, &compensation).await?;
     state
         .store
@@ -154,7 +154,7 @@ async fn observe_vm_control_state(
 fn retain_confirmed_guest_stop(
     state: &AppState,
     record: VmRecord,
-    stopped_at: chrono::DateTime<Utc>,
+    stopped_at: Timestamp,
 ) -> Result<(), OrchError> {
     let id = record.id;
     // Serialize the observation with periodic metering. Keep the in-memory
@@ -183,7 +183,7 @@ async fn observe_and_compensate_vm_status(
 ) -> Result<Option<VmRecord>, OrchError> {
     let observed = observe_vm_control_state(state, prior.id).await?;
     if observed == tarit_vmm_client::VmState::Stopped {
-        retain_confirmed_guest_stop(state, prior.clone(), Utc::now())?;
+        retain_confirmed_guest_stop(state, prior.clone(), Timestamp::now())?;
         return Ok(None);
     }
     compensate_vm_status(state, prior, control_status(observed)?)
@@ -204,7 +204,7 @@ async fn reconcile_failed_live_operation(
     }
     let observed = match observe_vm_control_state(state, prior.id).await {
         Ok(tarit_vmm_client::VmState::Stopped) => {
-            return match retain_confirmed_guest_stop(state, prior.clone(), Utc::now()) {
+            return match retain_confirmed_guest_stop(state, prior.clone(), Timestamp::now()) {
                 Ok(()) => {
                     OrchError::Internal(format!("{primary}; VMM stopped and teardown is pending"))
                 }
@@ -464,7 +464,7 @@ fn terminal_record(state: &AppState, id: Uuid, status: VmStatus) -> Result<VmRec
     record.runtime_layout = None;
     record.socket_path = None;
     record.pid = None;
-    record.updated_at = Utc::now();
+    record.updated_at = Timestamp::now();
     Ok(record)
 }
 
@@ -1226,7 +1226,7 @@ fn creating_record(
     id: Uuid,
     owner_key: Option<String>,
     api_key_id: Option<String>,
-    now: chrono::DateTime<Utc>,
+    now: tarit_types::Timestamp,
 ) -> VmRecord {
     VmRecord {
         id,
@@ -1508,7 +1508,7 @@ async fn create_local_owned(
     id: Uuid,
     task: &OwnedTaskControl,
 ) -> Result<VmRecord, OrchError> {
-    let now = Utc::now();
+    let now = Timestamp::now();
     tarit_proto::MemoryConfig {
         size_mib: req.memory_mib,
         boot_size_mib: req.boot_memory_mib,
@@ -1747,7 +1747,7 @@ async fn create_local_owned(
             record.startup_path = Some(VmStartupPath::Cold);
             record.pid = Some(pid);
             record.socket_path = Some(socket_path.display().to_string());
-            record.updated_at = Utc::now();
+            record.updated_at = Timestamp::now();
             async move {
                 publish_running_record(&publication_state, record.clone()).await?;
                 Ok(record)
@@ -1839,7 +1839,7 @@ async fn bind_requested_vm_volumes(
             owner_key: owner_key.to_string(),
             mode: requested.mode,
             volume_generation: volume.generation,
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
         };
         bindings.push(record);
         spawn.push(VmDataVolumeConfig {
@@ -2110,7 +2110,7 @@ async fn restore_local_owned(
         egress_allow_existing: false,
         data_volumes: Vec::new(),
     };
-    let now = Utc::now();
+    let now = Timestamp::now();
     let record = VmRecord {
         id,
         host_id: state.config.host_id.clone(),
@@ -2242,7 +2242,7 @@ async fn restore_local_owned(
                 record.status = VmStatus::Running;
                 record.pid = Some(pid);
                 record.socket_path = Some(socket_path.display().to_string());
-                record.updated_at = Utc::now();
+                record.updated_at = Timestamp::now();
                 async move {
                     publish_running_record(&publication_state, record.clone()).await?;
                     Ok(record)
@@ -2743,7 +2743,7 @@ async fn prepare_hibernation(
     )
     .await?;
     let owner_key = owner_key.clone();
-    let now = Utc::now();
+    let now = Timestamp::now();
     let hibernation = tarit_store::HibernationRecord {
         vm_id: id,
         owner_key: owner_key.clone(),
@@ -2814,7 +2814,7 @@ async fn finish_hibernation(state: &AppState, id: Uuid) -> Result<(), OrchError>
                 .map_err(|join| {
                     OrchError::Internal(format!("hibernate teardown join: {join}"))
                 })??;
-            let end = Utc::now();
+            let end = Timestamp::now();
             // Keep the exact boundary even if persisting the freeze itself
             // fails. Retries must not run teardown again and choose a later end.
             set_lifecycle_state(
@@ -2962,7 +2962,7 @@ pub async fn recover_hibernated_on_stale_owner(
         owner_key: owner_key.clone(),
         snapshot_path: snapshot.path.clone(),
         created_at: durable.created_at,
-        updated_at: Utc::now(),
+        updated_at: Timestamp::now(),
     };
     {
         let store = state
@@ -3342,7 +3342,7 @@ async fn resume_hibernated_local_locked(
             record.status = VmStatus::Running;
             record.pid = Some(pid);
             record.socket_path = Some(socket_path.display().to_string());
-            record.updated_at = Utc::now();
+            record.updated_at = Timestamp::now();
             async move {
                 publish_running_record(&publication_state, record.clone()).await?;
                 Ok(record)
@@ -3638,7 +3638,7 @@ async fn snapshot_local_locked(
         cmdline: Some(vm.cmdline.clone()),
         content_digest: Some(integrity.content_digest.clone()),
         size_bytes: Some(integrity.size_bytes),
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
     };
     let artifact = artifact_identity.zip(record.owner_key.clone()).map(
         |((immutable_image_digest, agent_digest, boot_manifest_digest), owner_key)| {
@@ -3987,9 +3987,9 @@ pub async fn localize_branch_artifact(
                     content_digest: local.content_digest.clone(),
                     size_bytes: local.size_bytes,
                     integrity_manifest_digest: local.integrity_manifest_digest.clone(),
-                    verified_at: Some(Utc::now()),
+                    verified_at: Some(Timestamp::now()),
                     created_at: snapshot.created_at,
-                    updated_at: Utc::now(),
+                    updated_at: Timestamp::now(),
                 };
                 let replication_state =
                     fleet
@@ -4213,7 +4213,7 @@ pub async fn localize_branch_artifact(
                 name: format!("peer-{}", artifact.artifact_id),
                 tag: "immutable".into(),
                 rootfs_path: final_rootfs.display().to_string(),
-                created_at: Utc::now(),
+                created_at: Timestamp::now(),
                 size_bytes: descriptor.rootfs_bytes,
                 source_ref: descriptor.image_source_ref.clone(),
                 source_digest: Some(descriptor.immutable_image_digest.clone()),
@@ -4376,7 +4376,7 @@ pub async fn localize_branch_artifact(
         cmdline: Some(descriptor.cmdline.clone()),
         content_digest: Some(descriptor.content_digest.clone()),
         size_bytes: Some(descriptor.size_bytes),
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
     };
     if let Err(error) = crate::supervisor::verify_snapshot_integrity(&staging_snapshot) {
         cleanup_replica_paths([&staging_ram, &staging_overlay, &staging_integrity]);
@@ -4446,9 +4446,9 @@ pub async fn localize_branch_artifact(
         content_digest: artifact.content_digest.clone(),
         size_bytes: artifact.size_bytes,
         integrity_manifest_digest: artifact.integrity_manifest_digest.clone(),
-        verified_at: Some(Utc::now()),
+        verified_at: Some(Timestamp::now()),
         created_at: final_snapshot.created_at,
-        updated_at: Utc::now(),
+        updated_at: Timestamp::now(),
     };
     let state_value = fleet
         .upsert_artifact_replica(&replica)
@@ -4603,7 +4603,7 @@ pub async fn put_egress_policy_local(
         )?)
     };
     let allowlist = crate::net::normalize_tenant_egress_allowlist(&allowlist)?;
-    let now = Utc::now();
+    let now = Timestamp::now();
     if vm.status != VmStatus::Hibernated {
         let current = get_egress_policy_local(state, id, owner_key)?;
         if current.revision != expected_revision {
@@ -4763,7 +4763,7 @@ pub async fn status_local(state: &AppState, id: Uuid) -> Result<serde_json::Valu
         .await
         .map_err(|e| OrchError::Internal(format!("join: {e}")))??;
     if status.state == tarit_vmm_client::VmState::Stopped {
-        retain_confirmed_guest_stop(state, record, Utc::now())?;
+        retain_confirmed_guest_stop(state, record, Timestamp::now())?;
     }
     serde_json::to_value(status).map_err(|e| OrchError::Internal(format!("status encode: {e}")))
 }
@@ -5408,7 +5408,7 @@ mod tests {
     #[test]
     fn artifact_backed_restore_requires_exact_ready_metadata() {
         let (state, _) = test_state_with_durable_writer();
-        let now = Utc::now();
+        let now = Timestamp::now();
         let boot_dir = PathBuf::from(format!("target/artifact-boot-metadata-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&boot_dir).unwrap();
         let kernel_path = boot_dir.join("vmlinux");
@@ -5546,7 +5546,7 @@ mod tests {
             integrity_manifest_digest: artifact.integrity_manifest_digest.clone(),
             verified_at: None,
             created_at: now,
-            updated_at: Utc::now(),
+            updated_at: Timestamp::now(),
         };
         state
             .store
@@ -5943,8 +5943,8 @@ mod tests {
         record.api_key_id = Some("test-api-key".into());
         commit_vm_record(&state, record.clone()).unwrap();
         state.supervisor.reserve_existing_for_test(id);
-        let stopped_at = Utc::now() - chrono::Duration::seconds(5);
-        let billing_start = stopped_at - chrono::Duration::seconds(10);
+        let stopped_at = Timestamp::now() - time::SignedDuration::seconds(5);
+        let billing_start = stopped_at - time::SignedDuration::seconds(10);
         {
             let store = state.store.lock().unwrap();
             store.insert_vm(&record).unwrap();
@@ -5991,7 +5991,7 @@ mod tests {
         let record = vm_get(&state, id).unwrap();
         state.store.lock().unwrap().insert_vm(&record).unwrap();
         state.supervisor.reserve_existing_for_test(id);
-        retain_confirmed_guest_stop(&state, record.clone(), Utc::now()).unwrap();
+        retain_confirmed_guest_stop(&state, record.clone(), Timestamp::now()).unwrap();
 
         test_runtime().block_on(async {
             let socket = std::env::temp_dir().join(format!("delete-{id}.sock"));
@@ -6137,7 +6137,7 @@ mod tests {
         let mut initial = vm_get(&state, id).unwrap();
         initial.api_key_id = Some("test-api-key".into());
         commit_vm_record(&state, initial.clone()).unwrap();
-        let billing_start = Utc::now() - chrono::Duration::seconds(1);
+        let billing_start = Timestamp::now() - time::SignedDuration::seconds(1);
         {
             let store = state.store.lock().unwrap();
             store.insert_vm(&initial).unwrap();
@@ -6900,7 +6900,7 @@ mod tests {
             .store
             .lock()
             .unwrap()
-            .set_billing_watermark(id, Utc::now() - chrono::Duration::seconds(10))
+            .set_billing_watermark(id, Timestamp::now() - time::SignedDuration::seconds(10))
             .unwrap();
         // Unexpected exit enters retryable terminal convergence. Fail durable
         // status publication after the usage interval has already committed.
@@ -6994,7 +6994,7 @@ mod tests {
                 name: "node".into(),
                 tag: "22".into(),
                 rootfs_path: rootfs.display().to_string(),
-                created_at: Utc::now(),
+                created_at: Timestamp::now(),
                 size_bytes: std::fs::metadata(&rootfs).unwrap().len(),
                 source_ref: format!("docker://docker.io/library/node@{source_digest}"),
                 source_digest: Some(source_digest),
@@ -7274,7 +7274,7 @@ mod tests {
             // A later incarnation acquired the UUID while delivery was pending.
             let mut replacement = vm_get(&state, id).unwrap();
             replacement.pid = Some(99);
-            replacement.created_at += chrono::Duration::seconds(1);
+            replacement.created_at += time::SignedDuration::seconds(1);
             set_lifecycle_state(
                 &state,
                 id,
@@ -7305,7 +7305,7 @@ mod tests {
         let mut replacement = vm_get(&state, id).unwrap();
         replacement.status = VmStatus::Creating;
         replacement.pid = None;
-        replacement.created_at += chrono::Duration::seconds(1);
+        replacement.created_at += time::SignedDuration::seconds(1);
         set_lifecycle_state(
             &state,
             id,
@@ -7541,7 +7541,7 @@ mod tests {
                     &PathBuf::from(format!("warm-publication-{id}.sock")),
                     None,
                     None,
-                    Utc::now(),
+                    Timestamp::now(),
                 );
                 set_lifecycle_state(
                     &state,
@@ -7726,7 +7726,7 @@ mod tests {
             &PathBuf::from(format!("warm-stop-all-{id}.sock")),
             None,
             None,
-            Utc::now(),
+            Timestamp::now(),
         );
         set_lifecycle_state(&state, id, LifecycleState::Abandoned { record }).unwrap();
         state.supervisor.abandon_lifecycle(id);
@@ -8029,8 +8029,8 @@ mod tests {
     fn deleted_vms_leave_the_cache_after_the_grace_unless_still_in_a_lifecycle() {
         let (state, _) = test_state_with_durable_writer();
         let running = insert_running_vm(&state);
-        let old = Utc::now() - chrono::Duration::minutes(10);
-        let stop = |id: Uuid, updated_at: chrono::DateTime<Utc>| {
+        let old = Timestamp::now() - time::SignedDuration::minutes(10);
+        let stop = |id: Uuid, updated_at: tarit_types::Timestamp| {
             let mut cache = state.vm_cache.write().unwrap();
             let vm = cache.get_mut(&id).unwrap();
             vm.status = VmStatus::Stopped;
@@ -8039,7 +8039,7 @@ mod tests {
         let expired = insert_running_vm(&state);
         stop(expired, old);
         let recent = insert_running_vm(&state);
-        stop(recent, Utc::now());
+        stop(recent, Timestamp::now());
         let terminating = insert_running_vm(&state);
         stop(terminating, old);
         let record = vm_get(&state, terminating).unwrap();
@@ -8059,7 +8059,7 @@ mod tests {
 
     fn insert_running_vm(state: &AppState) -> Uuid {
         let id = Uuid::new_v4();
-        let now = Utc::now();
+        let now = Timestamp::now();
         state.vm_cache.write().unwrap().insert(
             id,
             VmRecord {
@@ -8090,7 +8090,7 @@ mod tests {
     fn snapshot_and_fork_refuse_vms_with_persistent_volumes() {
         let (state, _writes) = test_state_with_durable_writer();
         let id = insert_running_vm(&state);
-        let now = Utc::now();
+        let now = Timestamp::now();
         let volume = tarit_types::VolumeRecord {
             id: Uuid::new_v4(),
             owner_key: "test".into(),
@@ -8153,7 +8153,7 @@ mod tests {
     #[test]
     fn snapshot_delete_refuses_snapshots_something_still_needs() {
         let (state, _writes) = test_state_with_durable_writer();
-        let now = Utc::now();
+        let now = Timestamp::now();
         let snapshot = |path: &str, ephemeral: Option<Uuid>| tarit_store::SnapshotRecord {
             snapshot_id: Uuid::new_v4(),
             path: path.into(),
@@ -8280,14 +8280,14 @@ mod tests {
                             .store
                             .lock()
                             .unwrap()
-                            .update_egress_policy("test", id, 0, &requested, true, Utc::now())
+                            .update_egress_policy("test", id, 0, &requested, true, Timestamp::now())
                             .map_err(crate::api::store_err);
                     }
                     state
                         .store
                         .lock()
                         .unwrap()
-                        .update_egress_policy("test", id, 1, &requested, true, Utc::now())
+                        .update_egress_policy("test", id, 1, &requested, true, Timestamp::now())
                         .map_err(crate::api::store_err)
                 },
             );
@@ -8446,7 +8446,7 @@ mod tests {
             record.status = VmStatus::Hibernated;
             record.clone()
         };
-        let now = Utc::now();
+        let now = Timestamp::now();
         let root = PathBuf::from(format!("target/hibernated-wake-failure-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let snapshot_path = root.join("vm.snap");
