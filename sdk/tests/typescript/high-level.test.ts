@@ -433,3 +433,32 @@ test("PTY helper rejects malformed server controls", async () => {
   await assert.rejects(read, TaritPtyProtocolError);
   await pty.close();
 });
+
+test("high-level client rejects API key line breaks before I/O", () => {
+  for (const apiKey of ["\rkey", "key\n", "key\r\nother"]) {
+    assert.throws(
+      () => new TaritClient({ baseUrl: "https://tarit.test", apiKey }),
+      /apiKey must not contain CR or LF/,
+    );
+  }
+});
+
+test("late PTY lease cleanup failure does not replace the open deadline", async () => {
+  const methods: string[] = [];
+  const fetch: typeof globalThis.fetch = async (input, init) => {
+    const request = new Request(input, init);
+    methods.push(request.method);
+    if (request.method === "POST") {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      return json(201, { pty_id: ptyId, cols: 80, rows: 24, connect_token: "secret" });
+    }
+    assert.ok(request.url.endsWith(`/${ptyId}`));
+    return json(500, { error: "cleanup failed" });
+  };
+  const client = new TaritClient({
+    baseUrl: "https://tarit.test", apiKey: "tenant-key", fetch,
+    webSocketFactory: () => { throw new Error("must not attach"); },
+  });
+  await assert.rejects(() => client.openPty(vmId, { deadlineMs: 5 }), TaritDeadlineExceeded);
+  assert.deepEqual(methods, ["POST", "DELETE"]);
+});

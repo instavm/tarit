@@ -4,7 +4,10 @@ import asyncio
 import json
 import math
 import ssl
+import threading
 import time
+from concurrent.futures import Future, wait
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Self, TypeVar
 from urllib.parse import quote, urlencode, urlsplit, urlunsplit
@@ -32,6 +35,9 @@ from .types import Response
 
 T = TypeVar("T")
 RETRYABLE_STATUS = {429, 502, 503, 504}
+# A custom sync transport or DNS resolver can outlive the caller's deadline.
+# Bound outstanding cleanup workers across clients, including timed-out calls.
+_CLEANUP_SLOTS = threading.BoundedSemaphore(16)
 TERMINAL_EXECUTION_STATUS = {"completed", "failed"}
 
 
@@ -105,6 +111,16 @@ def _parsed(response: Response[object], expected: type[T], operation: str) -> T:
     )
 
 
+def _fork_result(client: AuthenticatedClient, response: httpx.Response, child_id: UUID) -> ForkVmResponse:
+    try:
+        return _parsed(fork_vm_api._build_response(client=client, response=response), ForkVmResponse, "fork VM")
+    except (ValueError, KeyError, TypeError, AttributeError, OverflowError) as error:
+        # Existing callers can still catch the decoder's original exception.
+        error.__dict__["child_id"] = child_id
+        error.add_note(f"Fork may have completed as child {child_id}")
+        raise
+
+
 def _retry_delay(attempt: int) -> float:
     delays = (0.1, 0.2, 0.4, 0.8, 1.0)
     return delays[min(max(attempt, 0), len(delays) - 1)]
@@ -133,6 +149,13 @@ def _request_timeout(timeout: httpx.Timeout, remaining: float) -> httpx.Timeout:
     return httpx.Timeout(
         **{phase: remaining if value is None else min(value, remaining) for phase, value in timeout.as_dict().items()}
     )
+
+
+def _validate_api_key(api_key: str) -> None:
+    if not api_key:
+        raise ValueError("api_key must not be empty")
+    if "\r" in api_key or "\n" in api_key:
+        raise ValueError("api_key must not contain CR or LF")
 
 
 def _validate_pty_options(cols: int, rows: int, deadline_seconds: float, max_message_bytes: int) -> None:
@@ -243,7 +266,7 @@ class PtyConnection:
             close_error = error
         try:
             if delete_session:
-                self._client._delete_pty_session(self.vm_id, self.pty_id)
+                self._client.delete_pty_session(self.vm_id, self.pty_id)
         finally:
             if close_error is not None:
                 raise TaritPtyConnectionError("PTY WebSocket close failed") from close_error
@@ -298,11 +321,16 @@ class AsyncPtyConnection:
         close_error: Exception | None = None
         try:
             await self._websocket.close()
+        except asyncio.CancelledError:
+            if delete_session:
+                with suppress(Exception):
+                    await self._client.delete_pty_session(self.vm_id, self.pty_id)
+            raise
         except Exception as error:  # noqa: BLE001
             close_error = error
         try:
             if delete_session:
-                await self._client._delete_pty_session(self.vm_id, self.pty_id)
+                await self._client.delete_pty_session(self.vm_id, self.pty_id)
         finally:
             if close_error is not None:
                 raise TaritPtyConnectionError("PTY WebSocket close failed") from close_error
@@ -326,8 +354,7 @@ class TaritClient:
         verify_ssl: bool = True,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
-        if not api_key:
-            raise ValueError("api_key must not be empty")
+        _validate_api_key(api_key)
         self._base_url = base_url.rstrip("/")
         self._verify_ssl = verify_ssl
         self.raw = AuthenticatedClient(
@@ -352,14 +379,44 @@ class TaritClient:
     def __exit__(self, *_args: object) -> None:
         self.close()
 
-    def _delete_pty_session(self, vm_id: UUID, pty_id: UUID) -> None:
-        response = delete_pty_session_api.sync_detailed(vm_id, pty_id, client=self.raw)
-        if int(response.status_code) not in {204, 404}:
-            raise TaritApiError(
-                operation="delete PTY session",
-                status_code=int(response.status_code),
-                message=_error_message(response.content),
-            )
+    def delete_pty_session(self, vm_id: UUID, pty_id: UUID, *, deadline_seconds: float = 5.0) -> None:
+        """Delete a PTY lease; a lease that is already gone is not an error."""
+        deadline = _deadline(deadline_seconds)
+        operation = f"delete PTY session {pty_id}"
+        client = self.raw.get_httpx_client()
+        result: Future[None] = Future()
+
+        def delete() -> None:
+            try:
+                timeout = _request_timeout(client.timeout, _remaining(deadline, operation))
+                with client.stream(**delete_pty_session_api._get_kwargs(vm_id, pty_id), timeout=timeout) as response:
+                    _remaining(deadline, operation)
+                    if response.status_code not in {204, 404}:
+                        body = bytearray()
+                        for chunk in response.iter_bytes():
+                            _remaining(deadline, operation)
+                            body.extend(chunk[: 1024 - len(body)])
+                            if len(body) == 1024:
+                                break
+                        raise TaritApiError("delete PTY session", response.status_code, _error_message(bytes(body)))
+                result.set_result(None)
+            except BaseException as error:  # noqa: BLE001 - forward the worker failure to the caller
+                result.set_exception(error)
+            finally:
+                _CLEANUP_SLOTS.release()
+
+        if not _CLEANUP_SLOTS.acquire(timeout=_remaining(deadline, operation)):
+            raise TaritDeadlineExceeded(f"{operation} exceeded its deadline")
+        try:
+            threading.Thread(target=delete, name="tarit-pty-cleanup", daemon=True).start()
+        except BaseException:
+            _CLEANUP_SLOTS.release()
+            raise
+        done, _ = wait([result], timeout=_remaining(deadline, operation))
+        if not done:
+            raise TaritDeadlineExceeded(f"{operation} exceeded its deadline")
+        _remaining(deadline, operation)
+        result.result()
 
     def open_pty(
         self,
@@ -375,17 +432,21 @@ class TaritClient:
         _validate_pty_options(cols, rows, deadline_seconds, max_message_bytes)
         deadline = time.monotonic() + deadline_seconds
         try:
-            response = self.raw.get_httpx_client().post(
-                f"/v1/vms/{vm_id}/pty/sessions",
+            response = self._request(
+                deadline,
+                f"open PTY for VM {vm_id}",
+                check_response_deadline=False,
+                method="POST",
+                url=f"/v1/vms/{vm_id}/pty/sessions",
                 json=_pty_request(cols, rows, shell).to_dict(),
-                timeout=deadline_seconds,
             )
         except httpx.TimeoutException as error:
             raise TaritDeadlineExceeded(f"open PTY for VM {vm_id} exceeded its deadline") from error
         session = _pty_session_from_response(response)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            self._delete_pty_session(vm_id, session.pty_id)
+            with suppress(Exception):
+                self.delete_pty_session(vm_id, session.pty_id)
             raise TaritDeadlineExceeded(f"open PTY for VM {vm_id} exceeded its deadline")
         url = _pty_websocket_url(self._base_url, vm_id, session.pty_id, session.connect_token)
         try:
@@ -398,7 +459,7 @@ class TaritClient:
             )
         except Exception as error:
             try:
-                self._delete_pty_session(vm_id, session.pty_id)
+                self.delete_pty_session(vm_id, session.pty_id)
             except Exception:  # noqa: BLE001,S110
                 pass
             raise TaritPtyConnectionError("PTY WebSocket connection failed") from error
@@ -424,6 +485,7 @@ class TaritClient:
         *,
         child_id: UUID | None = None,
         deadline_seconds: float = 30.0,
+        accept_late_response: bool = False,
     ) -> ForkVmResponse:
         """Fork with one retry id, also exposed on TaritDeadlineExceeded.child_id."""
         deadline = _deadline(deadline_seconds)
@@ -434,15 +496,17 @@ class TaritClient:
             while True:
                 try:
                     response = self._request(
-                        deadline, operation, **fork_vm_api._get_kwargs(vm_id, body=ForkVmRequest(id=child_id))
+                        deadline,
+                        operation,
+                        check_response_deadline=not accept_late_response,
+                        **fork_vm_api._get_kwargs(vm_id, body=ForkVmRequest(id=child_id)),
                     )
                 except httpx.TransportError:
                     response = None
                 if response is not None and response.status_code not in RETRYABLE_STATUS:
-                    result = _parsed(
-                        fork_vm_api._build_response(client=self.raw, response=response), ForkVmResponse, "fork VM"
-                    )
-                    _remaining(deadline, operation)
+                    result = _fork_result(self.raw, response, child_id)
+                    if not accept_late_response:
+                        _remaining(deadline, operation)
                     return result
                 time.sleep(min(_retry_delay(attempt), _remaining(deadline, operation)))
                 attempt += 1
@@ -536,8 +600,7 @@ class AsyncTaritClient:
         verify_ssl: bool = True,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
-        if not api_key:
-            raise ValueError("api_key must not be empty")
+        _validate_api_key(api_key)
         self._base_url = base_url.rstrip("/")
         self._verify_ssl = verify_ssl
         self.raw = AuthenticatedClient(
@@ -562,8 +625,13 @@ class AsyncTaritClient:
     async def __aexit__(self, *_args: object) -> None:
         await self.close()
 
-    async def _delete_pty_session(self, vm_id: UUID, pty_id: UUID) -> None:
-        response = await delete_pty_session_api.asyncio_detailed(vm_id, pty_id, client=self.raw)
+    async def delete_pty_session(self, vm_id: UUID, pty_id: UUID, *, deadline_seconds: float = 5.0) -> None:
+        """Delete a PTY lease; a lease that is already gone is not an error."""
+        response = await self._request(
+            _deadline(deadline_seconds),
+            f"delete PTY session {pty_id}",
+            **delete_pty_session_api._get_kwargs(vm_id, pty_id),
+        )
         if int(response.status_code) not in {204, 404}:
             raise TaritApiError(
                 operation="delete PTY session",
@@ -585,17 +653,21 @@ class AsyncTaritClient:
         _validate_pty_options(cols, rows, deadline_seconds, max_message_bytes)
         deadline = time.monotonic() + deadline_seconds
         try:
-            response = await self.raw.get_async_httpx_client().post(
-                f"/v1/vms/{vm_id}/pty/sessions",
+            response = await self._request(
+                deadline,
+                f"open PTY for VM {vm_id}",
+                check_response_deadline=False,
+                method="POST",
+                url=f"/v1/vms/{vm_id}/pty/sessions",
                 json=_pty_request(cols, rows, shell).to_dict(),
-                timeout=deadline_seconds,
             )
         except httpx.TimeoutException as error:
             raise TaritDeadlineExceeded(f"open PTY for VM {vm_id} exceeded its deadline") from error
         session = _pty_session_from_response(response)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            await self._delete_pty_session(vm_id, session.pty_id)
+            with suppress(Exception):
+                await self.delete_pty_session(vm_id, session.pty_id)
             raise TaritDeadlineExceeded(f"open PTY for VM {vm_id} exceeded its deadline")
         url = _pty_websocket_url(self._base_url, vm_id, session.pty_id, session.connect_token)
         try:
@@ -606,11 +678,14 @@ class AsyncTaritClient:
                 max_size=max_message_bytes,
                 ssl=_websocket_ssl_context(self._base_url, self._verify_ssl),
             )
+        except asyncio.CancelledError:
+            # The lease is known; release it without turning cancellation into an API error.
+            with suppress(Exception):
+                await self.delete_pty_session(vm_id, session.pty_id)
+            raise
         except Exception as error:
-            try:
-                await self._delete_pty_session(vm_id, session.pty_id)
-            except Exception:  # noqa: BLE001,S110
-                pass
+            with suppress(Exception):
+                await self.delete_pty_session(vm_id, session.pty_id)
             raise TaritPtyConnectionError("PTY WebSocket connection failed") from error
         return AsyncPtyConnection(self, vm_id, session.pty_id, websocket)
 
@@ -638,6 +713,7 @@ class AsyncTaritClient:
         *,
         child_id: UUID | None = None,
         deadline_seconds: float = 30.0,
+        accept_late_response: bool = False,
     ) -> ForkVmResponse:
         deadline = _deadline(deadline_seconds)
         child_id = child_id or uuid4()
@@ -647,15 +723,17 @@ class AsyncTaritClient:
             while True:
                 try:
                     response = await self._request(
-                        deadline, operation, **fork_vm_api._get_kwargs(vm_id, body=ForkVmRequest(id=child_id))
+                        deadline,
+                        operation,
+                        check_response_deadline=not accept_late_response,
+                        **fork_vm_api._get_kwargs(vm_id, body=ForkVmRequest(id=child_id)),
                     )
                 except httpx.TransportError:
                     response = None
                 if response is not None and response.status_code not in RETRYABLE_STATUS:
-                    result = _parsed(
-                        fork_vm_api._build_response(client=self.raw, response=response), ForkVmResponse, "fork VM"
-                    )
-                    _remaining(deadline, operation)
+                    result = _fork_result(self.raw, response, child_id)
+                    if not accept_late_response:
+                        _remaining(deadline, operation)
                     return result
                 await asyncio.sleep(min(_retry_delay(attempt), _remaining(deadline, operation)))
                 attempt += 1

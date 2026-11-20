@@ -27,6 +27,9 @@ install -m 0644 "$ROOT/LICENSE" "$ROOT/sdk/typescript/LICENSE"
 uvx --from "ruff==$RUFF_VERSION" ruff check --fix-only "$ROOT/sdk/python"
 uvx --from "ruff==$RUFF_VERSION" ruff format "$ROOT/sdk/python"
 
+# Strict Python callers have historically received UnexpectedStatus on a fleet outage.
+git -C "$ROOT" apply "$ROOT/sdk/python-snapshot-compat.patch"
+
 find "$ROOT/sdk/typescript/src/generated" -mindepth 1 -delete 2>/dev/null || true
 npx --yes \
   "openapi-typescript@$TYPESCRIPT_CLIENT_VERSION" \

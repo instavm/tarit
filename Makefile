@@ -24,7 +24,7 @@ all: build
 build: vmm taritd agent
 
 vmm: agent
-	$(CARGO) build --release --manifest-path vmm/Cargo.toml -p vmm $(if $(VMM_FEATURES),--features $(VMM_FEATURES),)
+	python3 scripts/build-vmm.py "$(VMM_FEATURES)" $(CARGO)
 
 taritd:
 	$(CARGO) build --release --manifest-path orch/Cargo.toml -p taritd
@@ -41,12 +41,13 @@ guest:
 # Install host binaries plus the guest-only agent (use sudo for /usr/local).
 install:
 	@./scripts/check-install-artifact.sh vmm/target/release/vmm "make build" vmm/Cargo.lock
+	@./scripts/vmm-build-features.sh check vmm/target/release/vmm "$(VMM_FEATURES)" "make build"
 	@./scripts/check-install-artifact.sh orch/target/release/taritd "make build" orch/Cargo.lock
 	@test -x vmm/guest/agent/vmm-agent && $(MAKE) --no-print-directory -q -C vmm/guest/agent vmm-agent || \
 		{ echo "error: vmm/guest/agent/vmm-agent is missing or older than its source; run 'make build' as your regular user first, then install again" >&2; exit 1; }
 	install -d "$(DESTDIR)$(BINDIR)"
 	install -d "$(DESTDIR)$(LIBEXECDIR)"
-	install -m755 vmm/target/release/vmm     "$(DESTDIR)$(BINDIR)/vmm"
+	@./scripts/vmm-build-features.sh install vmm/target/release/vmm "$(VMM_FEATURES)" "make build" "$(DESTDIR)$(BINDIR)/vmm"
 	install -m755 orch/target/release/taritd "$(DESTDIR)$(BINDIR)/taritd"
 	install -m755 vmm/guest/agent/vmm-agent  "$(DESTDIR)$(LIBEXECDIR)/vmm-agent"
 	@echo "installed vmm + taritd to $(DESTDIR)$(BINDIR)"
@@ -55,8 +56,9 @@ install:
 # Install only the VMM.
 install-vmm:
 	@./scripts/check-install-artifact.sh vmm/target/release/vmm "make vmm" vmm/Cargo.lock
+	@./scripts/vmm-build-features.sh check vmm/target/release/vmm "$(VMM_FEATURES)" "make vmm"
 	install -d "$(DESTDIR)$(BINDIR)"
-	install -m755 vmm/target/release/vmm "$(DESTDIR)$(BINDIR)/vmm"
+	@./scripts/vmm-build-features.sh install vmm/target/release/vmm "$(VMM_FEATURES)" "make vmm" "$(DESTDIR)$(BINDIR)/vmm"
 	@echo "installed vmm to $(DESTDIR)$(BINDIR)"
 
 clean:

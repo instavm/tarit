@@ -436,6 +436,7 @@ export class TaritClient {
 
   constructor(options: TaritClientOptions) {
     if (!options.apiKey) throw new TypeError("apiKey must not be empty");
+    if (/[\r\n]/.test(options.apiKey)) throw new TypeError("apiKey must not contain CR or LF");
     this.baseUrl = options.baseUrl.replace(/\/$/, "");
     this.webSocketFactory = options.webSocketFactory ?? defaultWebSocketFactory;
     this.raw = createClient<paths>({
@@ -480,7 +481,7 @@ export class TaritClient {
     }
     const remaining = deadline - performance.now();
     if (remaining <= 0) {
-      await this.deletePtySession(vmId, created.pty_id);
+      await this.deletePtySession(vmId, created.pty_id).catch(() => undefined);
       throw new TaritDeadlineExceeded(`open PTY for VM ${vmId} exceeded its deadline`);
     }
     let connection: PtyConnection | undefined;
