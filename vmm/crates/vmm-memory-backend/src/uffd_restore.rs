@@ -1775,12 +1775,6 @@ mod tests {
         assert!(source.possibly_populated_pages().is_none());
         let fresh = lazy.page_discard_for_fresh_mapping();
         assert_eq!(fresh.possibly_populated_pages().unwrap(), [false; 4]);
-        // SAFETY: the registered mapping holds LEN live bytes.
-        assert_eq!(unsafe { std::ptr::read_volatile(guest.cast::<u8>()) }, 1);
-        assert_eq!(
-            fresh.possibly_populated_pages().unwrap(),
-            [true, true, false, false]
-        );
         assert_eq!(source.untouched_chunk(), CHUNK);
         // Page 1 is returned by the balloon before anything faults it in.
         source.discard(PAGE, PAGE).unwrap();
@@ -1802,6 +1796,13 @@ mod tests {
         std::os::unix::fs::FileExt::write_all_at(&file, &[0], (CHUNK + 5) as u64).unwrap();
         assert!(source.read_untouched(CHUNK, &mut out[..CHUNK]).is_err());
         assert!(source.read_untouched(0, &mut out[..CHUNK]).is_ok());
+
+        // SAFETY: the registered mapping holds LEN live bytes.
+        assert_eq!(unsafe { std::ptr::read_volatile(guest.cast::<u8>()) }, 1);
+        assert_eq!(
+            fresh.possibly_populated_pages().unwrap(),
+            [true, true, false, false]
+        );
 
         drop(lazy);
         // SAFETY: `guest` is still mapped.
