@@ -426,9 +426,19 @@ fn write_lazy_restored_pages(
     cloning_time: &mut Duration,
 ) -> Result<u64> {
     let page = PAGE_SIZE as usize;
-    let populated = mem
+    // A jailed VMM has no procfs. The fault handler can still identify
+    // untouched chunks for an authenticated restore into fresh guest RAM.
+    let Some(populated) = mem
         .populated_pages()
-        .ok_or_else(|| VmmError::Snapshot("read the guest page map".into()))?;
+        .or_else(|| lazy.possibly_populated_pages())
+    else {
+        // Without either map, read the live mapping so modified and
+        // swapped pages come from the guest, and missing pages are supplied
+        // by the normal restore handler (including its integrity checks).
+        // The caller holds the discard fence and replays concurrent writes.
+        return write_nonzero_pages(dest, source, 0)
+            .map_err(|error| VmmError::Snapshot(format!("write bulk staged RAM: {error}")));
+    };
     let chunk = lazy.untouched_chunk();
     let mut buffer = vec![0u8; chunk];
     let mut written = 0u64;

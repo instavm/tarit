@@ -6925,7 +6925,7 @@ fn try_lazy_restore_full_snapshot(
         chunk_integrity,
     )
     .map_err(|e| VmmError::Snapshot(format!("UFFD lazy restore: {e}")))?;
-    mem.set_lazy_page_discard(lazy_restore.page_discard());
+    mem.set_lazy_page_discard(lazy_restore.page_discard_for_fresh_mapping());
 
     log::info!(
         "restore: UFFD lazy full snapshot armed (mem_offset={}, mem_len={})",

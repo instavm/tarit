@@ -9,8 +9,20 @@ umask 077
 
 ORCH_ROOT="${ORCH_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 VMM_ROOT="${VMM_ROOT:-$ORCH_ROOT/../vmm}"
-TARITD="${TARITD_BIN:-$ORCH_ROOT/target/release/taritd}"
-VMM="${VMM_BIN:-$VMM_ROOT/target/release/vmm}"
+if [[ "${TARIT_TEST_NEAR_ENOSPC:-0}" = 1 || "${TARIT_TEST_CROSS_NODE_FORK_DEATH:-0}" = 1 ]]; then
+  # Both sides compare scratch file identity, including the creation time
+  # reported by their libc. Build both together with make peer-test-binaries.
+  if [[ -n "${TARITD_BIN:-}" && -z "${VMM_BIN:-}" || -z "${TARITD_BIN:-}" && -n "${VMM_BIN:-}" ]]; then
+    echo 'FAIL: set TARITD_BIN and VMM_BIN together to a matched failpoint build' >&2
+    exit 1
+  fi
+  peer_bin="$ORCH_ROOT/target/peer-test/x86_64-unknown-linux-musl/release"
+  TARITD="${TARITD_BIN:-$peer_bin/taritd}"
+  VMM="${VMM_BIN:-$peer_bin/vmm}"
+else
+  TARITD="${TARITD_BIN:-$ORCH_ROOT/target/release/taritd}"
+  VMM="${VMM_BIN:-$VMM_ROOT/target/release/vmm}"
+fi
 KERNEL="${KERNEL:-/tmp/vmlinux.microvm}"
 AGENT="${AGENT:-$VMM_ROOT/guest/agent/vmm-agent}"
 SECRET="0123456789abcdef0123456789abcdef-artifact-e2e"
@@ -117,7 +129,7 @@ cleanup() {
   fi
   if [ "$status" -ne 0 ]; then
     echo "FAIL: preserving diagnostics before peer artifact cleanup (status $status)" >&2
-    tail -120 "$DIR"/*.log 2>/dev/null || true
+    tail -n 120 -- "$DIR"/node-*.log >&2 || true
     find "$DIR" -maxdepth 3 -type f -name '*.json' -size -64k \
       -exec sh -c 'echo "== $1 ==" >&2; cat "$1" >&2' _ {} \; 2>/dev/null || true
   fi
@@ -183,7 +195,7 @@ cleanup() {
   return "$status"
 }
 trap cleanup EXIT
-trap 'status=$?; echo "FAIL: peer artifact gate exited $status" >&2; tail -120 "$DIR"/*.log 2>/dev/null || true' ERR
+trap 'echo "FAIL: peer artifact gate exited $? at line $LINENO" >&2' ERR
 
 for required in curl exportfs findmnt mount.nfs4 openssl python3 psql createdb sqlite3 skopeo systemctl timeout umoci e2fsck; do
   command -v "$required" >/dev/null || { echo "FAIL: missing $required" >&2; exit 1; }
@@ -395,9 +407,10 @@ PY
 echo '== start two exact-release Postgres+mTLS peers =='
 start_node node-a zone-a "$A_CONTROL" "$A_PEER" "$DIR/node-a.log"
 A_PID=$LAST_PID
+# Let the first peer initialize the shared fleet schema before starting the second.
+wait_health "http://127.0.0.1:$A_CONTROL" "$A_PID"
 start_node node-b zone-b "$B_CONTROL" "$B_PEER" "$DIR/node-b.log"
 B_PID=$LAST_PID
-wait_health "http://127.0.0.1:$A_CONTROL" "$A_PID"
 wait_health "http://127.0.0.1:$B_CONTROL" "$B_PID"
 
 echo '== build and boot a real Ubuntu 24.04 OCI image on node A =='
@@ -916,10 +929,10 @@ PGPASSWORD="$DB_PASSWORD" psql "$DATABASE_URL" -qAtc \
   "select replication_state from fleet_artifacts where artifact_id='$ARTIFACT_ID'" | grep -qx degraded
 
 echo '== start node C and continuously repair the degraded replica set =='
+test ! -e "$DIR/node-c"
 start_node node-c zone-c "$C_CONTROL" "$C_PEER" "$DIR/node-c.log"
 C_PID=$LAST_PID
 wait_health "http://127.0.0.1:$C_CONTROL" "$C_PID"
-test "$(sqlite3 "$DIR/node-c/store.db" 'select count(*) from images')" = 0
 REPAIR_STATE=""
 for _ in $(seq 1 60); do
   REPAIR_STATE=$(PGPASSWORD="$DB_PASSWORD" psql "$DATABASE_URL" -qAtc \
@@ -953,7 +966,7 @@ assert not ({"owner_key","host_id","storage_locator","failure_domain"} & set(row
 assert "/" not in row["name"], row
 PY
 
-echo '== last branch deletion preserves a live lazy restore, then physical replicas converge =='
+echo '== last branch deletion preserves the live restore and its user snapshot =='
 B_REPLICA_RAM=$(sqlite3 "$DIR/node-b/store.db" \
   "select path from snapshots where snapshot_id='$ARTIFACT_ID'")
 B_REPLICA_OVERLAY=$(sqlite3 "$DIR/node-b/store.db" \
@@ -968,10 +981,24 @@ PGPASSWORD="$DB_PASSWORD" psql "$DATABASE_URL" -qAtc \
 wait_exec_ubuntu "http://127.0.0.1:$B_CONTROL" "$RESTORED_VM"
 api_json DELETE "http://127.0.0.1:$B_CONTROL/v1/vms/$RESTORED_VM" >/dev/null
 RESTORED_VM=""
+# This snapshot was created explicitly on A. Dropping its last runtime
+# reference must leave it available until the tenant deletes it.
+PGPASSWORD="$DB_PASSWORD" psql "$DATABASE_URL" -qAtc \
+  "select count(*) from fleet_artifacts a join fleet_snapshots s on s.snapshot_id=a.artifact_id
+    where a.artifact_id='$ARTIFACT_ID' and a.reference_count=0 and s.retain_artifact" | grep -qx 1
+test -f "$B_REPLICA_RAM"
+test -f "$C_REPLICA_RAM"
+
+echo '== explicitly delete the retained snapshot on A and collect its replicas =='
+start_node node-a zone-a "$A_CONTROL" "$A_PEER" "$DIR/node-a-restarted.log"
+A_PID=$LAST_PID
+wait_health "http://127.0.0.1:$A_CONTROL" "$A_PID"
+api_json DELETE "http://127.0.0.1:$A_CONTROL/v1/snapshots/$ARTIFACT_ID" >/dev/null
 GC_CONVERGED=0
 for _ in $(seq 1 60); do
   GLOBAL_COUNT=$(PGPASSWORD="$DB_PASSWORD" psql "$DATABASE_URL" -qAtc \
-    "select count(*) from fleet_artifacts where artifact_id='$ARTIFACT_ID'")
+    "select (select count(*) from fleet_artifacts where artifact_id='$ARTIFACT_ID') +
+            (select count(*) from fleet_snapshots where snapshot_id='$ARTIFACT_ID')")
   B_LOCAL=$(sqlite3 "$DIR/node-b/store.db" \
     "select (select count(*) from artifacts where artifact_id='$ARTIFACT_ID') + (select count(*) from snapshots where snapshot_id='$ARTIFACT_ID')")
   C_LOCAL=$(sqlite3 "$DIR/node-c/store.db" \
@@ -989,4 +1016,4 @@ for deleted in \
   [ -z "$deleted" ] || test ! -e "$deleted"
 done
 
-echo "PASS source=${TARIT_SOURCE_REVISION:-unknown}: atomic live fork started its isolated child across nodes; boot metadata failed closed; Ubuntu OCI artifacts used peer mTLS; hibernate reached zero; stale owner was fenced; HTTP exec woke the same VM ID on B with durable egress and its shared-volume attachment; cross-node volume deletion removed the backing object; branch restored; node C repaired degradation; last-branch deletion preserved the live lazy restore and physical replica GC converged"
+echo "PASS source=${TARIT_SOURCE_REVISION:-unknown}: atomic live fork started its isolated child across nodes; boot metadata failed closed; Ubuntu OCI artifacts used peer mTLS; hibernate reached zero; stale owner was fenced; HTTP exec woke the same VM ID on B with durable egress and its shared-volume attachment; cross-node volume deletion removed the backing object; branch restored; node C repaired degradation; last-branch deletion preserved the live lazy restore and user snapshot; explicit snapshot deletion collected the replicas"

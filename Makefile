@@ -16,7 +16,7 @@ CARGO ?= cargo
 # On macOS, build the host-only paths with `make VMM_FEATURES=`.
 VMM_FEATURES ?= boot
 
-.PHONY: all build vmm taritd agent install install-vmm guest clean
+.PHONY: all build vmm taritd agent install install-vmm guest clean peer-test-binaries
 
 # Build both binaries and the guest agent (default).
 all: build
@@ -28,6 +28,16 @@ vmm: agent
 
 taritd:
 	$(CARGO) build --release --manifest-path orch/Cargo.toml -p taritd
+
+# Build the peer fault-injection fixture separately from installable binaries.
+# Use the release cross compiler by default, or PEER_CARGO_BUILD=build with a
+# configured native musl toolchain. Both binaries must use the same target.
+PEER_CARGO_BUILD ?= zigbuild
+PEER_BUILD_FLAGS = --release --locked --target x86_64-unknown-linux-musl --target-dir "$(CURDIR)/orch/target/peer-test"
+
+peer-test-binaries:
+	$(CARGO) $(PEER_CARGO_BUILD) $(PEER_BUILD_FLAGS) --manifest-path orch/Cargo.toml -p taritd --features test-failpoints
+	$(CARGO) $(PEER_CARGO_BUILD) $(PEER_BUILD_FLAGS) --manifest-path vmm/Cargo.toml -p vmm --features boot
 
 # Static guest exec agent (used as PID 1 / exec server inside the microVM).
 agent:
