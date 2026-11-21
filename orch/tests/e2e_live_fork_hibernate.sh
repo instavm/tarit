@@ -509,6 +509,13 @@ PY
 fi
 echo "hibernate_http_resume_ms=$((RESUME_END-RESUME_START))"
 
+echo "== fork a resumed guest and verify its post-resume RAM =="
+expect_exec "$PARENT_ID" "sh -c 'echo after-resume > /tmp/tarit-resume-proof'" ""
+RESUMED_FORK=$(api -H 'Content-Type: application/json' -d '{}' "$BASE_URL/v1/vms/$PARENT_ID/fork")
+RESUMED_CHILD_ID=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["vm"]["id"])' <<<"$RESUMED_FORK")
+expect_exec "$RESUMED_CHILD_ID" 'cat /tmp/tarit-resume-proof' 'after-resume'
+api -X DELETE "$BASE_URL/v1/vms/$RESUMED_CHILD_ID" >/dev/null
+
 echo "== PTY API is also an activation source =="
 api -H 'Content-Type: application/json' -d '{}' "$BASE_URL/v1/vms/$CHILD_ID/hibernate" | grep -q '"status":"hibernated"'
 [ -z "$(vmm_pids_for_id "$CHILD_ID")" ] || { echo "FAIL: child VMM survived hibernate"; exit 1; }

@@ -60,6 +60,7 @@ pub struct LazyPageDiscard {
     // restored with. A live snapshot of this guest records it as the next
     // restore's working set.
     touched: Option<TouchedChunks>,
+    initially_missing: bool,
 }
 
 /// One bit per integrity chunk, set by the fault handler.
@@ -142,6 +143,28 @@ impl LazyPageDiscard {
         self.touched
             .as_ref()
             .map_or_else(Vec::new, TouchedChunks::indices)
+    }
+
+    /// A conservative page map when this range started entirely missing. A
+    /// chunk that the handler has never attempted to populate still comes
+    /// from the snapshot. A marked chunk can include pages still missing.
+    pub fn possibly_populated_pages(&self) -> Option<Vec<bool>> {
+        const PAGE: usize = 4096;
+        if !self.initially_missing {
+            return None;
+        }
+        let touched = self.touched.as_ref()?;
+        let chunk_pages = self.untouched_chunk() / PAGE;
+        let mut pages = vec![false; self.guest_len / PAGE];
+        // Synchronize with in-flight copy/zeropage ioctls before sampling the
+        // bits. Subsequent writes are covered by the live snapshot dirty log.
+        let _guard = self.discarded_pages.lock().ok()?;
+        for chunk in touched.indices() {
+            let start = chunk as usize * chunk_pages;
+            let end = (start + chunk_pages).min(pages.len());
+            pages[start..end].fill(true);
+        }
+        Some(pages)
     }
 
     /// The unit [`Self::read_untouched`] reads: one integrity chunk, or
@@ -419,6 +442,15 @@ impl LazyPageDiscard {
 impl LazyRestore {
     pub fn page_discard(&self) -> LazyPageDiscard {
         self.page_discard.clone()
+    }
+
+    /// Use only for a newly allocated, untouched anonymous mapping. An
+    /// in-place restore can have live pages that never faulted through UFFD.
+    pub fn page_discard_for_fresh_mapping(&self) -> LazyPageDiscard {
+        LazyPageDiscard {
+            initially_missing: true,
+            ..self.page_discard()
+        }
     }
 
     #[cfg(all(feature = "test-failpoints", test))]
@@ -888,6 +920,7 @@ pub fn start_lazy_restore_with_integrity(
                 integrity: source_integrity,
             },
             touched,
+            initially_missing: false,
         },
     })
 }
@@ -1306,6 +1339,13 @@ fn fault_handler_loop(context: FaultHandlerContext) {
             }
         };
 
+        // A copy can wake a writer before ioctl returns, or populate only
+        // part of a chunk before an error. Publish the whole attempted range
+        // under the discard lock before making any page accessible.
+        if let (Some(touched), Some(integrity)) = (&touched, &chunk_integrity) {
+            touched.mark(copy_offset / integrity.chunk_size);
+        }
+
         // A chunk the manifest records as all zeros needs neither a read nor
         // a hash: zeros are exactly its authenticated content, which
         // UFFDIO_ZEROPAGE maps without copying. A discard inside it changes
@@ -1499,9 +1539,6 @@ fn fault_handler_loop(context: FaultHandlerContext) {
                     if let Some(word) = served_chunks.get_mut(chunk / 64) {
                         *word |= 1 << (chunk % 64);
                     }
-                }
-                if let Some(touched) = touched.as_ref() {
-                    touched.mark(chunk);
                 }
             }
             if prefetching {
@@ -1735,6 +1772,15 @@ mod tests {
             Err(error) => panic!("start lazy restore: {error}"),
         };
         let source = lazy.page_discard();
+        assert!(source.possibly_populated_pages().is_none());
+        let fresh = lazy.page_discard_for_fresh_mapping();
+        assert_eq!(fresh.possibly_populated_pages().unwrap(), [false; 4]);
+        // SAFETY: the registered mapping holds LEN live bytes.
+        assert_eq!(unsafe { std::ptr::read_volatile(guest.cast::<u8>()) }, 1);
+        assert_eq!(
+            fresh.possibly_populated_pages().unwrap(),
+            [true, true, false, false]
+        );
         assert_eq!(source.untouched_chunk(), CHUNK);
         // Page 1 is returned by the balloon before anything faults it in.
         source.discard(PAGE, PAGE).unwrap();

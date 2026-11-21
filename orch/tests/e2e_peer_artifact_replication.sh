@@ -9,8 +9,20 @@ umask 077
 
 ORCH_ROOT="${ORCH_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 VMM_ROOT="${VMM_ROOT:-$ORCH_ROOT/../vmm}"
-TARITD="${TARITD_BIN:-$ORCH_ROOT/target/release/taritd}"
-VMM="${VMM_BIN:-$VMM_ROOT/target/release/vmm}"
+if [[ "${TARIT_TEST_NEAR_ENOSPC:-0}" = 1 || "${TARIT_TEST_CROSS_NODE_FORK_DEATH:-0}" = 1 ]]; then
+  # Both sides compare scratch file identity, including the creation time
+  # reported by their libc. Build both together with make peer-test-binaries.
+  if [[ -n "${TARITD_BIN:-}" && -z "${VMM_BIN:-}" || -z "${TARITD_BIN:-}" && -n "${VMM_BIN:-}" ]]; then
+    echo 'FAIL: set TARITD_BIN and VMM_BIN together to a matched failpoint build' >&2
+    exit 1
+  fi
+  peer_bin="$ORCH_ROOT/target/peer-test/x86_64-unknown-linux-musl/release"
+  TARITD="${TARITD_BIN:-$peer_bin/taritd}"
+  VMM="${VMM_BIN:-$peer_bin/vmm}"
+else
+  TARITD="${TARITD_BIN:-$ORCH_ROOT/target/release/taritd}"
+  VMM="${VMM_BIN:-$VMM_ROOT/target/release/vmm}"
+fi
 KERNEL="${KERNEL:-/tmp/vmlinux.microvm}"
 AGENT="${AGENT:-$VMM_ROOT/guest/agent/vmm-agent}"
 SECRET="0123456789abcdef0123456789abcdef-artifact-e2e"
@@ -395,9 +407,10 @@ PY
 echo '== start two exact-release Postgres+mTLS peers =='
 start_node node-a zone-a "$A_CONTROL" "$A_PEER" "$DIR/node-a.log"
 A_PID=$LAST_PID
+# Let the first peer initialize the shared fleet schema before starting the second.
+wait_health "http://127.0.0.1:$A_CONTROL" "$A_PID"
 start_node node-b zone-b "$B_CONTROL" "$B_PEER" "$DIR/node-b.log"
 B_PID=$LAST_PID
-wait_health "http://127.0.0.1:$A_CONTROL" "$A_PID"
 wait_health "http://127.0.0.1:$B_CONTROL" "$B_PID"
 
 echo '== build and boot a real Ubuntu 24.04 OCI image on node A =='
