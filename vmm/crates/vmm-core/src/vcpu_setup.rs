@@ -330,6 +330,24 @@ pub fn write_acpi_tables_with_devices(
         (1 << FADT_F_HW_REDUCED_ACPI) | (1 << FADT_F_PWR_BUTTON) | (1 << FADT_F_SLP_BUTTON),
     );
     fadt.setup_iapc_flags(1 << IAPC_BOOT_ARG_FLAGS_VGA_NOT_PRESENT);
+    // ACPI power off (S5): 8-bit SystemIO sleep control/status registers;
+    // with the DSDT's \_S5_ Linux powers off through them (vcpu::is_acpi_s5_poweroff).
+    const SYSTEM_IO: u8 = 1;
+    const BYTE_ACCESS: u8 = 1;
+    fadt.set_sleep_control_reg(acpi_tables::GenericAddressStructure::new(
+        SYSTEM_IO,
+        8,
+        0,
+        BYTE_ACCESS,
+        crate::vcpu::ACPI_SLEEP_CONTROL_PORT.into(),
+    ));
+    fadt.set_sleep_status_reg(acpi_tables::GenericAddressStructure::new(
+        SYSTEM_IO,
+        8,
+        0,
+        BYTE_ACCESS,
+        crate::vcpu::ACPI_SLEEP_STATUS_PORT.into(),
+    ));
     fadt.write_to_guest(mem.inner.as_ref(), GuestAddress(fadt_addr))
         .map_err(map_acpi)?;
 
@@ -386,7 +404,27 @@ fn build_dsdt(devices: &[(u64, u64, u32, bool)]) -> Result<Vec<u8>> {
     }
     append_vmgenid_aml(&mut aml)?;
     append_legacy_aml(&mut aml)?;
+    append_s5_aml(&mut aml)?;
     Ok(aml)
+}
+
+/// `Name (\_S5_, Package (1) { 5 })`: the S5 sleep type Linux writes to the
+/// FADT's sleep control register to power off (vcpu::ACPI_S5_SLEEP_TYPE).
+fn append_s5_aml(aml: &mut Vec<u8>) -> Result<()> {
+    use acpi_tables::aml::{self, AmlError};
+    use acpi_tables::Aml;
+
+    fn map_aml(e: AmlError) -> VmmError {
+        VmmError::Memory(format!("AML encode: {e}"))
+    }
+
+    aml::Name::new(
+        "_S5_".try_into().map_err(map_aml)?,
+        &aml::Package::new(vec![&crate::vcpu::ACPI_S5_SLEEP_TYPE]),
+    )
+    .map_err(map_aml)?
+    .append_aml_bytes(aml)
+    .map_err(map_aml)
 }
 
 fn append_vmgenid_aml(aml: &mut Vec<u8>) -> Result<()> {
@@ -993,6 +1031,38 @@ mod tests {
             0x1234_5678,
             "unrelated host features must not be accidentally rewritten"
         );
+    }
+
+    /// The guest can power off: the FADT names the 8-bit SystemIO sleep control
+    /// and status registers at 0x600/0x601 (FADT rev 6 offsets 244 and 256) and
+    /// the DSDT declares `\_S5_` = 5, which Linux needs before it offers S5.
+    #[test]
+    fn acpi_tables_offer_s5_power_off() {
+        use acpi_tables::aml::{self, Aml};
+
+        let mem = GuestMemory::new(1 << 20).unwrap();
+        write_acpi_tables(&mem, 1).unwrap();
+        let mut fadt = [0u8; 276];
+        mem.read_phys(0xe4000, &mut fadt).unwrap();
+        assert_eq!(&fadt[..4], b"FACP");
+        assert_eq!(u32::from_le_bytes(fadt[4..8].try_into().unwrap()), 276);
+        assert_eq!(fadt[244..256], [1, 8, 0, 1, 0x00, 0x06, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(fadt[256..268], [1, 8, 0, 1, 0x01, 0x06, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            fadt.iter().fold(0u8, |sum, b| sum.wrapping_add(*b)),
+            0,
+            "checksum"
+        );
+
+        let mut s5 = Vec::new();
+        aml::Name::new("_S5_".try_into().unwrap(), &aml::Package::new(vec![&5u8]))
+            .unwrap()
+            .append_aml_bytes(&mut s5)
+            .unwrap();
+        let dsdt = build_dsdt(&[]).unwrap();
+        assert!(dsdt.windows(s5.len()).any(|window| window == s5));
+        // Still one page, the room vmgenid::require_snapshot_support reads.
+        assert!(dsdt.len() + 36 <= 0x1000);
     }
 
     /// Dump DSDT bytes for manual verification against iasl reference.

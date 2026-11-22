@@ -670,11 +670,19 @@ fn handle_io_exit(
             } else if crate::vcpu::is_i8042_reset(port, data) {
                 log::info!("i8042 reset (port 0x64, 0xFE) — guest rebooting; vCPU stopping");
                 return Ok(ExitAction::GuestStop);
+            } else if crate::vcpu::is_acpi_s5_poweroff(port, data) {
+                log::info!("ACPI S5 (sleep control 0x600) — guest powered off; vCPU stopping");
+                return Ok(ExitAction::GuestStop);
             }
         }
         VcpuExit::IoIn(port, data) => {
             if (0x3f8..=0x3ff).contains(&port) {
                 data[0] = serial.read((port - 0x3f8) as u8);
+            } else if port == crate::vcpu::ACPI_SLEEP_STATUS_PORT
+                || port == crate::vcpu::ACPI_SLEEP_CONTROL_PORT
+            {
+                // No wake event is ever pending.
+                data.fill(0);
             }
         }
         // A triple fault (Linux's last reboot method) or a reset, shutdown
@@ -885,6 +893,30 @@ mod tests {
                 ExitAction::GuestStop
             );
         }
+        // ACPI power off: SLP_TYP=S5 | SLP_EN to the sleep control register.
+        assert_eq!(
+            action(VcpuExit::IoOut(0x600, &[(5 << 2) | (1 << 5)])),
+            ExitAction::GuestStop
+        );
+        // Other sleep types, a write without SLP_EN, and clearing WAK_STS run on.
+        assert_eq!(
+            action(VcpuExit::IoOut(0x600, &[(3 << 2) | (1 << 5)])),
+            ExitAction::Continue
+        );
+        assert_eq!(
+            action(VcpuExit::IoOut(0x600, &[5 << 2])),
+            ExitAction::Continue
+        );
+        assert_eq!(
+            action(VcpuExit::IoOut(0x601, &[0x80])),
+            ExitAction::Continue
+        );
+        let mut wake = [0xffu8];
+        assert_eq!(
+            action(VcpuExit::IoIn(0x601, &mut wake)),
+            ExitAction::Continue
+        );
+        assert_eq!(wake, [0]);
         assert_eq!(action(VcpuExit::IoOut(0x64, &[0xad])), ExitAction::Continue);
         assert_eq!(action(VcpuExit::IoOut(0x60, &[0xfe])), ExitAction::Continue);
         assert_eq!(action(VcpuExit::IoOut(0x80, &[0x00])), ExitAction::Continue);
@@ -895,7 +927,7 @@ mod tests {
         );
     }
 
-    /// A real guest's i8042 reset and triple fault each end the vCPU thread
+    /// A real guest's i8042 reset, ACPI S5 power off and triple fault each end the vCPU thread
     /// promptly and without error, so the controller can record the VM as
     /// stopped; a guest that keeps running keeps its thread.
     #[test]
@@ -905,6 +937,11 @@ mod tests {
         for (name, program) in [
             // mov al, 0xfe; out 0x64, al; jmp $
             ("i8042 reset", &[0xb0, 0xfe, 0xe6, 0x64, 0xeb, 0xfe][..]),
+            // mov dx, 0x600; mov al, 0x34 (SLP_TYP=S5 | SLP_EN); out dx, al; jmp $
+            (
+                "ACPI S5 power off",
+                &[0xba, 0x00, 0x06, 0xb0, 0x34, 0xee, 0xeb, 0xfe][..],
+            ),
             // lidt [0x3100] (zero limit); int3; jmp $ — the breakpoint cannot
             // be delivered, nor can the faults that follow: a triple fault.
             (
@@ -933,19 +970,26 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{name}: {error}"));
         }
 
-        // A guest writing other i8042 commands keeps running.
-        // mov al, 0xad; out 0x64, al; jmp $
-        let (vm, _mem) = real_mode_vm(&kvm, &[0xb0, 0xad, 0xe6, 0x64, 0xeb, 0xfe]);
-        let thread = VcpuThread::spawn(
-            VcpuId(0),
-            real_mode_vcpu(&vm),
-            Arc::new(MmioBus::new()),
-            test_serial(),
-        )
-        .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        assert!(!thread.is_exited());
-        thread.stop().unwrap();
+        // A guest writing other i8042 commands, or clearing its ACPI wake
+        // status, keeps running.
+        for program in [
+            // mov al, 0xad; out 0x64, al; jmp $
+            &[0xb0, 0xad, 0xe6, 0x64, 0xeb, 0xfe][..],
+            // mov dx, 0x601; mov al, 0x80; out dx, al; jmp $
+            &[0xba, 0x01, 0x06, 0xb0, 0x80, 0xee, 0xeb, 0xfe][..],
+        ] {
+            let (vm, _mem) = real_mode_vm(&kvm, program);
+            let thread = VcpuThread::spawn(
+                VcpuId(0),
+                real_mode_vcpu(&vm),
+                Arc::new(MmioBus::new()),
+                test_serial(),
+            )
+            .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(!thread.is_exited());
+            thread.stop().unwrap();
+        }
     }
 
     /// #126: a vCPU thread started with `spawn_parked` runs no guest
