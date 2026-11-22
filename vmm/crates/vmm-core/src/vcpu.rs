@@ -230,6 +230,21 @@ mod tests {
         assert!(!is_i8042_reset(0x64, &[]));
     }
 
+    /// Only SLP_TYP = S5 with SLP_EN on the sleep control port powers off.
+    /// Linux writes 0x34 for `poweroff`; other sleep types, the type without
+    /// SLP_EN, and writes to the status port (clearing WAK_STS) do not.
+    #[test]
+    fn only_an_s5_sleep_with_slp_en_powers_the_guest_off() {
+        assert!(is_acpi_s5_poweroff(0x600, &[0x34]));
+        assert!(is_acpi_s5_poweroff(0x600, &[0x34 | 0x83])); // reserved bits ignored
+        assert!(!is_acpi_s5_poweroff(0x600, &[5 << 2])); // no SLP_EN
+        assert!(!is_acpi_s5_poweroff(0x600, &[(3 << 2) | (1 << 5)])); // S3
+        assert!(!is_acpi_s5_poweroff(0x600, &[1 << 5])); // S0
+        assert!(!is_acpi_s5_poweroff(0x601, &[0x34]));
+        assert!(!is_acpi_s5_poweroff(0x64, &[0x34]));
+        assert!(!is_acpi_s5_poweroff(0x600, &[]));
+    }
+
     #[test]
     fn completion_retries_abort_on_fault_and_observe_stop_before_reentry() {
         let stop = std::sync::atomic::AtomicBool::new(false);
