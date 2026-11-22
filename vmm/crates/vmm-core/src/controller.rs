@@ -3165,6 +3165,23 @@ impl VmmController {
     }
 }
 
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
+fn last_clone_repair_stage(stderr: &str) -> Option<&str> {
+    stderr
+        .lines()
+        .rev()
+        .filter_map(|line| line.strip_prefix("stage="))
+        .find(|stage| {
+            matches!(
+                *stage,
+                "decode" | "clock" | "entropy" | "identity" | "boot-id" | "userspace" | "complete"
+            )
+        })
+}
+
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 fn await_clone_repair_barrier(controller: &VmmController) -> Result<()> {
     use std::fmt::Write as _;
@@ -3229,7 +3246,10 @@ fn await_clone_repair_barrier(controller: &VmmController) -> Result<()> {
                     ));
                 }
                 Some(Ok((exit_code, _, stderr, _))) => {
-                    let stage = if exit_code == -1 {
+                    let stage = if let Some(stage) = last_clone_repair_stage(&stderr) {
+                        stage.to_owned()
+                    } else if exit_code == -1 {
+                        // Older agents only record progress inside the guest.
                         let diagnostic = controller
                             .exec(
                                 "pid=$(cat /run/tarit/clone-workload.pid 2>/dev/null || true); \
@@ -9412,6 +9432,16 @@ mod tests {
         // order 9 + 2 x order 10: DMA 2 + 4, DMA32 2 + 0, Normal 16 + 6.
         assert_eq!(free_huge_page_blocks(info), 30);
         assert_eq!(free_huge_page_blocks(""), 0);
+    }
+
+    #[test]
+    fn clone_repair_reports_only_a_recognized_stage_from_the_failed_request() {
+        assert_eq!(last_clone_repair_stage(""), None);
+        assert_eq!(last_clone_repair_stage("stage=unrecognized\n"), None);
+        assert_eq!(
+            last_clone_repair_stage("stage=clock\nstage=entropy\nother stderr\n"),
+            Some("entropy")
+        );
     }
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
