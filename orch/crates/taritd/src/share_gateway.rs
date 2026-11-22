@@ -63,8 +63,7 @@ type UpstreamWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 const MAX_PENDING_PINGS: usize = 64;
 const MAX_PENDING_BRIDGE_COMMANDS: usize = 256;
 const SHARE_TOKEN_HEADER: &str = "x-tarit-share-token";
-/// Minimum time the closing direction of a WebSocket bridge gets to finish
-/// its close handshake, independent of how short the idle timeout is.
+/// How long to drain the other direction after one forwarding task exits.
 const WEBSOCKET_CLOSE_GRACE: Duration = Duration::from_secs(5);
 
 struct PendingUpgradeState {
@@ -1578,7 +1577,6 @@ struct BridgeForwarding {
     activity_tx: watch::Sender<Instant>,
     activity_rx: watch::Receiver<Instant>,
     idle_timeout: Duration,
-    client_closed: Arc<AtomicBool>,
     upstream_closed: Arc<AtomicBool>,
     client_pings: Arc<Mutex<PendingPings>>,
     metrics: Arc<Metrics>,
@@ -1596,7 +1594,6 @@ async fn bridge_websocket(
     let (upstream_tx, upstream_rx) = upstream.split();
     let (activity_tx, activity_rx) = watch::channel(Instant::now());
     let (client_close_tx, client_close_rx) = watch::channel(false);
-    let client_closed = Arc::new(AtomicBool::new(false));
     let upstream_closed = Arc::new(AtomicBool::new(false));
     let client_pings = Arc::new(Mutex::new(PendingPings::default()));
     let mut client_to_upstream = Box::pin(forward_client_to_upstream(
@@ -1606,7 +1603,6 @@ async fn bridge_websocket(
             activity_tx: activity_tx.clone(),
             activity_rx: activity_rx.clone(),
             idle_timeout,
-            client_closed: Arc::clone(&client_closed),
             upstream_closed: Arc::clone(&upstream_closed),
             client_pings: Arc::clone(&client_pings),
             metrics: Arc::clone(&metrics),
@@ -1621,7 +1617,6 @@ async fn bridge_websocket(
             activity_tx,
             activity_rx,
             idle_timeout,
-            client_closed,
             upstream_closed,
             client_pings,
             metrics,
@@ -1630,16 +1625,13 @@ async fn bridge_websocket(
         client_close_rx,
     ));
 
-    // Give the surviving direction a real chance to deliver its Close frame:
-    // with a very short idle timeout, a loaded scheduler can otherwise cancel
-    // the peer mid-handshake and the client observes a bare TCP reset.
-    let close_grace = idle_timeout.max(WEBSOCKET_CLOSE_GRACE);
+    // Let the other direction finish the handshake, even with a long session idle timeout.
     tokio::select! {
         _ = &mut client_to_upstream => {
-            let _ = time::timeout(close_grace, &mut upstream_to_client).await;
+            let _ = time::timeout(WEBSOCKET_CLOSE_GRACE, &mut upstream_to_client).await;
         }
         _ = &mut upstream_to_client => {
-            let _ = time::timeout(close_grace, &mut client_to_upstream).await;
+            let _ = time::timeout(WEBSOCKET_CLOSE_GRACE, &mut client_to_upstream).await;
         }
     }
 }
@@ -1654,7 +1646,6 @@ async fn forward_client_to_upstream(
         activity_tx,
         mut activity_rx,
         idle_timeout,
-        client_closed,
         upstream_closed,
         client_pings,
         metrics,
@@ -1684,11 +1675,14 @@ async fn forward_client_to_upstream(
                 };
                 let close = matches!(message, AxumMessage::Close(_));
                 if close {
-                    client_closed.store(true, Ordering::Release);
                     client_close_tx.send_replace(true);
-                    if upstream_closed.load(Ordering::Acquire) {
+                }
+                if upstream_closed.load(Ordering::Acquire) {
+                    if close {
+                        let _ = sink.flush().await;
                         return;
                     }
+                    continue;
                 }
                 if let AxumMessage::Ping(payload) = &message {
                     if let Ok(mut pending) = client_pings.lock() {
@@ -1720,12 +1714,12 @@ async fn forward_upstream_to_client(
         activity_tx,
         mut activity_rx,
         idle_timeout,
-        client_closed,
         upstream_closed,
         client_pings,
         metrics,
         mut shutdown_rx,
     } = forwarding;
+    let mut client_close_flushed = false;
     loop {
         let deadline = *activity_rx.borrow() + idle_timeout;
         tokio::select! {
@@ -1737,7 +1731,7 @@ async fn forward_upstream_to_client(
                 let _ = sink.send(AxumMessage::Close(None)).await;
                 return;
             }
-            changed = client_close_rx.changed() => {
+            changed = client_close_rx.changed(), if !client_close_flushed => {
                 if changed.is_err() {
                     // The client-to-upstream direction is gone (idle timeout or
                     // client EOF). Complete the close handshake toward the
@@ -1745,9 +1739,10 @@ async fn forward_upstream_to_client(
                     let _ = time::timeout(idle_timeout, sink.send(AxumMessage::Close(None))).await;
                     return;
                 }
-                if *client_close_rx.borrow_and_update() {
-                    let _ = sink.flush().await;
-                }
+                // Reading Close queued an automatic reply on the client socket.
+                // Its reader can now exit while we drain the upstream handshake.
+                client_close_flushed = true;
+                let _ = sink.flush().await;
             }
             changed = activity_rx.changed() => {
                 if changed.is_err() {
@@ -1769,10 +1764,13 @@ async fn forward_upstream_to_client(
                 let close = matches!(message, TungsteniteMessage::Close(_));
                 if close {
                     upstream_closed.store(true, Ordering::Release);
-                    if client_closed.load(Ordering::Acquire) {
+                }
+                if *client_close_rx.borrow() {
+                    if close {
                         let _ = sink.flush().await;
                         return;
                     }
+                    continue;
                 }
                 let Some(message) = upstream_message(message) else {
                     continue;
@@ -1889,17 +1887,17 @@ mod tests {
     use tarit_types::Timestamp;
     use tarit_types::{ShareRecord, ShareVisibility, VmRecord, VmStatus};
     use tokio::{
-        net::TcpListener,
+        net::{TcpListener, TcpStream},
         sync::{mpsc, oneshot, watch},
     };
     use tokio_tungstenite::{
-        accept_hdr_async, connect_async,
+        accept_hdr_async, client_async, connect_async,
         tungstenite::{
             client::IntoClientRequest,
             handshake::server::{
                 Callback, ErrorResponse, Request as WebSocketRequest, Response as WebSocketResponse,
             },
-            protocol::Message as TungsteniteMessage,
+            protocol::{frame::coding::CloseCode, CloseFrame, Message as TungsteniteMessage},
         },
     };
     use tower::ServiceExt;
@@ -2890,6 +2888,64 @@ mod tests {
         })
         .await
         .expect("websocket protocol forwarding must complete within15s");
+    }
+
+    #[tokio::test]
+    async fn bridge_drains_upstream_after_acknowledging_client_close() {
+        assert_bridge_drains_close(true).await;
+    }
+
+    #[tokio::test]
+    async fn bridge_drains_client_after_acknowledging_upstream_close() {
+        assert_bridge_drains_close(false).await;
+    }
+
+    async fn assert_bridge_drains_close(client_initiates: bool) {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let (gateway, metrics) =
+                start_gateway_router(listener.local_addr().unwrap(), Duration::from_secs(30)).await;
+            let mut request = format!("ws://{gateway}/socket")
+                .into_client_request()
+                .unwrap();
+            request
+                .headers_mut()
+                .insert(SEC_WEBSOCKET_PROTOCOL, HeaderValue::from_static("chat"));
+            let transport = TcpStream::connect(gateway).await.unwrap();
+            let (client, upstream) = tokio::join!(client_async(request, transport), async {
+                let (stream, _) = listener.accept().await.unwrap();
+                accept_hdr_async(stream, ChatProtocol).await.unwrap()
+            });
+            let (client, _) = client.unwrap();
+            let (mut initiator, mut peer) = if client_initiates {
+                (client, upstream)
+            } else {
+                (upstream, client)
+            };
+            let close = TungsteniteMessage::Close(Some(CloseFrame {
+                code: CloseCode::Normal,
+                reason: "finished".into(),
+            }));
+            initiator.send(close.clone()).await.unwrap();
+            assert_eq!(initiator.next().await.unwrap().unwrap(), close);
+
+            // A frame from the peer can cross Close in flight.
+            peer.send(TungsteniteMessage::Text("in flight".into()))
+                .await
+                .unwrap();
+            assert_eq!(peer.next().await.unwrap().unwrap(), close);
+            let mut byte = [0; 1];
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), peer.get_ref().peek(&mut byte))
+                    .await
+                    .is_err(),
+                "bridge closed the TCP connection before the peer replied"
+            );
+            peer.flush().await.unwrap();
+            wait_for_websocket_gauge(&metrics, 0).await;
+        })
+        .await
+        .expect("close handshake did not finish");
     }
 
     #[tokio::test]
