@@ -1,9 +1,10 @@
 from typing import Literal
 
-VolumeProvider = Literal["local_block"]
+VolumeProvider = Literal["local_block", "nfs_v4_1_block"]
 
 VOLUME_PROVIDER_VALUES: set[VolumeProvider] = {
     "local_block",
+    "nfs_v4_1_block",
 }
 
 

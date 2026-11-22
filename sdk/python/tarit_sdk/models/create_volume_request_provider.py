@@ -1,9 +1,10 @@
 from typing import Literal
 
-CreateVolumeRequestProvider = Literal["local_block"]
+CreateVolumeRequestProvider = Literal["local_block", "nfs_v4_1_block"]
 
 CREATE_VOLUME_REQUEST_PROVIDER_VALUES: set[CreateVolumeRequestProvider] = {
     "local_block",
+    "nfs_v4_1_block",
 }
 
 
