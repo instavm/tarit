@@ -473,7 +473,7 @@ impl PostgresFleet {
                 .revision
                 .checked_add(1)
                 .ok_or_else(|| FleetError::Conflict("VM revision overflow".into()))?;
-            vm.updated_at = Timestamp::now();
+            vm.updated_at = Timestamp::now().to_microsecond_precision();
             let changed = tx
                 .execute(
                     "UPDATE fleet_vms
@@ -3922,6 +3922,8 @@ pub fn host_record_from_capacity(
 
 #[cfg(test)]
 mod tests {
+    mod hibernation_handoff;
+
     use super::*;
     use std::time::Duration;
     use tarit_types::ShareRecord;
