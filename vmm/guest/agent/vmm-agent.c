@@ -181,7 +181,23 @@ static int decode_clone_repair_request(const char *command,
     return 0;
 }
 
-static void set_clone_repair_stage(const char *stage) {
+struct repair_progress {
+    int fd;
+    uint64_t request_id;
+};
+
+static int send_exec_chunk(int fd, uint8_t kind, uint64_t request_id, const void *bytes, uint32_t len);
+
+static void set_clone_repair_stage(const struct repair_progress *progress, const char *stage) {
+    /* The VMM retains complete stderr frames even when this request times out
+     * and its socket is closed. Report only the fixed stage name. */
+    if (progress != NULL) {
+        char line[64];
+        int n = snprintf(line, sizeof(line), "stage=%s\n", stage);
+        if (n > 0 && (size_t)n < sizeof(line)) {
+            (void)send_exec_chunk(progress->fd, EXEC_FRAME_STDERR, progress->request_id, line, (uint32_t)n);
+        }
+    }
     int fd = open(CLONE_REPAIR_STAGE_PATH,
                   O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (fd < 0) return;
@@ -258,7 +274,8 @@ static int run_post_fork_hook(const char *clone_id) {
     return 0;
 }
 
-static int repair_clone_entropy(const char *command, char clone_id[33], int *protocol_version) {
+static int repair_clone_entropy(const char *command, char clone_id[33], int *protocol_version,
+                                const struct repair_progress *progress) {
     unsigned char nonce[CLONE_REPAIR_NONCE_BYTES];
     struct {
         int entropy_count;
@@ -274,19 +291,19 @@ static int repair_clone_entropy(const char *command, char clone_id[33], int *pro
     if (mkdir("/run/tarit", 0700) < 0 && errno != EEXIST) {
         goto out;
     }
-    set_clone_repair_stage("decode");
+    set_clone_repair_stage(progress, "decode");
     if (decode_clone_repair_request(command, nonce, &host_realtime, protocol_version) < 0) {
         goto out;
     }
     if (*protocol_version == 3) {
-        set_clone_repair_stage("clock");
+        set_clone_repair_stage(progress, "clock");
         if (clock_settime(CLOCK_REALTIME, &host_realtime) < 0) goto out;
     }
 
     pool.entropy_count = (int)(CLONE_REPAIR_SEED_BYTES * 8U);
     pool.buf_size = (int)CLONE_REPAIR_SEED_BYTES;
     memcpy(pool.buf, nonce, CLONE_REPAIR_SEED_BYTES);
-    set_clone_repair_stage("entropy");
+    set_clone_repair_stage(progress, "entropy");
     random_fd = open("/dev/random", O_RDWR | O_CLOEXEC);
     if (random_fd < 0 || ioctl(random_fd, RNDADDENTROPY, &pool) < 0 ||
         ioctl(random_fd, RNDRESEEDCRNG, 0) < 0) {
@@ -294,7 +311,7 @@ static int repair_clone_entropy(const char *command, char clone_id[33], int *pro
     }
     close(random_fd);
     random_fd = -1;
-    set_clone_repair_stage("identity");
+    set_clone_repair_stage(progress, "identity");
 
     /* The clone ID is a separate, non-secret part of the host nonce. Echoing
      * it proves that the exact repair request was consumed before admission. */
@@ -329,7 +346,7 @@ static int repair_clone_entropy(const char *command, char clone_id[33], int *pro
     }
     close(boot_id_file);
     boot_id_file = -1;
-    set_clone_repair_stage("boot-id");
+    set_clone_repair_stage(progress, "boot-id");
 
     /* A kernel boot_id is immutable and remains captured in VM RAM. Overlay it
      * with this incarnation ID before admission. On descendants the existing
@@ -345,11 +362,11 @@ static int repair_clone_entropy(const char *command, char clone_id[33], int *pro
             goto out;
         }
     }
-    set_clone_repair_stage("userspace");
+    set_clone_repair_stage(progress, "userspace");
     if (run_post_fork_hook(clone_id) < 0) {
         goto out;
     }
-    set_clone_repair_stage("complete");
+    set_clone_repair_stage(progress, "complete");
     rc = 0;
 
 out:
@@ -852,7 +869,7 @@ static void run_command(int serial_fd, const char *command) {
         strncmp(command, CLONE_REPAIR_PREFIX_V3, CLONE_REPAIR_PREFIX_V3_LEN) == 0) {
         char clone_id[33];
         int protocol_version = 0;
-        if (repair_clone_entropy(command, clone_id, &protocol_version) == 0) {
+        if (repair_clone_entropy(command, clone_id, &protocol_version, NULL) == 0) {
             const char *response = protocol_version == 3 ? CLONE_REPAIR_OK_V3 : CLONE_REPAIR_OK_V2;
             serial_printf(serial_fd, "%s %s\n", response, clone_id);
             serial_printf(serial_fd, "VMM_EXEC_EXIT=%d\n", 0);
@@ -1069,7 +1086,8 @@ static void run_command_chunked(int fd, uint64_t request_id, const char *command
         strncmp(command, CLONE_REPAIR_PREFIX_V3, CLONE_REPAIR_PREFIX_V3_LEN) == 0) {
         char clone_id[33];
         int protocol_version = 0;
-        if (repair_clone_entropy(command, clone_id, &protocol_version) == 0) {
+        const struct repair_progress progress = { .fd = fd, .request_id = request_id };
+        if (repair_clone_entropy(command, clone_id, &protocol_version, &progress) == 0) {
             char response[96];
             const char *marker = protocol_version == 3 ? CLONE_REPAIR_OK_V3 : CLONE_REPAIR_OK_V2;
             int len = snprintf(response, sizeof(response), "%s %s\n", marker, clone_id);

@@ -1309,6 +1309,20 @@ mod tests {
     }
 
     #[test]
+    fn chunked_exec_keeps_repair_progress_without_a_completion_frame() {
+        let (mut host, mut guest) = UnixStream::pair().unwrap();
+        write_start(&mut guest, 11);
+        write_chunk(&mut guest, ExecFrameKind::Stderr, 11, b"stage=complete\n");
+
+        let outcome = run_exec_chunked_v2(&mut host, 11, "repair", Duration::from_millis(80), None);
+        assert!(matches!(
+            outcome,
+            RunExecOutcome::TimedOut { started: true, stdout, stderr, .. }
+                if stdout.is_empty() && stderr == "stage=complete\n"
+        ));
+    }
+
+    #[test]
     fn chunked_exec_detects_disconnects() {
         let (mut host, guest) = UnixStream::pair().unwrap();
         let server = std::thread::spawn(move || {

@@ -15,6 +15,7 @@
 #include <sys/inotify.h>
 #endif
 #include <sys/random.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -393,18 +394,24 @@ static int signal_and_wait_for_repair(const char *expected_clone_id) {
 
 static int serve(void) {
     struct sigaction action = {0};
+    sigset_t repair_mask, wait_mask;
     struct workload_state state;
     struct sockaddr_un address = {0};
     int listener = -1;
+    int client_fd = -1;
     int result = EXIT_FAILURE;
 
     if (mkdir("/run/tarit", 0700) < 0 && errno != EEXIST) return EXIT_FAILURE;
     if (initialize_state(&state) < 0) return EXIT_FAILURE;
     action.sa_handler = request_repair;
     sigemptyset(&action.sa_mask);
-    if (sigaction(SIGHUP, &action, NULL) < 0 || signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
+    sigemptyset(&repair_mask);
+    sigaddset(&repair_mask, SIGHUP);
+    if (sigprocmask(SIG_BLOCK, &repair_mask, &wait_mask) < 0 ||
+        sigaction(SIGHUP, &action, NULL) < 0 || signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
         return EXIT_FAILURE;
     }
+    sigdelset(&wait_mask, SIGHUP);
 
     listener = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (listener < 0) return EXIT_FAILURE;
@@ -421,24 +428,32 @@ static int serve(void) {
             repair_requested = 0;
             if (repair_state(&state) < 0) goto out;
         }
-        struct pollfd descriptor = {.fd = listener, .events = POLLIN};
-        int ready = poll(&descriptor, 1, 100);
+        /* Unblock SIGHUP atomically with the wait, including while an
+         * accepted client has yet to send its request. */
+        int input = client_fd < 0 ? listener : client_fd;
+        if (input >= FD_SETSIZE) goto out;
+        fd_set readable;
+        FD_ZERO(&readable);
+        FD_SET(input, &readable);
+        int ready = pselect(input + 1, &readable, NULL, NULL, NULL, &wait_mask);
         if (ready < 0) {
             if (errno == EINTR) continue;
             goto out;
         }
-        if (ready == 0) continue;
-        int client = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
-        if (client < 0) {
-            if (errno == EINTR) continue;
-            goto out;
+        if (repair_requested) continue;
+        if (client_fd < 0) {
+            client_fd = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
+            if (client_fd < 0 && errno != EINTR) goto out;
+        } else {
+            (void)handle_request(client_fd, &state);
+            close(client_fd);
+            client_fd = -1;
         }
-        (void)handle_request(client, &state);
-        close(client);
     }
 
 out:
     memset(&state, 0, sizeof(state));
+    if (client_fd >= 0) close(client_fd);
     if (listener >= 0) close(listener);
     unlink(SOCKET_PATH);
     unlink(PID_PATH);
