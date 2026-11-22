@@ -146,6 +146,18 @@ impl Fadt {
     pub fn set_hypervisor_vendor_id(&mut self, hypervisor_vendor_id: [u8; 8]) {
         self.hypervisor_vendor_id = hypervisor_vendor_id;
     }
+
+    /// Set SLEEP_CONTROL_REG, the register a HW-reduced ACPI guest writes
+    /// SLP_TYPx | SLP_EN to when it enters a sleep state (S5: power off).
+    pub fn set_sleep_control_reg(&mut self, reg: GenericAddressStructure) {
+        self.sleep_control_reg = reg;
+    }
+
+    /// Set SLEEP_STATUS_REG (WAK_STS), which a HW-reduced ACPI guest clears
+    /// and polls around a sleep transition.
+    pub fn set_sleep_status_reg(&mut self, reg: GenericAddressStructure) {
+        self.sleep_status_reg = reg;
+    }
 }
 
 impl Sdt for Fadt {

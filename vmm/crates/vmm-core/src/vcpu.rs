@@ -57,6 +57,34 @@ pub(crate) fn is_i8042_reset(port: u16, data: &[u8]) -> bool {
     port == I8042_COMMAND_PORT && data.first() == Some(&I8042_PULSE_RESET)
 }
 
+/// The guest's ACPI sleep control register (FADT SLEEP_CONTROL_REG, an 8-bit
+/// I/O port) and sleep status register (SLEEP_STATUS_REG) right after it,
+/// at Firecracker's and Cloud Hypervisor's address.
+pub const ACPI_SLEEP_CONTROL_PORT: u16 = 0x600;
+pub const ACPI_SLEEP_STATUS_PORT: u16 = 0x601;
+/// The S5 (soft off) sleep type the DSDT's `\_S5_` package declares.
+pub const ACPI_S5_SLEEP_TYPE: u8 = 5;
+
+/// The guest's ACPI power off: SLP_TYP = S5 (bits 2-4) with SLP_EN (bit 5)
+/// written to the sleep control register. Linux does this for `poweroff`
+/// and `halt -p` on a HW-reduced ACPI machine; it only offers S5 when the
+/// FADT names both sleep registers and the DSDT declares `\_S5_`
+/// (write_acpi_tables_with_devices). Without it the guest ended `poweroff`
+/// in a halt loop the VMM never saw, and kept reporting running.
+#[cfg(any(
+    test,
+    all(feature = "kvm", target_arch = "x86_64", target_os = "linux")
+))]
+pub(crate) fn is_acpi_s5_poweroff(port: u16, data: &[u8]) -> bool {
+    const SLP_EN: u8 = 1 << 5;
+    const SLP_TYP_SHIFT: u8 = 2;
+    const SLP_TYP_MASK: u8 = 0b111 << SLP_TYP_SHIFT;
+    port == ACPI_SLEEP_CONTROL_PORT
+        && data.first().is_some_and(|value| {
+            value & SLP_EN != 0 && (value & SLP_TYP_MASK) >> SLP_TYP_SHIFT == ACPI_S5_SLEEP_TYPE
+        })
+}
+
 /// Outcome of finishing a vCPU's in-flight I/O instruction before a pause.
 #[cfg(any(
     test,
@@ -200,6 +228,21 @@ mod tests {
         assert!(!is_i8042_reset(0x60, &[0xfe]));
         assert!(!is_i8042_reset(0x3f8, &[0xfe]));
         assert!(!is_i8042_reset(0x64, &[]));
+    }
+
+    /// Only SLP_TYP = S5 with SLP_EN on the sleep control port powers off.
+    /// Linux writes 0x34 for `poweroff`; other sleep types, the type without
+    /// SLP_EN, and writes to the status port (clearing WAK_STS) do not.
+    #[test]
+    fn only_an_s5_sleep_with_slp_en_powers_the_guest_off() {
+        assert!(is_acpi_s5_poweroff(0x600, &[0x34]));
+        assert!(is_acpi_s5_poweroff(0x600, &[0x34 | 0x83])); // reserved bits ignored
+        assert!(!is_acpi_s5_poweroff(0x600, &[5 << 2])); // no SLP_EN
+        assert!(!is_acpi_s5_poweroff(0x600, &[(3 << 2) | (1 << 5)])); // S3
+        assert!(!is_acpi_s5_poweroff(0x600, &[1 << 5])); // S0
+        assert!(!is_acpi_s5_poweroff(0x601, &[0x34]));
+        assert!(!is_acpi_s5_poweroff(0x64, &[0x34]));
+        assert!(!is_acpi_s5_poweroff(0x600, &[]));
     }
 
     #[test]

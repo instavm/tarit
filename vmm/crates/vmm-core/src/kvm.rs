@@ -824,6 +824,11 @@ impl KvmVm {
                                 cancel_timer();
                                 return Ok(());
                             }
+                            if crate::vcpu::is_acpi_s5_poweroff(port, data) {
+                                log::info!("ACPI S5 (sleep control 0x600) — guest powered off");
+                                cancel_timer();
+                                return Ok(());
+                            }
                         }
                         VcpuExit::IoIn(port, data) => {
                             // Serial port 0x3f8: TX data (we already write it out).
