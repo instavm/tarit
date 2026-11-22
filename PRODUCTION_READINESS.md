@@ -69,6 +69,13 @@ its scope.
   tenant-scoped, and ordered with hibernate, resume, recovery, and deletion.
   Production generic NFS requires Kerberos privacy (`krb5p`), and mount
   admission checks the kernel-reported security and transport parameters.
+  On a disposable Ubuntu 24.04.5 arm64 VM (Linux 6.8.0-147), the generic
+  provider passed three loopback nfsd restarts with Kerberos privacy and
+  three with AUTH_SYS. In each run a synchronous write was in the kernel
+  with zero nfsd threads, completed after restart, and appeared exactly once
+  in the server's file. Busy detach, block reopen, and cleanup also passed.
+  The [Kerberos fixture](orch/tests/e2e_nfs_kerberos.sh) includes the command
+  to reproduce this on a fresh Ubuntu 24.04 VM.
 - Snapshot files are opened without following symlinks and validated before
   restore. A first incremental request without a parent is emitted as a complete
   full snapshot, and subsequent diff-chain restore plus hardlink-spelled input
@@ -214,9 +221,11 @@ but the following unresolved items now block release:
    omission is repaired, but the dynamic KVM custom-MSR set still needs the
    cross-kernel/build pvclock, PV-EOI, steal-time, and async-PF enabled/disabled
    compatibility matrix.
-3. Qualify shared/cloud volume durability and failure recovery, including NFS
-   server loss/restart with protected transport and object-store interruption,
-   rather than extrapolating from local-block tests.
+3. Qualify shared/cloud volume recovery from physical NFS server loss,
+   stale handles, and remote object-store interruption. Protected NFS
+   service restart on loopback is covered above. The immutable object
+   provider currently has a local-file implementation. Cloud transports
+   still need a conditional-write/checksum adapter and a real outage test.
 4. Complete multi-hour hibernation and ownership-lease qualification and record 100-sample
    fork/snapshot/restore latency distributions on a larger reflink-capable
    fixture. A version-1 binary to version-2 candidate restore passes on Ubuntu
