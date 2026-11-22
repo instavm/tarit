@@ -1,6 +1,6 @@
 # API reference
 
-This document reflects the Rust handlers in `crates/taritd/src/api.rs` and `crates/taritd/src/internal.rs`. The served `openapi.yaml` covers all public routes; it does not describe the internal peer routes, and this document remains the more detailed reference for behavior and status codes.
+This document reflects the Rust handlers in `crates/taritd/src/api.rs` and `crates/taritd/src/internal.rs`. The [OpenAPI contract](../openapi.yaml) lists public operations and wire schemas. This guide explains selected endpoints and fleet behavior.
 
 ## Authentication
 
@@ -242,13 +242,9 @@ Request:
 
 ```json
 {
-  "id": "optional uuid",
   "memory_mib": 256,
   "vcpus": 1,
-  "kernel_path": "optional admin-only kernel override",
-  "image": "optional registered image name[:tag]",
-  "rootfs_path": "optional admin-only rootfs override, empty string means no rootfs",
-  "cmdline": "optional kernel command line override",
+  "image": "registered-image:tag",
   "egress": { "allowlist": ["0.0.0.0/0:443/tcp", "10.0.0.2/32:53/udp"], "allow_existing": false }
 }
 ```
@@ -286,19 +282,12 @@ Status codes:
 
 ### `GET /v1/vms`
 
-List VM records visible to the caller. User keys only see their tenant's VMs; admin keys can see all local VM records.
+Return an array of public [VM records](#vmrecord). Fleet mode reads
+PostgreSQL across nodes. Single-host mode reads the local cache. User keys
+see their tenant’s records, admin keys see all tenants, and both omit stopped VMs.
+Physical host IDs and paths stay private.
 
-Response `200`:
-
-```json
-[
-  { "id": "uuid", "host_id": "node-a", "status": "running" }
-]
-```
-
-The actual objects are full `VmRecord` values. In cluster mode this endpoint is not a cluster-wide list. It does not aggregate peer stores or read `fleet_vms`.
-
-Status codes: `200`, `401`, `500`.
+Status codes are `200`, `401` and `500`.
 
 ### `GET /v1/vms/{id}`
 
@@ -316,7 +305,7 @@ Status codes:
 | `200` | VM found. |
 | `401` | Missing or wrong `X-API-Key`. |
 | `403` | VM belongs to a different tenant. |
-| `404` | VM not found in fleet or local fallback. |
+| `404` | No visible active VM with that ID. |
 | `500` | Internal store or protocol failure. Details are not exposed. |
 | `503` | The owning host is unhealthy, stale, or unavailable. |
 
@@ -496,7 +485,15 @@ Response `200`:
 ```
 
 Status codes: `200`, `401`, `403`, `404`, `409` (the lifecycle state does not
-support snapshots), `500`.
+support snapshots), `429` (storage pressure or a busy disk, retry after the specified delay), `500`.
+
+### `POST /v1/vms/{id}/fork`
+
+Fork a running source. Supply `{"id":"<child UUID>"}` to retry safely with the
+same child ID. The response contains `source_vm_id` and the child’s public
+`vm` record. A new child returns `201`. Replaying its committed request
+returns `200`. A healthy non-owner node can run the child after verifying the
+source artifact and meeting replica policy. Workload access waits for repair.
 
 ### `GET /v1/snapshots`
 
@@ -567,10 +564,13 @@ Request:
 
 ```json
 {
-  "snapshot_id": "uuid",
-  "id": "optional new vm uuid"
+  "snapshot_id": "5746f422-d767-4f01-82cf-20e71d76c57a"
 }
 ```
+
+The server generates the new VM ID unless you supply `id`. Eligible live
+snapshots can grow within their reserved maximum using `target_memory_mib`.
+[Memory growth requirements](../../docs/memory-growth.md)
 
 Response `201`: `VmRecord`.
 
@@ -619,7 +619,7 @@ Status codes:
 
 ### `POST /v1/execute_async`
 
-Resolve the VM owner and run a command asynchronously. The execution record is created on the API node that accepts the request, even when the VM owner is remote.
+Run a command asynchronously on the VM owner and return an execution ID.
 
 Request:
 
@@ -646,11 +646,9 @@ Status codes:
 | `404` | VM not found. |
 | `500` | Store, peer, or VMM failure. |
 
-Polling note: `GET /v1/executions/{id}` must hit the same API node that accepted the execution request unless an external system replicates execution records. Execution status lookups are not routed through the fleet.
-
 ### `GET /v1/executions/{id}`
 
-Return an execution record from the receiving node's local SQLite store.
+In fleet mode, any healthy API node can read the execution record from PostgreSQL. A standalone node reads its local record.
 
 Response `200`: `ExecutionRecord`.
 
@@ -739,27 +737,24 @@ Status codes: `200`, `401`, `500`.
 
 ## Internal peer API
 
-Internal routes are currently mounted on the same HTTP listener. Each request
-uses a short-lived HMAC bound to method, path, body hash, nonce, source host, and
-target host; caller identity is signed separately and replay protected. The
-shared key is never transmitted, and the legacy `X-Peer-Secret` header is
-rejected. This is not a substitute for a separate internal listener with mTLS
-and host-session fencing; keep `/internal/v1/*` unreachable from public
-networks.
+Fleet peers use a dedicated private listener with mutual TLS by default.
+Each request carries a short-lived HMAC bound to the request and peer
+identities. The receiver checks the boot sessions and rejects replayed
+requests. The shared key stays on the nodes. [Peer configuration](CONFIGURATION.md#cluster-and-durability)
 
-### Internal endpoint table
+### Selected internal endpoints
 
 | Method | Path | Body | Success | Purpose |
 | --- | --- | --- | --- | --- |
 | POST | `/internal/v1/vms` | `CreateVmRequest` | `201 VmRecord` | Create on this node only. Returns 429 + `Retry-After` if this node is full. |
-| POST | `/internal/v1/restore` | `RestoreRequest` | `201 VmRecord` | Restore on this node only. |
+| POST | `/internal/v1/restore` | Private restore request | `201 VmRecord` | Restore on this node only. |
 | GET | `/internal/v1/vms/{id}` | none | `200 VmRecord` | Get from this node's local store. |
 | GET | `/internal/v1/vms/{id}/status` | none | `200 LiveVmStatus` | Query live status from this node's local VMM. |
 | DELETE | `/internal/v1/vms/{id}` | none | `204` | Stop on this node and clear local/fleet ownership. |
 | POST | `/internal/v1/vms/{id}/exec` | `{"command":"...","timeout_ms":30000}` | `200 {exit_code,stdout,stderr,duration_ms}` | Execute on this node's VM. |
 | POST | `/internal/v1/vms/{id}/pause` | none | `200 VmRecord` | Pause local VM. |
 | POST | `/internal/v1/vms/{id}/resume` | none | `200 VmRecord` | Resume local VM. |
-| POST | `/internal/v1/vms/{id}/snapshot` | `{"diff":false}` | `200 {path,host_id}` | Snapshot local VM. |
+| POST | `/internal/v1/vms/{id}/snapshot` | `{"diff":false}` | `200 {snapshot_id,live_snapshot?}` | Snapshot local VM. |
 | PATCH | `/internal/v1/vms/{id}/egress` | `EgressUpdateRequest` | `200 {rules_applied}` | Update local VM egress. |
 
 Internal handlers call the same `ops::*_local` functions as public handlers, so local behavior is shared. Peer-forwarded public requests carry the resolved caller identity in the `X-Tarit-Tenant`, `X-Tarit-Role`, and `X-Tarit-Api-Key-Id` headers so the owner node can enforce tenant access before local VM operations. Requests without a valid tenant and role are rejected with `401`; `X-Tarit-Api-Key-Id` may be empty. They intentionally do not perform owner resolution.
@@ -773,7 +768,7 @@ Internal handlers call the same `ops::*_local` functions as public handlers, so 
 | `202` | Execution accepted. |
 | `204` | Successful delete/stop. |
 | `400` | Bad request. Usually malformed JSON or invalid payload shape. |
-| `401` | Missing or invalid API key or peer secret. |
+| `401` | Missing or invalid API credentials or peer request signature. |
 | `403` | Authenticated caller is not allowed to access the tenant resource, lacks admin role, or exceeded tenant VM quota. |
 | `404` | VM, execution, owner host, or snapshot owner not found. |
 | `409` | Genuine state conflict, such as a duplicate requested VM id or an operation invalid for the current VM state. |

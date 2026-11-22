@@ -109,7 +109,7 @@ Boot the single VM. This is the API equivalent of creating a live VM under `vmm 
 { "op": "snapshot", "diff": false }
 ```
 
-Set `diff` to `true` to request an incremental snapshot when the VMM has a previous snapshot and dirty logging is active.
+Set `diff` to `true` to request an incremental snapshot. Without a usable parent, the VMM writes a full snapshot.
 
 ### `restore`
 
@@ -189,7 +189,7 @@ size equals the request. Both reply with `status: "memory_hotplug"` and
 `total_size_mib`, `block_size_mib`, `plugged_size_mib`, `requested_size_mib`,
 `boot_memory_mib`. Semantics: `docs/memory-growth.md` at the repository root.
 
-```json
+```jsonl
 { "op": "memory_hotplug_status" }
 { "op": "set_memory_hotplug", "requested_size_mib": 2048, "wait_timeout_ms": 30000 }
 ```
@@ -282,6 +282,9 @@ fn call(socket_path: &str, req: &ApiRequest) -> Result<ApiResponse, Box<dyn Erro
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf)?;
     let resp_len = u32::from_be_bytes(len_buf) as usize;
+    if resp_len > tarit_proto::MAX_API_FRAME_LEN {
+        return Err("response exceeds the protocol frame limit".into());
+    }
     let mut resp = vec![0u8; resp_len];
     stream.read_exact(&mut resp)?;
 
@@ -297,12 +300,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             cmdline: "root=/dev/vda console=ttyS0 reboot=k panic=1 nokaslr".into(),
             initramfs: None,
         },
-        memory: MemoryConfig { size_mib: 512 },
+        memory: MemoryConfig { size_mib: 512, boot_size_mib: None },
         vcpus: VcpuConfig { count: 1 },
         volumes: vec![VolumeConfig {
             path: "/var/lib/tarit/rootfs.ext4".into(),
             read_only: false,
             overlay: None,
+            inherited_fd: None,
         }],
         net: vec![],
     };
@@ -355,7 +359,7 @@ Use `tarit_proto::write_frame`, `tarit_proto::read_frame`, and `tarit_proto::wri
 
 ## Operational notes
 
-- The VMM does not implement control-plane auth. Use Unix socket permissions, process supervision, and your own API layer.
+- The VMM checks Unix peer credentials. Restrict socket permissions and enforce tenant authentication in your control plane.
 - Track external VM ids in your orchestrator. The VMM protocol intentionally has no ids.
 - One socket maps to one VMM process and one microVM.
 - Start `vmm serve` with `--jail`, `--netns`, `--cgroup`, and `--cpuset` when your control plane needs confinement.

@@ -6,7 +6,7 @@ This guide covers building, running, clustering, load balancing, deployment help
 
 - Linux host with KVM for actually running microVMs.
 - Rust stable toolchain.
-- The rust-vmm based `vmm` binary from the sibling VMM repository.
+- The `vmm` binary from this repository’s VMM workspace.
 - The release ELF `vmlinux` and optional rootfs image readable by `taritd`.
 - `umoci`, `skopeo`, and `e2fsck` on hosts that run `taritd image build`;
   `cosign` is additionally required when provenance verification is configured.
@@ -15,26 +15,11 @@ This guide covers building, running, clustering, load balancing, deployment help
 
 ## Build
 
-Build the orchestrator:
-
-```sh
-cd /path/to/tarit/orch
-cargo build --release -p taritd
-```
-
-Build the VMM binary used by `TARIT_VMM_BIN`:
-
-```sh
-cd /path/to/tarit/vmm
-cargo build --release --features "vmm-core/kvm vmm-core/boot vmm-memory-backend/kvm"
-```
-
-The deploy script uses the command above when the `vmm` binary is not found on `PATH`.
-
-Prepare and install the kernel and rootfs:
+Build the orchestrator, VMM and guest agent, then stage the guest assets:
 
 ```sh
 cd /path/to/tarit
+make build
 sudo make guest
 sudo install -d -m 0755 /var/lib/taritd
 sudo install -m 0644 guest-assets/vmlinux guest-assets/rootfs.ext4 /var/lib/taritd/
@@ -80,20 +65,14 @@ taritd image build --oci node:20-slim --name node20 --size 2048
 taritd image ls
 ```
 
-The build command writes a temporary ext4 under `TARIT_IMAGES_DIR`, runs:
-
-```sh
-$TARIT_VMM_BIN pull --agent node:20-slim <out.ext4>
-e2fsck -fy <out.ext4>
-```
-
-then atomically moves the file into place and registers `name:tag`, rootfs path,
+The build resolves the image digest, injects the configured guest agent into a
+temporary ext4 filesystem and runs `e2fsck -fy`. It installs the file and registers `name:tag`, rootfs path,
 size, source ref, and creation time in `TARIT_DB`. Create VMs from a registered
 image:
 
 ```sh
-taritd vm create --image node20 --vcpus 1 --memory-mib 256
-taritd exec <vm-id> 'node -v'
+vm=$(taritd --json vm create --image node20 --vcpus 1 --memory-mib 256 | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+taritd exec "$vm" 'node -v'
 ```
 
 Remove unused records/files with `taritd image rm node20`. Garbage collection is
@@ -129,17 +108,10 @@ export TARIT_MAX_MEMORY_MIB='65536'
 export RUST_LOG='taritd=info,tower_http=info'
 ```
 
-Each node must differ:
-
-The `:8443` origins below assume a private TLS proxy that denies every route
-except `/internal/v1/*` and forwards those requests to the node's HTTP listener
-on `:8080`. The proxy must support WebSocket upgrades and preserve method, path,
-query, body, and `X-Tarit-*` headers exactly because `taritd` validates them as
-part of the request HMAC. Its certificate SAN must match the advertised
-hostname and chain to the WebPKI roots built into the Rustls clients; a custom
-peer CA cannot currently be configured. For an isolated development cluster
-without a compatible proxy, use the private `http://...:8080` origin and set
-`TARIT_ALLOW_INSECURE_PEER_HTTP=1` explicitly.
+On each node bind `TARIT_PEER_LISTEN` to its private IP on port 8443.
+Set `TARIT_PEER_TLS_CERT` and `TARIT_PEER_TLS_KEY` to its certificate and
+private key, and `TARIT_PEER_TLS_CLIENT_CA` to the fleet CA. The certificate
+must cover the hostname in `TARIT_RPC_ADDR`. [Configuration example](CONFIGURATION.md#one-node-of-a-three-node-cluster-with-postgresql)
 
 | Node | Required differences |
 | --- | --- |
@@ -171,10 +143,11 @@ Recommended public routing:
 | --- | --- |
 | `/health` | Public or load balancer only. |
 | `/v1/*` | Public through TLS and `X-API-Key`. |
+| `/metrics` | Monitoring access with an admin API key. |
 | `/openapi.yaml`, `/docs` | Optional public exposure. Useful during development, consider restricting in production. |
 | `/internal/v1/*` | Private only. Never route from the public listener. |
 
-The current binary mounts public and internal routes on the same listener. In production, isolate internal access with network policy, security groups, firewall rules, or a sidecar/proxy that blocks `/internal/v1/*` from public networks.
+taritd serves internal routes on its dedicated peer listener. Restrict that listener to fleet peers.
 
 In fleet mode, asynchronous execution records are stored in PostgreSQL, so
 `GET /v1/executions/{id}` can be polled through any healthy API node.
@@ -440,6 +413,8 @@ pre-copy rounds, copied and residual dirty pages, downtime, convergence reason,
 and local versus cross-node path counts. Retained snapshots are bounded per
 epoch; live fork artifacts are deleted with their transient children.
 
+Record the candidate SHA and each completed case in [production readiness](../../PRODUCTION_READINESS.md). On failure, add the operation, last observed stage and archive reference to the [failure audit](../../docs/LIVE_FORK_KNOWN_FAILURE_AUDIT.md). Keep routine progress counters in the run logs.
+
 For focused reproduction, pass `--actions` through
 `TARIT_LIFECYCLE_DRIVER_ARGS`. Supported comma-separated actions are `assert`,
 `mutate`, `fork`, `hibernate`, `pause`, `balloon`, `guest-work`,
@@ -459,10 +434,10 @@ it while the three resident anchors continue working. At epoch completion,
 concurrent execute requests must single-flight its restore. The driver verifies
 the minimum zero-VMM hold, host-relative realtime repair, paused monotonic time,
 timer delivery, clone identity and session rotation, database state, artifact
-ownership, and capacity cleanup. The installed c8i unit requires at least a
+ownership, and capacity cleanup. The checked-in systemd unit requires at least a
 one-hour hold; its six-hour workload epoch normally yields a hold longer than
 six hours.
-`tests/tarit-continuous-soak.service` is the c8i systemd unit. It archives a
+`tests/tarit-continuous-soak.service` is the systemd unit for the continuous runner. It archives a
 failed epoch and restarts after 30 seconds so an isolated failure does not stop
 subsequent qualification. Repeated failures remain visible in
 `failures/index.jsonl`; they are not treated as passing epochs.
@@ -523,7 +498,7 @@ Modes are `sequential`, `staggered`, `burst`, or `all`.
 - Do not expose `/internal/v1/*` publicly.
 - Use TLS for public clients, usually at the load balancer.
 - Peer requests use a replay-protected HMAC; the shared key is never transmitted.
-- A separate internal listener with mandatory mTLS and host-session fencing is still required before hostile multi-tenant production use.
+- Fleet peers use a dedicated listener, mTLS by default, and host-session fencing. Keep the peer listener private.
 - Keep `TARIT_RPC_ADDR` values private and stable.
 - Use PostgreSQL TLS and CA validation where available.
 - Restrict VMM, kernel, rootfs, socket, and SQLite paths to trusted local directories.
@@ -537,14 +512,14 @@ Modes are `sequential`, `staggered`, `burst`, or `all`.
 | Startup fails with `configure at least one API key ...` | No API key configured. | Set `TARIT_API_KEY`, `TARIT_API_KEYS`, or `[api_keys]` in `TARIT_CONFIG`. |
 | Startup fails with peer secret error | Cluster mode without a strong `TARIT_PEER_SECRET`, or an explicit secret shorter than 32 characters. | Set a strong `TARIT_PEER_SECRET` on every node. |
 | `401 unauthorized` on `/v1/*` | Missing or wrong `X-API-Key`. | Check client header and environment value. |
-| `401` on `/internal/v1/*` | Missing or wrong `X-Peer-Secret`. | Ensure all nodes share the same peer secret. |
+| `401` on `/internal/v1/*` | Peer HMAC, session or identity check failed. | Check the shared signing key, clock skew, current boot session and node certificate. |
 | Create returns 429 | All visible nodes are full for the admission window. Response carries `Retry-After`. | Check `/v1/cluster`, `TARIT_MAX_VMS`, max vCPUs, max memory, and stale heartbeats. |
 | Create returns 409 | A VM with the same explicit `id` already exists in the fleet. | Use a fresh id or look up the existing VM. |
 | Peer placement never happens | No PostgreSQL fleet or no healthy peers. | Check `TARIT_DATABASE_URL`, heartbeats, `rpc_addr`, and peer reachability. |
 | A node shows `up: false` | Heartbeat older than about 15 seconds or unhealthy row. | Check node process, PostgreSQL connectivity, and clock skew. |
 | Owner operations fail with peer HTTP errors | `fleet_vms` points to a host that is down or unreachable. | Check owner `rpc_addr`, firewalls, and node status. |
-| Restore fails on another node | Snapshot path is node-local. | Pass `host_id` returned by snapshot or use external shared storage. |
-| Execution polling returns 404 through LB | `GET /v1/executions/{id}` hit a different node. | Enable sticky routing or poll the accepting node. |
+| Restore fails on another node | Snapshot owner or locator unavailable. | Use the returned `snapshot_id` and check the holding node and fleet registry. |
+| Execution polling returns 404 | Unknown or expired execution ID. | Check the ID returned on submission and the configured execution retention. |
 | `spawn vmm` fails | Wrong `TARIT_VMM_BIN` or missing execute bit. | Verify path and permissions. |
 | `wait for socket` times out | VMM child failed to create UDS. | Check VMM logs, kernel/rootfs paths, and KVM availability. |
 | Network provisioning fails | Missing privileges or `ip`/`nft`. | Run with required capabilities and verify host networking tools. |

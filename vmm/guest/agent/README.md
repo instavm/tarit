@@ -99,6 +99,18 @@ close-on-exec as an additional guard. Cleanup uses `close_range` on modern
 Linux and enumerates open descriptors on older kernels; it does not scan the
 potentially large descriptor limit.
 
+## Post-fork repair
+
+Before taritd admits work on a fork or wake, the agent sets realtime, reseeds
+the kernel RNG and installs a clone-specific view of the boot ID. An image
+with cached application secrets can install `/usr/libexec/tarit/post-fork`.
+The hook must be a root-owned executable regular file with group and other
+write permissions disabled. It receives `TARIT_POST_FORK=1` and
+`TARIT_CLONE_ID`. Return success only after the running application has
+rotated its cached keys, PRNG and nonce state and invalidated inherited sessions.
+A failed hook or missing repair acknowledgement blocks workload admission.
+[Failure audit](../../../docs/LIVE_FORK_KNOWN_FAILURE_AUDIT.md#wake-repair-timeout)
+
 ## Build
 
 On the Linux guest/rootfs build host:

@@ -257,7 +257,7 @@ Recommended safe scale-in sequence:
 2. Remove the victim from the external load balancer so it receives no new public API traffic.
 3. Keep the `taritd` process running so existing owner-routed operations can complete.
 4. Wait for `sandbox_count` to reach 0 if workloads are disposable.
-5. For stateful workloads, snapshot VMs on the victim and preserve each snapshot's `host_id` and path. Because snapshots are node-local today, evacuation requires either restoring before termination on that same node, copying snapshots externally, or using shared storage.
+5. For stateful workloads, keep each returned `snapshot_id`. Ordinary restore routes to the holding node. Before retiring it, verify that the workload and all required volumes can recover on a surviving host.
 6. Stop remaining VMs or restore them elsewhere according to workload policy.
 7. Terminate the underlying instance only after VM ownership is cleared or safely recreated.
 8. Verify the node disappears from `healthy_nodes` after heartbeat freshness expires.
@@ -271,7 +271,7 @@ Recommended safe scale-in sequence:
    still-running node whose row is deleted re-registers on its next
    heartbeat but loses those locators.
 
-If node-local snapshots are required for recovery, do not terminate a victim until snapshots are copied to durable storage.
+A snapshot handle cannot recover files lost with the only copy. Retain the holding node until the recovery check passes.
 
 ## Alerting recommendations
 

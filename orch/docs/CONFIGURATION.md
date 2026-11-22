@@ -4,7 +4,7 @@
 
 ## Required vs optional
 
-At least one API key is required. Configure it with `TARIT_API_KEY`, `TARIT_API_KEYS`, or `[api_keys]` in `TARIT_CONFIG`. In cluster mode, also set `TARIT_PEER_SECRET` to the same strong value on every node. All other daemon settings have code defaults, although host paths such as the VMM binary, kernel, and rootfs must still point to usable files for VM creation to work.
+At least one API key is required. Configure it with `TARIT_API_KEY`, `TARIT_API_KEYS`, or `[api_keys]` in `TARIT_CONFIG`. Fleet mode also needs a shared HMAC key and a dedicated peer listener. Configure a reachable HTTPS origin and peer certificates for the default mTLS transport. The VMM binary, kernel and rootfs must be readable at their configured paths.
 
 Boolean environment variables accept `1`, `true`, `yes`, or `on` for true and `0`, `false`, `no`, or `off` for false. Invalid booleans fail startup.
 
@@ -14,7 +14,7 @@ Boolean environment variables accept `1`, `true`, `yes`, or `on` for true and `0
 | --- | --- | --- | --- |
 | `TARIT_API_KEY` | string | unset | Single public API key. When set, it adds tenant `default`, role `admin`, and unlimited VM quota (`max_vms = 0`). Empty values are rejected. |
 | `TARIT_API_KEYS` | comma-separated string | unset | Multi-key config. Format is `key:tenant:role[:max_vms]`. `role` is `admin` or `user`. Omitted or `0` `max_vms` means unlimited. Entries are added to any TOML keys. |
-| `TARIT_LISTEN` | socket address | `0.0.0.0:8080` | HTTP bind address for public and internal routes. Invalid socket addresses are rejected. |
+| `TARIT_LISTEN` | socket address | `0.0.0.0:8080` | Public control API bind address. Invalid socket addresses are rejected. |
 | `TARIT_HOST_ID` | string | output of `hostname`, else `localhost` | Stable node identity used in local records and fleet ownership. |
 | `TARIT_RPC_ADDR` | string | `http://{listen.ip()}:{listen.port()}` | HTTP(S) origin advertised to peers. In cluster mode, set this to an address other nodes can reach; HTTPS is required unless insecure peer HTTP is explicitly enabled for development. |
 | `TARIT_VMM_BIN` | path | `vmm` (looked up on `PATH`) | Path to the rust-vmm based `vmm` binary. `~/` is expanded. |
@@ -32,6 +32,10 @@ Boolean environment variables accept `1`, `true`, `yes`, or `on` for true and `0
 | --- | --- | --- | --- |
 | `TARIT_DATABASE_URL` | string | unset | PostgreSQL fleet registry URL. Empty string is treated as unset. Setting this enables distributed fleet behavior. `TARIT_PRODUCTION=1` requires `sslmode=require` unless every host is a Unix socket, because the default `sslmode=prefer` silently falls back to plaintext. |
 | `TARIT_PEER_SECRET` | string | random local-only value | Key for short-lived, source/target-bound peer request HMACs. It is never sent on the wire. Explicit values must be at least 32 characters and cannot be `dev-peer-secret`; cluster mode requires this variable. |
+| `TARIT_PEER_LISTEN` | socket address | unset | Dedicated private bind address for peer RPC. Required in fleet mode. |
+| `TARIT_PEER_TLS_CERT` | path | unset | Node certificate chain in PEM format, used for incoming and outgoing peer TLS. |
+| `TARIT_PEER_TLS_KEY` | path | unset | Node private key. Use a regular file accessible only to its owner. |
+| `TARIT_PEER_TLS_CLIENT_CA` | path | unset | Trusted CA bundle for peer clients and servers. Configure all three TLS paths together. |
 | `TARIT_ALLOW_INSECURE_PEER_HTTP` | bool | `false` | Permit `http://` peer origins in cluster mode. Use only on an isolated development network; production mode forbids it. When set, `TARIT_PEER_LISTEN` and an IP-literal `TARIT_RPC_ADDR` must be loopback or private (RFC 1918 / IPv6 unique-local `fc00::/7`; wildcard binds are refused), and startup logs a loud `INSECURE` warning. |
 | `TARIT_PRODUCTION` | bool | `false` | Enforce the strict production configuration gates, including per-VM PID and network namespaces. This does not by itself satisfy every release gate in `PRODUCTION_READINESS.md`. |
 | `TARIT_IMAGE_REQUIRE_SIGNATURE` | bool | `false` | Require registered OCI images to have been verified with the currently configured cosign public key. `TARIT_PRODUCTION=1` requires this setting. Non-admin production creates must name a registered image and cannot fall back to the raw node default rootfs. |
@@ -43,6 +47,15 @@ Boolean environment variables accept `1`, `true`, `yes`, or `on` for true and `0
 
 `TARIT_RPC_ADDR` is listed in Core / identity because it is always present. In cluster mode it should be a stable private URL reachable by every peer.
 
+### Shared block volumes
+
+Set `TARIT_SHARED_BLOCK_PROVIDER=nfs_v4_1_block` with
+`TARIT_SHARED_BLOCK_ENDPOINT`, `TARIT_SHARED_BLOCK_EXPORT` and an absolute
+`TARIT_SHARED_BLOCK_MOUNT_ROOT`. `TARIT_SHARED_BLOCK_SECURITY` defaults to
+`sys` in development. Production requires `krb5p`. The per-volume size limit
+(`TARIT_SHARED_BLOCK_MAX_BYTES`) defaults to 1 TiB and the operation timeout
+(`TARIT_SHARED_BLOCK_TIMEOUT_MS`) to 20,000 ms. [Volume providers](SANDBOX-MIGRATION-AND-VOLUMES.md)
+
 ## Capacity and admission limits
 
 | Variable | Type | Default | Description |
@@ -51,6 +64,10 @@ Boolean environment variables accept `1`, `true`, `yes`, or `on` for true and `0
 | `TARIT_MAX_VCPUS` | u64 | `ceil(available_parallelism * TARIT_CPU_OVERCOMMIT)` | Local vCPU placement ceiling. If set, it overrides the derived ceiling. |
 | `TARIT_MAX_MEMORY_MIB` | u64 | host `MemTotal` in MiB (`65536` if `/proc/meminfo` is unreadable) | Local memory placement ceiling in MiB. |
 | `TARIT_ADMISSION_TIMEOUT_MS` | u64 | `60000` | Time a create operation may wait for capacity before admission gives up. |
+| `TARIT_API_MAX_IN_FLIGHT` | positive usize | `1024` | Node-wide authenticated handler concurrency limit. |
+| `TARIT_API_REQUESTS_PER_SECOND` | positive u64 | `5000` | Request rate used by API admission budgets. |
+| `TARIT_API_REQUEST_TIMEOUT_MS` | positive u64 | `180000` | API handler deadline in milliseconds. |
+| `TARIT_METRICS_EXPOSE_TENANT_LABELS` | bool | `false` | Expose tenant and VM identity labels on the admin metrics endpoint. |
 | `TARIT_CPU_OVERCOMMIT` | f64 | `4.0` | CPU overcommit ratio for the warm pool and for the derived `TARIT_MAX_VCPUS` when it is unset. |
 | `TARIT_PTY_MAX_ACTIVE_CONNECTIONS` | positive usize | `1024` | Node-wide active guest PTY limit, shared by WebSocket PTYs and SSH gateway channels. |
 | `TARIT_PTY_MAX_ACTIVE_CONNECTIONS_PER_TENANT` | positive usize | `128` | Active guest PTY limit for one authenticated tenant. Must be less than the node-wide limit so one tenant cannot consume every slot. |
@@ -64,6 +81,7 @@ Boolean environment variables accept `1`, `true`, `yes`, or `on` for true and `0
 | `TARIT_WARM_POOL_TARGET` | usize | `8` for the default class | Override the first warm-pool class target. |
 | `TARIT_WARM_POOL_ROOTFS` | path | unset | Override the first warm-pool class rootfs when non-empty. `~/` is expanded. |
 | `TARIT_WARM_POOL_IMAGE` | string | unset | Override the first warm-pool class image reference when non-empty after trimming. |
+| `TARIT_WARM_POOL_PREWARM` | string | unset | Command to run on the first class’s golden VM before capture. |
 | `TARIT_WARM_POOL_RESTORE` | bool | `true` | Restore-from-golden replenishment for the first class. For this variable, only `1` or `true` enables it; any other value refills by cold boot. |
 | `TARIT_WARM_POOL_LOW_WATERMARK` | usize | derived from target | Override the first class low watermark. Refill starts when depth is below this value. |
 | `TARIT_WARM_POOL_HIGH_WATERMARK` | usize | derived from target | Override the first class high watermark. Refill does not intentionally grow past this ceiling. |
@@ -311,7 +329,11 @@ export TARIT_PEER_SECRET='replace-with-a-long-random-peer-secret'
 export TARIT_DATABASE_URL='postgres://user:password@postgres.example:5432/taritd?sslmode=require'
 export TARIT_HOST_ID='node-a'
 export TARIT_LISTEN='0.0.0.0:8080'
-# HTTPS endpoint supplied by the private peer TLS proxy.
+# Use this node's private IP, certificate and key.
+export TARIT_PEER_LISTEN='10.0.1.10:8443'
+export TARIT_PEER_TLS_CERT='/etc/tarit/peer/node.crt'
+export TARIT_PEER_TLS_KEY='/etc/tarit/peer/node.key'
+export TARIT_PEER_TLS_CLIENT_CA='/etc/tarit/peer/ca.crt'
 export TARIT_RPC_ADDR='https://node-a.peer.example.com:8443'
 export TARIT_VMM_BIN='/opt/taritd/bin/vmm'
 export TARIT_KERNEL='/var/lib/taritd/vmlinux'
@@ -326,13 +348,9 @@ export TARIT_MAX_MEMORY_MIB='65536'
 ```
 
 Nodes B and C should use the same API key, peer secret, database URL, VMM binary, kernel, and rootfs, but distinct `TARIT_HOST_ID`, `TARIT_RPC_ADDR`, `TARIT_SOCKET_DIR`, `TARIT_DB`, and usually `TARIT_IMAGES_DIR`.
-The HTTPS proxy must deny every route except `/internal/v1/*`, support WebSocket
-upgrades, and preserve the method, path, query, body, and `X-Tarit-*` headers
-exactly; `taritd` performs the request-HMAC authentication. Its certificate SAN
-must match the `TARIT_RPC_ADDR` host and chain to the WebPKI roots used by the
-built-in Rustls clients. There is no custom peer-CA setting yet. For an isolated
-development cluster without a compatible TLS proxy, use a private `http://`
-origin and set `TARIT_ALLOW_INSECURE_PEER_HTTP=1` explicitly.
+Use each node’s private bind address and its own certificate/key pair. The
+certificate must cover the hostname in its advertised HTTPS origin and chain
+to the configured peer CA. The public listener and load balancer serve clients.
 
 ## Startup validation rules
 

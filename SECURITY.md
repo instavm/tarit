@@ -36,39 +36,12 @@ The boundary is crossed via virtio devices (block, net, vsock, serial), MMIO, an
 shared guest memory. KVM provides the CPU and memory boundary. On top of that the
 host applies defense in depth, in two tiers:
 
-- Enforced on the standard orchestrated path: restrictive Unix-socket
-  permissions with `SO_PEERCRED` checks, fail-closed seccomp on vCPU and selected
-  I/O worker threads, an nftables egress allowlist for VMs that set an egress
-  policy, and per-VM cgroup v2 limits when a parent cgroup is configured. The
-  coordinator thread is not seccomp-confined.
-- Available as an opt-in hardened mode (`vmm serve --jail`): chroot, privilege
-  drop to an unprivileged uid/gid, mount namespaces, optional entry into an
-  explicit network namespace, and cgroup placement. Without `--netns`, the VMM
-  remains in the caller's network namespace. Jail mode automatically enables
-  the mandatory built-in seccomp profile; the legacy `--seccomp` flag remains
-  accepted, but the profile cannot be disabled. This mode fails closed if a
-  required confinement step cannot be applied.
+- The standard path checks Unix-socket peer credentials, confines vCPU and selected I/O worker threads with seccomp, and enforces configured cgroup and egress policies. The coordinator thread runs outside the worker seccomp filters.
+- In production mode, taritd requires a per-VM UID/GID jail, staged assets, cgroups, PID and network namespaces and a signed-image policy. The VMM receives its TAP by descriptor. The standalone VMM also supports a jail. [Orchestrator isolation](orch/docs/ISOLATION.md)
 
-The standard `taritd` launch path does not yet stage and start every VMM through
-that jail. Production mode therefore remains disabled for hostile multi-tenant
-workloads until unique per-VM uid/gid jails, private staged assets, namespaces,
-and mandatory resource controls are wired end to end. KVM and the worker-thread
-filters are important boundaries, but they are not a categorical guarantee that
-a compromised guest cannot affect the host.
+Raw VMM snapshots have corruption checks. The orchestrator additionally authenticates artifacts and verifies RAM chunks during lazy restore. It repairs guest network configuration and waits for guest identity and entropy repair before admitting workload requests. Applications own the rotation of secrets cached in their processes. [Guest repair hook](vmm/guest/agent/README.md#post-fork-repair)
 
-The evidence and remaining release blockers are tracked in
-[PRODUCTION_READINESS.md](PRODUCTION_READINESS.md).
-
-Snapshot and migration streams are treated as untrusted input when they can
-originate off-node. Raw snapshot restore validates the current CRC-based format,
-which detects corruption but is not cryptographic authenticity, and full restore
-currently scans the memory payload before arming lazy paging. Production use of
-off-node artifacts therefore requires trusted storage or an external
-authenticated artifact layer. End-to-end fs-verity sealing, trusted measurement
-metadata, and restore propagation are still required before that scan can be
-safely skipped. Networked restore is not production-ready until the resumed
-guest also rebinds its IP, routes, gateway, and DNS; replacing only the host TAP
-is insufficient.
+The [release checklist](PRODUCTION_READINESS.md) records the remaining gates for hostile multi-tenant workloads.
 
 **Client to control plane (the orchestrator, `orch/`).** `taritd` exposes an HTTP
 API and drives one VMM per microVM over a Unix-domain socket. It is responsible

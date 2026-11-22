@@ -30,19 +30,19 @@ together.
 
 ## Build and test
 
-Each workspace is built and tested independently.
+Run from the repository root. Each command selects its workspace explicitly.
 
 ```sh
 # shared protocol crate
-cd proto && cargo test
+cargo test --manifest-path proto/Cargo.toml
 
 # the VMM (unit + non-KVM tests work on macOS; KVM tests need Linux+KVM)
-cd vmm && cargo test
-cargo build --release -p vmm --features boot   # Linux (boot = vmm-core/kvm + vmm-api/boot)
+cargo test --manifest-path vmm/Cargo.toml --workspace
+cargo build --manifest-path vmm/Cargo.toml --release -p vmm --features boot  # Linux
 
 # the orchestrator
-cd orch && cargo test
-cargo build --release -p taritd
+cargo test --manifest-path orch/Cargo.toml --workspace
+cargo build --manifest-path orch/Cargo.toml --release -p taritd
 ```
 
 Before sending a change, run in the workspace you touched:

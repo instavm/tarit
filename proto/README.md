@@ -1,7 +1,7 @@
 # tarit-proto
 
 The wire protocol for talking to a Tarit VMM (`vmm serve`) over its Unix domain
-socket. This crate is dependency-light (serde only, no KVM) and is the single
+socket. This crate is dependency-light (Serde and serde_json, no KVM) and is the single
 source of truth for the types on the wire, so any orchestrator can drive the VMM
 without hand-copying types.
 
@@ -33,7 +33,7 @@ crate.
 
 ## Using it
 
-See `vmm/docs/INTEGRATION.md` for a full bring-your-own-orchestrator guide with a
+See the [VMM integration guide](../vmm/docs/INTEGRATION.md) for a full bring-your-own-orchestrator guide with a
 minimal client example. In brief: spawn `vmm serve --socket <path>`, connect to
 the socket, send `ApiRequest::Create(VmSpec { config })` length-prefixed, read
 the `ApiResponse`, then drive `exec`, `snapshot`, `stop`, and the rest.
