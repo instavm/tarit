@@ -699,7 +699,9 @@ class AsyncDeadlineTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_deadline_cancels_an_inflight_request(self) -> None:
         for operation in ("execute", "wait_execution", "fork"):
-            with self.subTest(operation=operation):
+            # Keep setup from consuming the SDK budget. asyncio still enforces the
+            # real 10 ms request timeout and cancels the waiting transport.
+            with self.subTest(operation=operation), Clock().patched():
                 cancelled = False
 
                 async def handler(_request: httpx.Request) -> httpx.Response:

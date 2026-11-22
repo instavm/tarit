@@ -2294,9 +2294,17 @@ mod tests {
         setup_blk_out_requests(&mem, 3);
         make_flush_request(&mem, 1);
 
-        // The worker's pass completes the first write and stops at the
-        // FLUSH instead of flushing the backing store with the queue held.
-        assert!(!dev.process_queue_pass().unwrap());
+        // A slow write can use the worker's time slice before it reaches FLUSH.
+        // Retry each budget yield as the worker does, without another guest kick.
+        let run_until_blocked = |device: &VirtioBlkMmio, memory: &GuestMemoryMmap| {
+            let mut used = used_idx(memory);
+            while device.process_queue_pass().unwrap() {
+                let next = used_idx(memory);
+                assert!(next > used, "worker yielded without completing a request");
+                used = next;
+            }
+        };
+        run_until_blocked(&dev, &mem);
         assert_eq!(used_idx(&mem), 1);
         assert!(dev.host_flush_wanted());
 
@@ -2306,6 +2314,7 @@ mod tests {
         assert_eq!(state.processor.as_ref().unwrap().last_avail_idx, 1);
         assert_eq!(state.processor.as_ref().unwrap().last_used_idx, 1);
         assert_eq!(request_status(&mem, 1), 0xff);
+        assert_eq!(request_status(&mem, 2), 0xff);
 
         // The restored VM serves it again, on its own backing store.
         let restored_mem = new_test_mem();
@@ -2315,11 +2324,13 @@ mod tests {
         let mut restored = VirtioBlkMmio::new(5, BlkBackend::open(&path, false).unwrap());
         restored.restore(state);
         restored.set_guest_memory(restored_mem.clone());
-        assert!(!restored.process_queue_pass().unwrap());
+        run_until_blocked(&restored, &restored_mem);
         assert_eq!(used_idx(&restored_mem), 1);
         assert!(restored.host_flush_wanted());
+        assert_eq!(request_status(&restored_mem, 1), 0xff);
+        assert_eq!(request_status(&restored_mem, 2), 0xff);
         restored.service_host_flush().unwrap();
-        assert!(!restored.process_queue_pass().unwrap());
+        run_until_blocked(&restored, &restored_mem);
         assert_eq!(used_idx(&restored_mem), 3);
         for request in 0..3 {
             assert_eq!(request_status(&restored_mem, request), status::OK);
@@ -2329,7 +2340,7 @@ mod tests {
         // then moves on to the write behind it.
         dev.service_host_flush().unwrap();
         assert!(!dev.host_flush_wanted());
-        assert!(!dev.process_queue_pass().unwrap());
+        run_until_blocked(&dev, &mem);
         assert_eq!(used_idx(&mem), 3);
         assert_eq!(request_status(&mem, 1), status::OK);
         assert_eq!(request_status(&mem, 2), status::OK);
