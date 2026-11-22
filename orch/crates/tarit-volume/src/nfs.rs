@@ -942,12 +942,31 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn disposable_nfs_provider(endpoint: String) -> NfsProvider {
+        let export = std::env::var("TARIT_TEST_NFS_EXPORT").expect("NFS export");
+        let security = match std::env::var("TARIT_TEST_NFS_SECURITY").as_deref() {
+            Err(std::env::VarError::NotPresent) | Ok("sys") => NfsSecurityFlavor::Sys,
+            Ok("krb5p") => NfsSecurityFlavor::Krb5Privacy,
+            other => panic!("unexpected NFS test security flavor: {other:?}"),
+        };
+        NfsProvider::new(
+            NfsDialect::GenericV4_1,
+            endpoint,
+            export,
+            Some("test-region".into()),
+            None,
+        )
+        .unwrap()
+        .with_security(security)
+        .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn disposable_nfs_mount_reconnects_and_busy_detach_fails_closed() {
         let Ok(endpoint) = std::env::var("TARIT_TEST_NFS_ENDPOINT") else {
             return;
         };
-        let export = std::env::var("TARIT_TEST_NFS_EXPORT").expect("NFS export");
         let mount_root =
             PathBuf::from(std::env::var("TARIT_TEST_NFS_MOUNT_ROOT").expect("NFS mount root"));
         let unit = std::env::var("TARIT_TEST_NFS_SYSTEMD_UNIT").expect("NFS systemd unit");
@@ -956,14 +975,7 @@ mod tests {
             "nfs-server.service" | "nfs-kernel-server.service"
         ));
 
-        let provider = NfsProvider::new(
-            NfsDialect::GenericV4_1,
-            endpoint,
-            export,
-            Some("c8i-local".into()),
-            None,
-        )
-        .unwrap();
+        let provider = disposable_nfs_provider(endpoint);
         let spec = provider.prepare(Uuid::new_v4(), 11, false).unwrap();
         let mounter = SystemNfsMounter::open(mount_root).unwrap();
         let attachment = mounter.mount(&spec, Duration::from_secs(20)).unwrap();
@@ -973,12 +985,12 @@ mod tests {
         let mut proof = OpenOptions::new()
             .create_new(true)
             .write(true)
+            .custom_flags(libc::O_SYNC)
             .mode(0o600)
             .open(&proof_path)
             .unwrap();
         proof.write_all(b"before-interruption").unwrap();
         proof.sync_all().unwrap();
-        drop(proof);
 
         let systemctl = |action: &str| {
             Command::new("/usr/bin/systemctl")
@@ -988,12 +1000,45 @@ mod tests {
                 .expect("run systemctl")
         };
         assert!(systemctl("stop").success());
+        // Observe the synchronous write inside the kernel while nfsd is down.
+        // A worker-start notification alone could precede the actual syscall.
+        let (task_tx, task_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            task_tx
+                .send(fs::read_link("/proc/thread-self").unwrap())
+                .unwrap();
+            proof.write_all(b"-during-outage")?;
+            proof.sync_all()
+        });
+        let task = task_rx.recv().unwrap();
+        let syscall = Path::new("/proc").join(task).join("syscall");
+        let write_nr = libc::SYS_write.to_string();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let writing_during_outage = loop {
+            let status = fs::read_to_string(&syscall).unwrap_or_default();
+            if status.split_whitespace().next() == Some(write_nr.as_str()) {
+                break true;
+            }
+            if writer.is_finished() || Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
         assert!(systemctl("start").success());
         assert!(Command::new("/usr/sbin/exportfs")
             .arg("-ra")
             .status()
             .expect("reload NFS exports")
             .success());
+
+        writer
+            .join()
+            .expect("outage writer panicked")
+            .expect("outage write failed");
+        assert!(
+            writing_during_outage,
+            "never observed an in-flight synchronous write with nfsd stopped"
+        );
 
         let mut proof = OpenOptions::new().append(true).open(&proof_path).unwrap();
         proof.write_all(b"-after-reconnect").unwrap();
@@ -1004,7 +1049,10 @@ mod tests {
             .unwrap()
             .read_to_string(&mut contents)
             .unwrap();
-        assert_eq!(contents, "before-interruption-after-reconnect");
+        assert_eq!(
+            contents,
+            "before-interruption-during-outage-after-reconnect"
+        );
 
         let mut holder = Command::new("/bin/sleep")
             .arg("30")
@@ -1029,17 +1077,9 @@ mod tests {
         let Ok(endpoint) = std::env::var("TARIT_TEST_NFS_ENDPOINT") else {
             return;
         };
-        let export = std::env::var("TARIT_TEST_NFS_EXPORT").expect("NFS export");
         let mount_root =
             PathBuf::from(std::env::var("TARIT_TEST_NFS_MOUNT_ROOT").expect("NFS mount root"));
-        let nfs = NfsProvider::new(
-            NfsDialect::GenericV4_1,
-            endpoint,
-            export,
-            Some("test-region".into()),
-            None,
-        )
-        .unwrap();
+        let nfs = disposable_nfs_provider(endpoint);
         let provider = NfsBackedBlockProvider::open(
             nfs,
             &mount_root,

@@ -1,0 +1,87 @@
+name: NFS recovery
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/nfs-recovery.yml'
+      - 'orch/tests/e2e_nfs_provider.sh'
+      - 'orch/crates/tarit-volume/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  recovery:
+    name: NFSv4.1 server restart
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Linux NFS and Kerberos
+        run: |
+          sudo apt-get -qq update
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get -qq install --no-install-recommends \
+            nfs-kernel-server nfs-common krb5-kdc krb5-admin-server krb5-user
+          if ! sudo modprobe nfsd || ! sudo modprobe rpcsec_gss_krb5; then
+            sudo apt-get -qq install "linux-modules-extra-$(uname -r)"
+            sudo modprobe nfsd
+            sudo modprobe rpcsec_gss_krb5
+          fi
+
+      - name: Create a disposable loopback Kerberos realm
+        shell: sudo bash -euo pipefail {0}
+        run: |
+          umask 077
+          realm=TARIT.TEST
+          fqdn=nfs.tarit.test
+          test ! -e /etc/krb5.keytab
+          test ! -e /var/lib/krb5kdc/principal
+          hostnamectl set-hostname "$fqdn"
+          echo "127.0.0.2 $fqdn nfs" >> /etc/hosts
+          cat >/etc/krb5.conf <<EOF
+          [libdefaults]
+            default_realm = $realm
+            dns_lookup_kdc = false
+            rdns = false
+          [realms]
+            $realm = {
+              kdc = 127.0.0.1
+            }
+          EOF
+          cat >>/etc/idmapd.conf <<EOF
+
+          [Translation]
+            GSS-Methods = static,nsswitch
+          [Static]
+            root/$fqdn@$realm = root
+          EOF
+          kdb5_util -r "$realm" -P "$(openssl rand -hex 32)" create -s
+          for service in root nfs; do
+            kadmin.local -q "addprinc -randkey $service/$fqdn"
+            kadmin.local -q "ktadd -norandkey $service/$fqdn"
+          done
+          systemctl restart krb5-kdc
+          kinit -k "root/$fqdn"
+          kvno "nfs/$fqdn"
+          kdestroy
+          systemctl restart rpc-gssd rpc-svcgssd
+          systemctl is-active rpc-gssd rpc-svcgssd
+
+      - name: Verify ordinary and privacy-protected recovery
+        run: |
+          for security in sys krb5p; do
+            sudo env CARGO_HOME="$HOME/.cargo" \
+              TARIT_CARGO_BIN="$(rustup which cargo)" TARIT_RUSTC_BIN="$(rustup which rustc)" \
+              TARIT_TEST_NFS_SECURITY="$security" TARIT_TEST_NFS_ENDPOINT=nfs.tarit.test \
+              bash orch/tests/e2e_nfs_provider.sh
+          done
+
+      - name: Collect service diagnostics on failure
+        if: failure()
+        run: |
+          sudo journalctl -b -n 100 --no-pager -u nfs-server -u rpc-gssd -u rpc-svcgssd -u krb5-kdc
+          sudo journalctl -b -k -n 60 --no-pager
