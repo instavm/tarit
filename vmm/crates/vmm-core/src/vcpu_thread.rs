@@ -913,7 +913,7 @@ mod tests {
         );
         let mut wake = [0xffu8];
         assert_eq!(
-            action(VcpuExit::IoIn(0x601, &mut wake)),
+            handle_io_exit(VcpuExit::IoIn(0x601, &mut wake), &bus, &serial).unwrap(),
             ExitAction::Continue
         );
         assert_eq!(wake, [0]);
