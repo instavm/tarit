@@ -1,31 +1,10 @@
 # Live fork and lifecycle known-failure audit
 
-The [release checklist](../PRODUCTION_READINESS.md) tracks the candidate and its
-four-case rotation. This audit records what failed, which tests exercise the
-failure, and where coverage ends.
-
-## Earlier live-fork repair failure
-
-The Azure run on `e9e6a7c` stopped during live-fork guest repair after 43,106
-operations and 737 verified forks. Serial input stalled before the host could
-record the guest repair stage. None of the four cases completed. The next
-build added stage reporting. [Repair diagnostics](https://github.com/instavm/tarit/pull/191)
-
 ## Wake repair timeout
 
-On November 22, 2026, revision `696f4ed` failed the first six-hour Azure case
-on Ubuntu 24.04 / Linux 6.6.155, seed `20261122`. After 72 minutes, 14,346 API
-operations and 261 verified forks, exec tried to wake a four-vCPU hibernated VM.
-The last repair stage reported was `userspace`, immediately before the post-fork
-hook. The 30-second host deadline expired without a completion acknowledgement.
-The trace does not identify what blocked inside that interval.
-
-On the same binaries, 100 focused wake replays passed. A separate two-hour
-instrumented run passed 419 verified forks. Its positive control completed
-repair and its deliberately stopped workload failed admission. A cold-start
-writer race also reproduced before any fork or wake and has a separate
-[fixture fix](https://github.com/instavm/tarit/pull/194). The mixed-workload
-timeout remains open pending sustained qualification.
+One soak stopped during live-fork guest repair. A separate soak timed out
+while waking a hibernated VM. Focused wake tests passed. The cause of the
+timeout remains open. [Release status](../PRODUCTION_READINESS.md)
 
 ## Upstream-derived invariants
 
@@ -33,17 +12,17 @@ timeout remains open pending sustained qualification.
 | --- | --- | --- |
 | Running fork | High-dirty tests preserved source and child data across Ubuntu/Alpine and both kernels. Ten injected VMM capture/publication failures resumed the source and removed staging. Local and cross-node retries recovered the same child after daemon death. | Remaining cancellation and non-convergence paths, physical host loss and non-overcommitted local and cross-node latency distributions. |
 | Lazy RAM / UFFD | Handler loss, unexpected unmap/remap and descriptor loss terminated the VMM. API recovery preserved retryable hibernation, guest data and capacity. Discard, zero-refault and mixed-residency faults passed. | Covered for the in-process handler and tested guest matrix. |
-| Balloon and restore | Eighty snapshot/restore/balloon cycles across both distributions and kernels verified guest data, host reclaim and kernel liveness under a 768 MiB cgroup limit. | Covers balloon and lazy memory interaction. The mixed wake failure above followed a balloon operation; causation is unknown. |
+| Balloon and restore | Eighty snapshot/restore/balloon cycles across both distributions and kernels verified guest data, host reclaim and kernel liveness under a 768 MiB cgroup limit. | Covers balloon and lazy memory interaction. |
 | Clone uniqueness | Siblings had distinct clone IDs, boot IDs and kernel random samples. Linux 6.6.155 delivered VMGenID. Linux 5.10.230 used the guest repair barrier. A test application rotated cached PRNG, ticket keys and nonces, cleared session state and rejected an inherited ticket. | Applications must implement their own cached-state repair. The sustained admission gate remains open. [Guest hook](../vmm/guest/agent/README.md#post-fork-repair) |
 | Time and timers | Bounded hibernation and sibling-fork cases verified host-relative realtime, paused monotonic time and delivery of both timer classes after resume. | Multi-hour hibernation and ownership lease tests. |
 | vCPU MSRs | Linux 6.6.155 and 5.10.230 restored online/offline vCPU state, including pvclock, PV-EOI, steal-time and async-PF. After onlining, the secondary vCPU made progress. | Cross-build compatibility with those features enabled and disabled. |
 | Restored device I/O | Active serial/vsock streams, stale transport reset, queued TX and delayed block I/O passed real-KVM or device regression tests. The snapshot barrier drains device workers after vCPU producers stop. | Regression gate for the tested UART, vsock, net and block devices. |
 | Snapshot compatibility | Checks covered corrupt components, CPU-template and state-ABI rejection before publication, v1-to-v2 restore, 4 GiB split RAM, swap, SMP, first-diff semantics and hardlink alias protection. | Retain these gates for format changes. Outstanding publication failures appear below. |
 | CoW disk and artifacts | Storage pressure reproduced ENOSPC during publication. Range reflinks avoided a second full RAM copy on CoW storage. | Inject ENOSPC at each publication phase and verify source, files and filesystem after crash/restart. |
-| NFS and shared volumes | Three loopback NFSv4.1 restarts each with AUTH_SYS and Kerberos privacy preserved an in-flight synchronous write. Busy detach, durable reopen and cleanup passed. Production requires `krb5p`. | Independent server/network loss, stale file handles, managed TLS helpers and cloud volume recovery. [NFS fixture](../orch/tests/e2e_nfs_kerberos.sh) |
-| Lifecycle concurrency and ownership | Fork retry checks fenced duplicate IDs, wrong targets and stale owners. Two concurrent wake claims produced one winner in 100 races each on PostgreSQL 14 and 16. PostgreSQL 16 also recovered across two abrupt restarts on one host. | Independent-host failover, multi-hour leases and remaining transfer/publication fault cases. [Handoff tests](https://github.com/instavm/tarit/pull/193) |
+| NFS and shared volumes | Local NFS restarts preserved an in-flight write. Busy detach and durable reopen passed. | Independent server loss, stale handles and cloud volume recovery. |
+| Lifecycle concurrency and ownership | Fork retries fenced duplicate IDs, wrong targets and stale owners. Concurrent wake claims elected one owner, and local database restarts preserved it. | Independent-host failover, multi-hour leases and remaining transfer and publication failures. |
 | Isolation | KVM gates verified host virtualization remained available while guests lacked nested VMX/SVM and access to the KVM device. | Repeat syscall and path confinement gates as host kernels, microcode and devices change. [Isolation](../orch/docs/ISOLATION.md) |
-| OCI input | Tests rejected digest, expansion and inode violations. Six interrupted TLS pulls rolled back fresh or existing destinations. Six whole-pull retries passed filesystem and payload verification, including a moved registry tag. | Registry retry coverage applies to image conversion. Remote object-volume recovery is a separate open gate. [Registry fixture](../vmm/ci/oci-registry-interruption.py) |
+| OCI input | Tests rejected digest, expansion and inode violations. Interrupted pulls rolled back and retries passed content verification. | Image conversion only. Remote object-volume recovery remains open. |
 
 ## Release execution rule
 

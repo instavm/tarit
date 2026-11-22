@@ -6,28 +6,18 @@ production use still has open security and durability gates. Setting
 
 ## Release evidence
 
-| Revision | Verified result |
-| --- | --- |
-| Main `08cbfb3` | The protected-main KVM lifecycle and performance job passed. [KVM run](https://github.com/instavm/tarit/actions/runs/44989376832) |
-| Rehearsal `696f4ed` | The first six-hour Azure case stopped after 72 minutes on Ubuntu 24.04 / Linux 6.6.155. An exec-triggered wake exceeded the 30-second repair deadline after 261 verified forks. A separate two-hour diagnostic passed 24,593 API operations and 419 verified forks. [Wake failure](docs/LIVE_FORK_KNOWN_FAILURE_AUDIT.md#wake-repair-timeout) |
-| Candidate `7b1ec28` | The build-only workflow produced attested Linux artifacts. Installed Python wheel, sdist and npm consumer tests passed. On November 22, 2026 at 15:42 UTC, the four-case Azure rotation started with the verified VMM and daemon. [Candidate build](https://github.com/instavm/tarit/actions/runs/45039199864) |
-
-The matrix pairs Ubuntu 24.04 and Alpine 3.20 with Linux 6.6.155 and 5.10.230.
-Each case requires six continuous hours plus crash recovery, ingress wake and
-persistent-volume checks. A failed case stays in the record alongside its rerun.
-[Soak procedure](orch/docs/OPERATIONS.md#continuous-lifecycle-qualification)
+The candidate build and SDK package checks passed. Sustained fork and wake
+qualification remains open. [Failure audit](docs/LIVE_FORK_KNOWN_FAILURE_AUDIT.md#wake-repair-timeout) · [Soak procedure](orch/docs/OPERATIONS.md#continuous-lifecycle-qualification)
 
 ## Stop-ship items
 
 | Gate | Evidence still required |
 | --- | --- |
-| Lifecycle and ownership | Complete all four epochs and 12 auxiliary checks. Verify multi-hour hibernation, timer and application-state repair, and fenced ownership handoff across independent hosts. Single-host PostgreSQL races and restart recovery passed. [Ownership tests](https://github.com/instavm/tarit/pull/193) |
-| Fork and snapshot rollback | Finish cancellation, dirty-rate non-convergence, corruption and near-ENOSPC cases. Verify source progress, a single writer and removal of staged files across crash/restart. |
-| CPU compatibility and latency | Exercise guest-enabled paravirtual MSRs across VMM builds. Record 100-sample fork, snapshot and restore distributions on a larger reflink-capable host, including cross-node forks. |
-| Durable storage | Exercise independent NFS server loss, stale handles and host-crash durability. Generic NFS loopback restarts passed with an in-flight write. The immutable object provider uses local files. Remote conditional writes, checksum verification and outage recovery remain open. [Storage coverage](orch/docs/SANDBOX-MIGRATION-AND-VOLUMES.md#acceptance-gates) |
-| Release from main | Verify the merged revision against the rehearsed artifacts, run the protected gates and retain hashes, configuration, logs and teardown results for the release build. [Release workflow](.github/workflows/release.yml) |
-
-The candidate SDK rejects a valid NFS volume response. The [OpenAPI and SDK correction](https://github.com/instavm/tarit/pull/197) changes the embedded schema and both SDKs. Rebuild and attest the release artifacts from the revision that includes it.
+| Lifecycle and ownership | Complete the guest/kernel rotation and verify multi-hour hibernation and ownership handoff between independent hosts. |
+| Fork and snapshot rollback | Verify source recovery and cleanup after cancellation, corruption and storage exhaustion. |
+| CPU compatibility and latency | Check cross-build restore and measure fork, snapshot and restore latency on representative hosts. |
+| Durable storage | Verify independent NFS server loss, stale handles, host-crash durability and remote object recovery. [Storage coverage](orch/docs/SANDBOX-MIGRATION-AND-VOLUMES.md#acceptance-gates) |
+| Release from main | Include the NFS volume SDK fix, run the protected checks and verify the final artifacts. [Release workflow](.github/workflows/release.yml) |
 
 ## Implemented and testable
 
@@ -39,11 +29,8 @@ The candidate SDK rejects a valid NFS volume response. The [OpenAPI and SDK corr
 
 ## Required gates
 
-CI runs formatting, tests, lint and dependency policy. The protected-main KVM
-job uses a one-job runner labeled `tarit-kvm-ephemeral`. It exercises suspend,
-disk isolation, checkpoint/wake loops and the VMM integration suite. It takes
-100 cold and 100 warm create-to-exec samples. Both require 100% success,
-with p99 limits of 5,000 ms cold and 1,000 ms warm. The continuous release rotation is a separate run.
+CI checks formatting, tests, lint and dependency policy. The protected-main KVM job
+checks lifecycle, disk isolation and cold and warm create-to-exec latency.
 [KVM workflow and thresholds](.github/workflows/kvm.yml)
 
 ## PaaS capability gaps (non-billing)

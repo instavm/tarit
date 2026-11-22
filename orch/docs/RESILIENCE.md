@@ -55,7 +55,7 @@ The fleet store is the only shared dependency. It holds fleet VM records, owners
 | PostgreSQL TLS | A configured CA bundle is added to the Rust TLS root store alongside native roots | e2e (cluster tests connect over `sslmode=require`) |
 | Usage/audit write-behind | Per-key usage stats and audit events buffer in a local SQLite outbox and flush to Postgres; a DB outage delays but never drops them, and re-sends are idempotent (`UNIQUE(vm_id, kind, window_end)`) | e2e: `e2e_usage_audit.sh` + outbox design |
 
-PostgreSQL handoff tests also ran 100 two-claim races on each of PostgreSQL 14 and 16. Two abrupt local database restarts preserved the committed owner. Independent-host failover remains open. [Handoff tests](https://github.com/instavm/tarit/pull/193)
+Local PostgreSQL tests verified that concurrent wake claims elect one owner and that the owner survives database restarts. Independent-host failover remains open.
 
 The DB outage is injected with an nftables drop rule to the database endpoint, so
 the test is self-contained and does not depend on a cloud control-plane API. A

@@ -219,7 +219,7 @@ versions may contain breaking changes.
   refused, 19 pauses in about 1 ms.
 
 - Share WebSocket bridges drain the close handshake in both directions.
-- Guest repair reports the last reported stage on timeout. Fleet hibernation handoff returns the timestamp persisted by PostgreSQL. See the [release checklist](PRODUCTION_READINESS.md) for qualification status.
+- Guest repair timeouts identify the last reported stage. Fleet hibernation handoff returns the timestamp persisted by PostgreSQL. See the [release checklist](PRODUCTION_READINESS.md) for qualification status.
 
 - A burst of snapshots or forks on one host all wrote and synced guest RAM
   at once. On a 40-VM soak with a saturated disk, 40% of live snapshots ran

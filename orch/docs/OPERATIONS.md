@@ -413,7 +413,7 @@ pre-copy rounds, copied and residual dirty pages, downtime, convergence reason,
 and local versus cross-node path counts. Retained snapshots are bounded per
 epoch; live fork artifacts are deleted with their transient children.
 
-Record the candidate SHA and each completed case in [production readiness](../../PRODUCTION_READINESS.md). On failure, add the operation, last observed stage and archive reference to the [failure audit](../../docs/LIVE_FORK_KNOWN_FAILURE_AUDIT.md). Keep routine progress counters in the run logs.
+Update [production readiness](../../PRODUCTION_READINESS.md) when a release gate changes and the [failure audit](../../docs/LIVE_FORK_KNOWN_FAILURE_AUDIT.md) when a failure is confirmed or resolved. Keep traces with the run logs.
 
 For focused reproduction, pass `--actions` through
 `TARIT_LIFECYCLE_DRIVER_ARGS`. Supported comma-separated actions are `assert`,

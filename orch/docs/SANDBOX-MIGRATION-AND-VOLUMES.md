@@ -155,10 +155,8 @@ attachment and replaces the VMM's inherited descriptor on same-host resume.
   tenant denial, unprivileged FD-only attachment, guest virtualization masking,
   and exact physical cleanup. A host-crash durability gate with explicit
   provider flush evidence remains required before claiming fsync durability.
-- Loopback NFSv4.1 tests verified synchronous write recovery through three
-  server restarts each with AUTH_SYS and Kerberos privacy, plus busy detach
-  and durable reopen. Production generic NFS requires `krb5p`. Independent
-  server loss and stale handles remain open. [Fixture](../tests/e2e_nfs_kerberos.sh)
+- Local NFS tests verified write recovery after a server restart. Independent
+  server loss and stale handles remain open. Production generic NFS requires `krb5p`.
 - Managed block providers still need independent volume tests for attach
   timeouts, node loss and stale-generation cleanup.
 - Object-provider tests cover immutable blob/checkpoint behavior and reject

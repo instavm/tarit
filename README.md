@@ -215,7 +215,7 @@ tested, and consumed on its own. Both depend on `proto/` for the wire types.
 
 ## Self-hosting
 
-Tarit has run on AWS, GCP and an Azure VM exposing KVM. The [release checklist](PRODUCTION_READINESS.md) records the Azure guest/kernel combinations and current results.
+Tarit has run on AWS, GCP and Azure hosts with KVM access. [Release status](PRODUCTION_READINESS.md)
 
 ## License
 
