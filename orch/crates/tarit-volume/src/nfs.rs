@@ -974,6 +974,15 @@ mod tests {
             unit.as_str(),
             "nfs-server.service" | "nfs-kernel-server.service"
         ));
+        // A process spawned during the outage can block closing inherited NFS
+        // descriptors before it execs systemctl. Start the controller before mount.
+        let mut restart = Command::new("/bin/sh")
+            .arg("-ec")
+            .arg(r#"read -r request && test "$request" = restart && exec /usr/bin/systemctl start "$1""#)
+            .args(["nfs-restart", &unit])
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("start NFS restart controller");
 
         let provider = disposable_nfs_provider(endpoint);
         let spec = provider.prepare(Uuid::new_v4(), 11, false).unwrap();
@@ -992,14 +1001,15 @@ mod tests {
         proof.write_all(b"before-interruption").unwrap();
         proof.sync_all().unwrap();
 
-        let systemctl = |action: &str| {
-            Command::new("/usr/bin/systemctl")
-                .arg(action)
-                .arg(&unit)
-                .status()
-                .expect("run systemctl")
-        };
-        assert!(systemctl("stop").success());
+        assert!(Command::new("/usr/bin/systemctl")
+            .args(["stop", &unit])
+            .status()
+            .expect("stop nfsd")
+            .success());
+        assert_eq!(
+            fs::read_to_string("/proc/fs/nfsd/threads").unwrap().trim(),
+            "0"
+        );
         // Observe the synchronous write inside the kernel while nfsd is down.
         // A worker-start notification alone could precede the actual syscall.
         let (task_tx, task_rx) = std::sync::mpsc::channel();
@@ -1024,7 +1034,14 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(10));
         };
-        assert!(systemctl("start").success());
+        eprintln!("observed outage write in the kernel: {writing_during_outage}");
+        restart
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"restart\n")
+            .unwrap();
+        assert!(restart.wait().expect("restart nfsd").success());
         assert!(Command::new("/usr/sbin/exportfs")
             .arg("-ra")
             .status()
