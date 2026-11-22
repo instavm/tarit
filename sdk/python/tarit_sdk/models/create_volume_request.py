@@ -17,7 +17,8 @@ class CreateVolumeRequest:
     """
     Attributes:
         name (str):
-        size_bytes (int):
+        size_bytes (int): Local block volumes are limited to 1 TiB. The NFS limit is set by TARIT_SHARED_BLOCK_MAX_BYTES
+            (1 TiB by default).
         id (UUID | Unset): Optional client-selected identity for idempotent replay.
         provider (CreateVolumeRequestProvider | Unset):  Default: 'local_block'.
     """

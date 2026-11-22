@@ -79,7 +79,8 @@ def sync_detailed(
     """Create a persistent volume
 
      Creates an opaque tenant-owned volume. Exact replay with the same id and immutable properties is
-    idempotent. The initial local-block provider is exact-host constrained; provider paths are private.
+    idempotent. The default local_block provider pins the volume to one host. The nfs_v4_1_block
+    provider requires a configured NFS backend in the same region. Provider paths are private.
 
     Args:
         body (CreateVolumeRequest):
@@ -111,7 +112,8 @@ def sync(
     """Create a persistent volume
 
      Creates an opaque tenant-owned volume. Exact replay with the same id and immutable properties is
-    idempotent. The initial local-block provider is exact-host constrained; provider paths are private.
+    idempotent. The default local_block provider pins the volume to one host. The nfs_v4_1_block
+    provider requires a configured NFS backend in the same region. Provider paths are private.
 
     Args:
         body (CreateVolumeRequest):
@@ -138,7 +140,8 @@ async def asyncio_detailed(
     """Create a persistent volume
 
      Creates an opaque tenant-owned volume. Exact replay with the same id and immutable properties is
-    idempotent. The initial local-block provider is exact-host constrained; provider paths are private.
+    idempotent. The default local_block provider pins the volume to one host. The nfs_v4_1_block
+    provider requires a configured NFS backend in the same region. Provider paths are private.
 
     Args:
         body (CreateVolumeRequest):
@@ -168,7 +171,8 @@ async def asyncio(
     """Create a persistent volume
 
      Creates an opaque tenant-owned volume. Exact replay with the same id and immutable properties is
-    idempotent. The initial local-block provider is exact-host constrained; provider paths are private.
+    idempotent. The default local_block provider pins the volume to one host. The nfs_v4_1_block
+    provider requires a configured NFS backend in the same region. Provider paths are private.
 
     Args:
         body (CreateVolumeRequest):

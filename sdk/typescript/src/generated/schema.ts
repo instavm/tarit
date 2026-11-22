@@ -138,7 +138,7 @@ export interface paths {
         put?: never;
         /**
          * Create a persistent volume
-         * @description Creates an opaque tenant-owned volume. Exact replay with the same id and immutable properties is idempotent. The initial local-block provider is exact-host constrained; provider paths are private.
+         * @description Creates an opaque tenant-owned volume. Exact replay with the same id and immutable properties is idempotent. The default local_block provider pins the volume to one host. The nfs_v4_1_block provider requires a configured NFS backend in the same region. Provider paths are private.
          */
         post: operations["createVolume"];
         delete?: never;
@@ -553,7 +553,7 @@ export interface paths {
         put?: never;
         /**
          * Execute command in sandbox (async)
-         * @description User keys can execute only in their tenant's VMs; admin keys can execute in any VM. Poll the record with GET /v1/executions/{id} on the same node.
+         * @description User keys can execute only in their tenant's VMs; admin keys can execute in any VM. In fleet mode, poll GET /v1/executions/{id} through any healthy API node.
          */
         post: operations["executeAsync"];
         delete?: never;
@@ -1052,7 +1052,7 @@ export interface components {
             id: string;
             name: string;
             /** @enum {string} */
-            provider: "local_block";
+            provider: "local_block" | "nfs_v4_1_block";
             /** @enum {string} */
             storage_class: "block" | "filesystem" | "object";
             /** Format: uint64 */
@@ -1091,13 +1091,16 @@ export interface components {
              */
             id?: string;
             name: string;
-            /** Format: uint64 */
+            /**
+             * Format: uint64
+             * @description Local block volumes are limited to 1 TiB. The NFS limit is set by TARIT_SHARED_BLOCK_MAX_BYTES (1 TiB by default).
+             */
             size_bytes: number;
             /**
              * @default local_block
              * @enum {string}
              */
-            provider: "local_block";
+            provider: "local_block" | "nfs_v4_1_block";
         };
         RestoreRequest: {
             /** @description Grow guest-visible RAM to this total within the snapshot reserved maximum. Requires a live hotplug-ready snapshot; shrinking is rejected. */

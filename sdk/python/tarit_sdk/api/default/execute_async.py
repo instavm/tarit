@@ -75,8 +75,8 @@ def sync_detailed(
 ) -> Response[Any | ExecutionRecord]:
     """Execute command in sandbox (async)
 
-     User keys can execute only in their tenant's VMs; admin keys can execute in any VM. Poll the record
-    with GET /v1/executions/{id} on the same node.
+     User keys can execute only in their tenant's VMs; admin keys can execute in any VM. In fleet mode,
+    poll GET /v1/executions/{id} through any healthy API node.
 
     Args:
         body (ExecuteRequest):
@@ -107,8 +107,8 @@ def sync(
 ) -> Any | ExecutionRecord | None:
     """Execute command in sandbox (async)
 
-     User keys can execute only in their tenant's VMs; admin keys can execute in any VM. Poll the record
-    with GET /v1/executions/{id} on the same node.
+     User keys can execute only in their tenant's VMs; admin keys can execute in any VM. In fleet mode,
+    poll GET /v1/executions/{id} through any healthy API node.
 
     Args:
         body (ExecuteRequest):
@@ -134,8 +134,8 @@ async def asyncio_detailed(
 ) -> Response[Any | ExecutionRecord]:
     """Execute command in sandbox (async)
 
-     User keys can execute only in their tenant's VMs; admin keys can execute in any VM. Poll the record
-    with GET /v1/executions/{id} on the same node.
+     User keys can execute only in their tenant's VMs; admin keys can execute in any VM. In fleet mode,
+    poll GET /v1/executions/{id} through any healthy API node.
 
     Args:
         body (ExecuteRequest):
@@ -164,8 +164,8 @@ async def asyncio(
 ) -> Any | ExecutionRecord | None:
     """Execute command in sandbox (async)
 
-     User keys can execute only in their tenant's VMs; admin keys can execute in any VM. Poll the record
-    with GET /v1/executions/{id} on the same node.
+     User keys can execute only in their tenant's VMs; admin keys can execute in any VM. In fleet mode,
+    poll GET /v1/executions/{id} through any healthy API node.
 
     Args:
         body (ExecuteRequest):
