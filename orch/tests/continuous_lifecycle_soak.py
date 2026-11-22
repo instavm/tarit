@@ -271,6 +271,8 @@ printf '%s\n' PROOF_VALUE > /root/tarit-soak-proof
 for i in $(seq 1 200); do /usr/local/bin/tarit-clone-repair-workload state >/dev/null 2>&1 && break; sleep 0.05; done
 /usr/local/bin/tarit-clone-repair-workload cache long-lived-session >/dev/null
 busybox setsid sh -c 'i=0; while :; do i=$((i + 1)); printf "%s\n" "$i" > /tmp/soak-counter.next; mv /tmp/soak-counter.next /tmp/soak-counter; busybox dd if=/dev/urandom of=/tmp/soak-workset bs=4096 count=16 seek=$((i % 256)) conv=notrunc 2>/dev/null; sync; sleep 1; done' </dev/null >/tmp/soak-writer.log 2>&1 &
+for i in $(seq 1 200); do test -s /tmp/soak-counter && break; sleep 0.05; done
+test -s /tmp/soak-counter || { echo "soak writer did not publish its first counter" >&2; exit 1; }
 test "$(cat /root/tarit-soak-proof)" = PROOF_VALUE
 /usr/local/bin/tarit-clone-repair-workload state
 '''.replace("PROOF_VALUE", proof)
