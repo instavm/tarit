@@ -8,8 +8,8 @@ timeout remains open. [Release status](../PRODUCTION_READINESS.md)
 
 ## Guest command stalled
 
-The latest soak stopped in its first case when serial input stalled during
-guest command execution. The cause remains open.
+After a VM resumed, one concurrent command timed out and another stalled on
+serial input. Focused pause/resume tests passed. The cause remains open.
 
 ## Upstream-derived invariants
 
