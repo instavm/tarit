@@ -6,8 +6,8 @@ production use still has open security and durability gates. Setting
 
 ## Release evidence
 
-The candidate build and SDK package checks passed. Sustained fork and wake
-qualification remains open. [Failure audit](docs/LIVE_FORK_KNOWN_FAILURE_AUDIT.md#wake-repair-timeout) · [Soak procedure](orch/docs/OPERATIONS.md#continuous-lifecycle-qualification)
+The candidate build and SDK package checks passed. The latest lifecycle soak
+failed during its first case. [Failure audit](docs/LIVE_FORK_KNOWN_FAILURE_AUDIT.md) · [Soak procedure](orch/docs/OPERATIONS.md#continuous-lifecycle-qualification)
 
 ## Stop-ship items
 

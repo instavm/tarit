@@ -6,6 +6,11 @@ One soak stopped during live-fork guest repair. A separate soak timed out
 while waking a hibernated VM. Focused wake tests passed. The cause of the
 timeout remains open. [Release status](../PRODUCTION_READINESS.md)
 
+## Guest command stalled
+
+The latest soak stopped in its first case when serial input stalled during
+guest command execution. The cause remains open.
+
 ## Upstream-derived invariants
 
 | Failure area | What the tests established | Coverage boundary |
