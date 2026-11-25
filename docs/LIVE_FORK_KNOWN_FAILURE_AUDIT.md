@@ -2,9 +2,9 @@
 
 ## Wake repair timeout
 
-One soak stopped during live-fork guest repair. A separate soak timed out
-while waking a hibernated VM. Focused wake tests passed. The cause of the
-timeout remains open. [Release status](../PRODUCTION_READINESS.md)
+Soaks have timed out during guest repair on both live fork and wake. In the
+latest live-fork failure, the child reached userspace repair and its final
+acknowledgement timed out. Focused wake tests passed. The cause remains open. [Release status](../PRODUCTION_READINESS.md)
 
 ## Guest command stalled
 
