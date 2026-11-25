@@ -1,6 +1,6 @@
 # Documentation index
 
-Start with the [README quickstart](../README.md#quickstart-run-your-first-microvm)
+Start with the [repository quickstart](../../README.md#layer-1-run-code-in-a-microvm)
 if you want to build the binary, create a rootfs, start `vmm serve`, and run the
 first `exec` command.
 

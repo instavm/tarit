@@ -20,10 +20,9 @@ types.
 ## What it does
 
 - **Isolation.** Each sandbox is a KVM guest with its own kernel. The VMM
-  runs each thread under its own seccomp profile. With taritd's VM jail
+  applies seccomp filters to vCPUs and selected I/O workers. With taritd's VM jail
   configured, each VMM also gets its own uid, PID namespace, network
-  namespace and cgroup. See [SECURITY.md](SECURITY.md) for what this does
-  and does not cover.
+  namespace and cgroup. [Security model](SECURITY.md)
 - **Fast creates.** taritd keeps warm pools of VMs restored from a golden
   snapshot, one for each registered image and for each VM shape in use, so
   most creates return in a few milliseconds. An image can carry a command
@@ -33,10 +32,12 @@ types.
   writable disk. A checkpoint after the first pauses the guest only for
   memory changed since the previous one, and still restores on its own.
   Live snapshots keep the guest running until a short final stop.
-- **Fork.** A running VM can be forked. Children share its memory until
-  they write to it, and on a reflink filesystem its disk too.
-- **Images.** Any OCI or Docker image can become a VM root filesystem,
-  without root (`taritd image build`, `vmm pull`).
+- **Fork.** Fork a running VM at one RAM, device and disk checkpoint. Each child
+  resumes the captured processes with independent lazy RAM and a private disk
+  overlay. Before admitting requests, taritd waits for guest repair. Workloads
+  with cached keys or PRNG state need a [post-fork hook](vmm/guest/agent/README.md#post-fork-repair).
+- **Images.** Build an ext4 root filesystem from a Linux container image without
+  root using `taritd image build` or `vmm pull`.
 - **Network.** With taritd's networking on, each VM gets its own TAP and
   address, and outbound traffic is denied unless allowed.
 - **Access.** Commands run over vsock; there are also PTYs, an SSH
@@ -101,7 +102,7 @@ sudo vmm serve --socket /tmp/vm.sock &
 sudo vmm --socket /tmp/vm.sock create --kernel guest-assets/vmlinux --rootfs guest-assets/rootfs.ext4
 sleep 12                                             # let the guest boot and dial the agent
 sudo vmm --socket /tmp/vm.sock exec "uname -a"
-sudo vmm --socket /tmp/vm.sock stop
+sudo vmm --socket /tmp/vm.sock stop                  # skip this if continuing to Layer 2
 ```
 
 For a kernel-only install, run `sudo vmm kernel install`. Interactive
@@ -120,7 +121,8 @@ pass the same `VMM_FEATURES` to the install target.
 ### Layer 2: snapshot, suspend, restore
 
 Drive the same socket to capture and move VM state. A full snapshot writes memory
-plus device state; `--diff` writes only dirty pages. Suspend releases resident
+and device state with the writable disks by default. With a usable parent,
+`--diff` writes the changed RAM pages. Suspend releases resident
 guest RAM; resume brings it back. Restore boots a fresh VMM from a snapshot.
 Snapshots include the architectural and host-advertised KVM paravirtual MSR
 state used by the guest. Restore validates that state against the destination
@@ -213,7 +215,7 @@ tested, and consumed on its own. Both depend on `proto/` for the wire types.
 
 ## Self-hosting
 
-Self-hosting has been tested on AWS and GCP. Azure support is coming soon.
+Tarit has run on AWS, GCP and Azure hosts with KVM access. [Release status](PRODUCTION_READINESS.md)
 
 ## License
 

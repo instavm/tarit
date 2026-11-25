@@ -6,17 +6,16 @@ is opt-in and does not convert old snapshots. Restore-time growth is
 grow-only; a running VM can additionally be grown and shrunk through the VMM
 API (see "Live resize of a running VM").
 
-Create a VM with **2 GiB boot RAM and a 4 GiB maximum reservation**:
+Send `POST /v1/vms` with 2 GiB boot RAM and a 4 GiB maximum reservation.
 
 ```json
-POST /v1/vms
 {"memory_mib":4096,"boot_memory_mib":2048,"vcpus":1}
 ```
 
-Snapshot it normally (`POST /v1/vms/{id}/snapshot`, `{"diff":false}`), then:
+Snapshot the VM with `POST /v1/vms/{id}/snapshot` and `{"diff":false}`.
+Use the returned snapshot ID in `POST /v1/restore`.
 
 ```json
-POST /v1/restore
 {"snapshot_id":"<returned UUID>","target_memory_mib":4096}
 ```
 
@@ -68,7 +67,7 @@ The VMM API (`vmm serve` socket) exposes two ops for a VM created with
 `memory.boot_size_mib`. All sizes are MiB and **exclude boot RAM**, the same
 convention as Firecracker's `requested_size_mib`:
 
-```json
+```jsonl
 {"op":"memory_hotplug_status"}
 {"op":"set_memory_hotplug","requested_size_mib":2048}
 {"op":"set_memory_hotplug","requested_size_mib":0,"wait_timeout_ms":30000}

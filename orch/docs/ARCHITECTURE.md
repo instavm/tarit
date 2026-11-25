@@ -7,7 +7,7 @@ This document describes the distributed design implemented in `crates/taritd` an
 | Component | Code | Responsibility |
 | --- | --- | --- |
 | Public HTTP API | `crates/taritd/src/api.rs` | Client-facing routes, API key auth, cluster placement, owner resolution, and peer forwarding. |
-| Internal peer API | `crates/taritd/src/internal.rs` | Node-local execution routes protected by `X-Peer-Secret`. |
+| Internal peer API | `crates/taritd/src/internal.rs` | Dedicated peer routes with session-bound HMACs and mutual TLS by default. |
 | Cluster logic | `crates/taritd/src/cluster.rs` | VM owner lookup, peer RPC lookup, placement candidate selection, ownership map maintenance. |
 | Node-local operations | `crates/taritd/src/ops.rs` | Shared local create, restore, stop, pause, resume, snapshot, exec, egress, and get operations. |
 | Peer client | `crates/taritd/src/peer.rs` | Hardened blocking HTTP client for `/internal/v1/*` calls. |
@@ -60,15 +60,13 @@ Every node runs a 5 second heartbeat loop. It writes its current local capacity 
 
 `fleet_vms` maps a VM to exactly one owning `host_id`. The owning node is the only node that has the VMM child process and its UDS. Public requests can arrive at any node, but operations that touch a VM are executed by the owner.
 
-Owner resolution in cluster mode:
+In fleet mode, PostgreSQL supplies the authoritative owner. A remote owner
+must have a fresh heartbeat, a current boot session and a routable peer
+address. Missing ownership returns 404. An unavailable registry or stale
+owner fails the request. Single-host mode resolves ownership locally.
 
-1. Look up `fleet_vms(id)` in PostgreSQL.
-2. If the owner is the current node, execute locally.
-3. If the owner is another node, look up that node's `rpc_addr` in `fleet_hosts` and forward to `/internal/v1/*`.
-4. If the fleet lookup fails or misses, fall back to the local SQLite store so a node can still answer for VMs it owns.
-5. If neither source knows the VM, return 404.
-
-Ownership writes are best effort. A successful local create or restore writes the local SQLite record and then calls `fleet.upsert_vm`. If that fleet write fails, the local VM still exists and a warning is logged. Operators should alert on fleet write failures because peer routing depends on the map.
+Lifecycle publication checks revisions and fences ownership writes. Recovery
+reconciles the durable record and the actual VMM before reclaiming capacity.
 
 ## Port-share gateway
 
@@ -155,8 +153,8 @@ node B public API
   v
 node B peer client
   |
-  | X-Peer-Secret
-  | PATCH/POST/GET/DELETE http://node-a:8080/internal/v1/...
+  | Session-bound request HMAC over mTLS
+  | PATCH/POST/GET/DELETE https://node-a:8443/internal/v1/...
   v
 node A internal API
   |
@@ -170,7 +168,7 @@ response returns through node B to client
 
 This applies to get, delete, pause, resume, snapshot, egress update, and the command execution part of `POST /v1/execute_async`.
 
-Important operational detail: the execution job record for `POST /v1/execute_async` is stored in the local SQLite database of the public API node that accepted the request. The command can run on a remote owner, but `GET /v1/executions/{id}` does not forward through the cluster. If an external load balancer distributes requests randomly, use stickiness for execution polling or have clients poll the same node that accepted the execution request.
+In fleet mode the owner runs the command and PostgreSQL stores the execution record. A client can poll `GET /v1/executions/{id}` through any healthy API node.
 
 ## Placement model
 
@@ -217,24 +215,14 @@ the same image names on every placement host.
 
 ## Restore and snapshots
 
-Snapshots are node-local files produced by the owner through the VMM UDS. Public snapshot responses include:
+Public snapshot creation returns `{"snapshot_id":"<uuid>"}`. Restore accepts
+that handle, an optional new VM ID and an optional memory target for a compatible
+template. taritd resolves the private locator and routes ordinary restore to
+the holding node. Public responses omit host paths and placement identifiers.
 
-```json
-{
-  "path": "/path/on/owner/snapshot",
-  "host_id": "node-a"
-}
-```
-
-`POST /v1/restore` accepts `snapshot_path`, optional `host_id`, and optional new `id`. If `host_id` is present and not the receiving node, the request is routed to that host using `cluster::peer_rpc`. The file is not copied across nodes.
-
-Restore behavior:
-
-- Restore succeeds only on the node that can read `snapshot_path`.
-- The restored `VmRecord` currently uses `memory_mib: 0`, `vcpus: 0`, `kernel_path: "(restored)"`, and `cmdline: "(restored)"` because the code does not reconstruct shape metadata from the snapshot.
-- Restored VMs write ownership to `fleet_vms` like newly created VMs.
-
-A disaster-recovery or cross-zone restore design can store snapshots in shared storage or object storage, put the URI in the snapshot response, and make restore download or mount the artifact on the selected target node.
+Cross-node live fork has a separate transfer path. The receiving node obtains
+the authenticated source artifact, verifies it against the configured replica
+policy and publishes the child with its own writable overlay. [Public API](API.md)
 
 ## Membership and health
 
@@ -254,32 +242,29 @@ Placement and `/v1/cluster` consider a node up only if the row is healthy and le
 
 ## Consistency model
 
-The design is simple and mostly eventually consistent:
-
-- PostgreSQL is authoritative for VM ownership and node membership in cluster mode.
-- A node's local SQLite store is authoritative for records and executions created on that node.
-- Fleet ownership writes after local create and restore are best effort. A write failure can make a live VM unreachable through peers until repaired.
+- In fleet mode PostgreSQL is authoritative for ownership, node membership and execution records. Standalone nodes persist VM and execution records in SQLite.
+- Fleet writes check the VM revision and incarnation. Failed publication enters recovery or cleanup before capacity can be reused.
 - Host capacity is heartbeat based and can be stale for up to about 15 seconds.
 - Peer create handles races by treating peer 429 as capacity backpressure and preserving 409 for duplicate requested IDs or other state conflicts.
-- Delete clears `fleet_vms` after stopping the local VM. The local SQLite VM row is marked `stopped`, not deleted.
+- Delete clears `fleet_vms` after stopping the local VM. The stopped record reserves its ID during the configured retention window (24 hours by default).
 
 ## Failure handling
 
 | Failure | Behavior | Operator action |
 | --- | --- | --- |
 | Node misses heartbeats | Excluded from placement and shown as `up: false` after about 15 seconds. | Investigate node and VMM child processes. |
-| Owner node down | Requests routed by `fleet_vms` can fail with peer HTTP errors until the node returns or ownership is repaired. | Restore from a node-local snapshot on that node, or use shared snapshot storage if implemented externally. |
-| PostgreSQL unavailable | Owner lookup falls back to local only; cross-node placement returns no candidates. Heartbeat logs warnings. | Restore PostgreSQL service. Do not rely on new cross-node placement while unavailable. |
+| Owner node down | Owner-routed requests fail when the owner is stale. | Recover the owner or use a supported fenced recovery path. |
+| PostgreSQL unavailable | Fleet owner lookup fails and heartbeats report errors. | Restore PostgreSQL service. Do not rely on new cross-node placement while unavailable. |
 | Peer full during placement | Peer returns 429, caller tries the next candidate. | No action unless all peers are full. |
 | Whole cluster full | Create waits up to `TARIT_ADMISSION_TIMEOUT_MS`, then returns 429 with `Retry-After`. | Add capacity or enable autoscaling. |
-| Fleet ownership write fails | VM keeps running locally, but other nodes may not find it. | Alert on logs and reconcile ownership. |
-| Snapshot restore sent to wrong node | `host_id` in restore routes to the right node if available. Without it, restore is local only. | Preserve and pass `host_id` from snapshot responses. |
+| Fleet ownership write fails | Lifecycle publication reports failure and recovery preserves the ownership fence. | Alert on logs and reconcile ownership. |
+| Snapshot restore sent to wrong node | taritd resolves the holding node from the snapshot handle. | Pass the opaque `snapshot_id` and check owner availability. |
 
 ## Security boundaries
 
 - Public API routes require `X-API-Key`.
-- Peer routes require `X-Peer-Secret`.
+- Peer routes require a session-bound HMAC derived from the shared signing key.
 - Cluster mode refuses the built-in `dev-peer-secret`.
 - Peer URLs are not user supplied. They come from `fleet_hosts.rpc_addr`.
 - The peer HTTP client disables redirects to avoid redirect-based SSRF.
-- Production deployments should use mTLS between peers, restrict peer ports to private networks or security groups, and terminate public TLS at the load balancer or at `taritd` through a sidecar/proxy.
+- Production mode requires peer mTLS on a dedicated listener. Restrict peer ports to the private fleet network and terminate public TLS at the edge.

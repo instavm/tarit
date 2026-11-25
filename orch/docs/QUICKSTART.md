@@ -19,13 +19,8 @@ can exec into and SSH into. For the full option list see
 `taritd` and the `vmm` microVM backend, both in this repository:
 
 ```sh
-cd /path/to/tarit/orch
-cargo build --release -p taritd
-
-cd /path/to/tarit/vmm
-cargo build --release --features "vmm-core/kvm vmm-core/boot vmm-memory-backend/kvm"
-
 cd /path/to/tarit
+make build
 sudo make guest
 sudo install -d -m 0755 /var/lib/taritd
 sudo install -m 0644 guest-assets/vmlinux guest-assets/rootfs.ext4 /var/lib/taritd/
@@ -97,8 +92,8 @@ id; the gateway authenticates by registered key and bridges to the guest PTY:
 export TARIT_SSH_GATEWAY=1
 export TARIT_SSH_GATEWAY_ADDR='0.0.0.0:2222'
 # restart taritd with these set, then offer only the registered key:
-ssh -p 2222 -i ~/.ssh/tarit -o IdentitiesOnly=yes "$vm"@<taritd-host>
-# or: ./target/release/taritd ssh "$vm" -i ~/.ssh/tarit uname -a
+ssh -p 2222 -i ~/.ssh/id_ed25519 -o IdentitiesOnly=yes "${vm}@127.0.0.1"
+# or: ./target/release/taritd ssh "$vm" -i ~/.ssh/id_ed25519 uname -a
 ```
 
 Each unregistered key a client offers first costs about a second, because the
@@ -113,21 +108,9 @@ disconnect.
 
 ## 5. Cluster mode (optional)
 
-Cluster mode is selected by setting `TARIT_DATABASE_URL` (shared PostgreSQL) and
-a strong shared `TARIT_PEER_SECRET` on every node. Any node then accepts API
-traffic and forwards to the owning host.
-
-```sh
-export TARIT_DATABASE_URL='postgres://user:pass@db.example:5432/taritd?sslmode=require'
-export TARIT_PEER_SECRET="$(openssl rand -hex 32)"
-export TARIT_HOST_ID="$(hostname)"
-export TARIT_RPC_ADDR="http://$(hostname -i | awk '{print $1}'):8080"
-```
-
-Each node needs its own `TARIT_HOST_ID`, `TARIT_RPC_ADDR`, `TARIT_SOCKET_DIR`,
-and `TARIT_DB`. See [OPERATIONS.md](OPERATIONS.md) for the full three-node table,
-load balancer guidance, and RDS setup, and [RESILIENCE.md](RESILIENCE.md) for the
-failover and scale behavior each of these settings drives.
+Set up a shared PostgreSQL database and provision each node with a private
+peer listener, a TLS identity trusted by the other nodes, and the fleet HMAC
+key. The [configuration example](CONFIGURATION.md#one-node-of-a-three-node-cluster-with-postgresql) gives the variables for one node. The [operations guide](OPERATIONS.md#run-a-three-node-cluster) shows what changes on the other two.
 
 ## Next steps
 

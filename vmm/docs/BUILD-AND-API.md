@@ -17,6 +17,8 @@ kernel from checksum-pinned source. The loader also supports user-supplied
 ### Build Commands
 
 ```sh
+cd vmm  # from the repository root
+
 # Development build (debug)
 cargo build --workspace
 
@@ -69,7 +71,7 @@ cargo fmt --all -- --check
 
 ### `vmm run` (`start`): Boot a fresh VM
 
-```sh
+```text
 vmm run [--kernel <PATH>] [OPTIONS]
 ```
 
@@ -105,7 +107,7 @@ vmm run --kernel ../guest-assets/vmlinux --initramfs guest/initramfs.cpio.gz \
 
 ### `vmm create`: Boot a VM inside `vmm serve` (via API)
 
-```sh
+```text
 vmm create [--kernel <PATH>] [OPTIONS] [--socket <PATH>]
 ```
 
@@ -128,7 +130,7 @@ Non-interactive commands fail with an install command instead of prompting.
 
 ### `vmm kernel install`: Install the pinned kernel
 
-```sh
+```text
 vmm kernel install [--output <PATH>] [--force]
 ```
 
@@ -139,7 +141,7 @@ whose checksum is wrong; symlinks and non-regular files are rejected.
 
 ### `vmm serve` (`server`): Start the API server
 
-```sh
+```text
 vmm serve [OPTIONS] [--socket <PATH>]
 ```
 
@@ -170,7 +172,7 @@ require `--cgroup`. `--cgroup-memory-max` accepts bytes or K/M/G/T suffixes.
 
 ### `vmm restore` (`load`): Restore from snapshot
 
-```sh
+```text
 vmm restore --snapshot <PATH> [OPTIONS]
 ```
 
@@ -183,17 +185,17 @@ vmm restore --snapshot <PATH> [OPTIONS]
 
 ### `vmm snapshot` (`snap`): Snapshot a running VM (via API)
 
-```sh
+```text
 vmm snapshot [--diff] [--socket <PATH>]
 ```
 
 | Flag | Default | Description |
 |---|---|---|
-| `--diff` | off | Create a diff snapshot |
+| `--diff` | off | Capture changed RAM against a usable parent, or a full snapshot on the first capture. |
 
 ### `vmm snapshot-verify`: Check a full snapshot file offline
 
-```sh
+```text
 vmm snapshot-verify [--record] <PATH>
 ```
 
@@ -221,13 +223,13 @@ failed check exits non-zero and records nothing.
 
 ### `vmm status` (`info`): Show VM status
 
-```sh
+```text
 vmm status [--socket <PATH>]
 ```
 
 ### `vmm exec` (`run-in`): Execute a command in a guest
 
-```sh
+```text
 vmm exec <COMMAND> [--timeout <MS>] [--socket <PATH>]
 ```
 
@@ -238,7 +240,7 @@ vmm exec <COMMAND> [--timeout <MS>] [--socket <PATH>]
 
 ### `vmm attach-pty`: Attach an interactive PTY
 
-```sh
+```text
 vmm attach-pty [--shell <SHELL>] [--socket <PATH>]
 ```
 
@@ -248,13 +250,13 @@ vmm attach-pty [--shell <SHELL>] [--socket <PATH>]
 
 ### `vmm stop` (`kill`): Stop a VM
 
-```sh
+```text
 vmm stop [--socket <PATH>]
 ```
 
 ### `vmm gc`: Remove orphaned VMM scratch files
 
-```sh
+```text
 vmm gc [--dir /tmp] [--max-age <SECS>]
 ```
 
@@ -270,21 +272,21 @@ are preserved.
 
 ### `vmm pause` / `vmm resume`: Pause/resume a VM
 
-```sh
+```text
 vmm pause [--socket <PATH>]
 vmm resume [--socket <PATH>]
 ```
 
 ### `vmm suspend`: Pause and release resident guest RAM
 
-```sh
+```text
 vmm suspend [--socket <PATH>]
 vmm resume [--socket <PATH>]
 ```
 
 ### `vmm update-egress` (`egress`): Update egress policy on a live VM
 
-```sh
+```text
 vmm update-egress --allow <RULE>... [--allow-existing] [--socket <PATH>]
 ```
 
@@ -301,7 +303,7 @@ vmm update-egress --allow 10.0.0.0/8:443/tcp --allow 8.8.8.8/32:53/udp
 
 ### `vmm pull` (`oci-pull`): Pull an OCI image and convert to ext4
 
-```sh
+```text
 vmm pull <IMAGE_REF> --output <PATH> [--size <MIB>] [--auth <PATH>] [--agent <PATH>]
 ```
 
@@ -436,7 +438,7 @@ Optional fields may be `null` or omitted when using the shared wire types.
 ```json
 { "op": "snapshot", "diff": false }
 ```
-Set `diff` to `true` to request a diff snapshot.
+Set `diff` to `true` to request a diff against a usable parent. A first diff request without a parent produces a full snapshot.
 
 #### `restore`: Restore from a snapshot file
 ```json
@@ -500,7 +502,7 @@ and exclude boot RAM. `requested_size_mib` grows or shrinks (`0` unplugs all)
 and must be a multiple of `block_size_mib`, at most `total_size_mib`.
 `wait_timeout_ms` (optional, at most 60000) waits until plugged equals
 requested. See `docs/memory-growth.md` at the repository root.
-```json
+```jsonl
 { "op": "memory_hotplug_status" }
 { "op": "set_memory_hotplug", "requested_size_mib": 2048, "wait_timeout_ms": 30000 }
 ```
@@ -521,7 +523,7 @@ All responses are JSON objects with a `status` field:
 | `memory_hotplug` | `total_size_mib`, `block_size_mib`, `plugged_size_mib`, `requested_size_mib`, `boot_memory_mib` | `memory_hotplug_status`, `set_memory_hotplug` |
 | `err` | `msg` | Any non-PTY request |
 
-```json
+```jsonl
 { "status": "ok" }
 { "status": "snapshot", "path": "/tmp/vmm-vm-1.snap" }
 { "status": "restored" }

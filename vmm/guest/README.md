@@ -51,8 +51,9 @@ and toolchain container.
 
 The `Guest kernel release` workflow builds `vmlinux`, the generated config, and
 `SHA256SUMS`, then creates GitHub artifact attestations. Publishing is manual
-and is blocked until the candidate passes all 19 `orch/tests/e2e_*.sh`
-programs plus a minimum three-hour c8i soak. Point-release maintenance updates
+and requires the [kernel promotion suites](../../test/kernel-promotion.sh) and
+at least three hours of soak on the c8i runner. The [Tarit release rotation](../../PRODUCTION_READINESS.md)
+separately qualifies the VMM and orchestrator. Point-release maintenance updates
 the pins in `kernel-version.env`, rebuilds the config, and repeats that gate.
 Lifecycle gates execute commands inside guests after create, resume, and
 restore. Egress gates run real guest-side `curl` requests and prove deny,

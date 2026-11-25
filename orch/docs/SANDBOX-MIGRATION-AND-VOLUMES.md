@@ -155,14 +155,11 @@ attachment and replaces the VMM's inherited descriptor on same-host resume.
   tenant denial, unprivileged FD-only attachment, guest virtualization masking,
   and exact physical cleanup. A host-crash durability gate with explicit
   provider flush evidence remains required before claiming fsync durability.
-- NFS E2E proves reconnect, server interruption, busy detach, durable block
-  reopen, strict live-mount option verification, and that no cloud or
-  metadata-store credential reaches the guest. Production parsing rejects
-  generic `AUTH_SYS` and accepts only Kerberos privacy.
-- AWS and Azure gates use real disposable volumes, exercise attach timeout/node
-  loss/stale generation cleanup, and leave no billable resource behind.
+- Local NFS tests verified write recovery after a server restart. Independent
+  server loss and stale handles remain open. Production generic NFS requires `krb5p`.
+- Managed block providers still need independent volume tests for attach
+  timeouts, node loss and stale-generation cleanup.
 - Object-provider tests cover immutable blob/checkpoint behavior and reject
   requests that imply unsupported POSIX, locking, or block semantics.
-- Sandbox cutover tests run product CRUD against Tarit's public API with the
-  legacy Firecracker/VMD processes disabled and assert equivalent user-visible
-  behavior.
+- Product cutover requires a separate CRUD test against the public API with
+  legacy Firecracker/VMD processes disabled.

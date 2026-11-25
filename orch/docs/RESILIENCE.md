@@ -37,17 +37,14 @@ forwards operations for VMs owned by peers. Node liveness is a heartbeat row in
 | Leader node dies | Lease expires after its TTL (30s) and a survivor acquires leadership; self-heals with no operator action | e2e: `e2e_ha_failover.sh` (lease moved n2 -> n1) |
 | Node rejoins | Restarted node re-registers; `healthy_nodes` returns to N | e2e: `e2e_ha_failover.sh` |
 | Request lands on a non-owner node | The receiving node looks up the owner in `fleet_vms` and forwards the lifecycle/exec call over the internal peer API | e2e: `e2e_cluster.sh` (`cross-node routing`) |
-| Cross-node snapshot then restore | Snapshot is node-local; restore on another node is routed to the owner (or takes an explicit `host_id`) | e2e: `e2e_cluster.sh` (`restore from full snapshot`, `cross-node routing`) |
+| Cross-node snapshot then restore | Clients pass the returned `snapshot_id`; taritd routes ordinary restore to the holding node | e2e: `e2e_cluster.sh` (`restore from full snapshot`, `cross-node routing`) |
 | Startup reconciliation | On boot a node adopts verified live VMM children, reapplies local limits, and frees orphaned per-VM resources. Networkless VMs do not require TAP recovery. | c8i KVM e2e: taritd SIGKILL, restart, VM adoption, successful exec, graceful cleanup; unit recovery coverage |
 
 Result: `HA_FAILOVER_PASS` (5/5) and `e2e_cluster.sh` 7/7.
 
 ## 2. Database (PostgreSQL) failures (durability)
 
-The fleet store is the only shared dependency. It holds node membership, VM
-ownership, and the leader lease. Node-local state (VM/exec records, cached host
-roster) lives in per-node SQLite, so a node can keep serving its own VMs across a
-database blip.
+The fleet store is the only shared dependency. It holds fleet VM records, ownership, artifact metadata, node membership and the leader lease. SQLite retains node-local state. Fleet owner lookup and publication depend on PostgreSQL, including when the VM process survives a database outage.
 
 | Scenario | Expected behavior | Validation |
 | --- | --- | --- |
@@ -58,7 +55,7 @@ database blip.
 | PostgreSQL TLS | A configured CA bundle is added to the Rust TLS root store alongside native roots | e2e (cluster tests connect over `sslmode=require`) |
 | Usage/audit write-behind | Per-key usage stats and audit events buffer in a local SQLite outbox and flush to Postgres; a DB outage delays but never drops them, and re-sends are idempotent (`UNIQUE(vm_id, kind, window_end)`) | e2e: `e2e_usage_audit.sh` + outbox design |
 
-Result: `PG_BLIP_PASS` (no crash during outage, full recovery after).
+Local PostgreSQL tests verified that concurrent wake claims elect one owner and that the owner survives database restarts. Independent-host failover remains open.
 
 The DB outage is injected with an nftables drop rule to the database endpoint, so
 the test is self-contained and does not depend on a cloud control-plane API. A
@@ -75,7 +72,7 @@ for a slot, then returns overload backpressure.
 
 | Scenario | Expected behavior | Validation |
 | --- | --- | --- |
-| Single node full, cluster has room | Create is placed on a peer node and returns 201 with the owning `host_id` | e2e: `e2e_cluster.sh` (`cross-node routing`) |
+| Single node full, cluster has room | Create is placed on a peer node and returns 201 with a public VM record | e2e: `e2e_cluster.sh` (`cross-node routing`) |
 | Whole cluster full | Create returns `429 Too Many Requests` with `Retry-After`, not a crash or a hang | e2e: `e2e_cluster.sh` (`capacity/backpressure`) |
 | Burst of concurrent creates | Warm pool absorbs the burst; overflow cold-boots or gets backpressure, never a partial/corrupt VM | e2e: warm-pool restore path (`e2e_warmpool_restore.sh`); prior burst-100 run |
 | Warm pool refill under load | Refill runs on a low `cpu.weight` cgroup with a concurrency limit and watermark hysteresis, so refill never starves live traffic | e2e: `e2e_cpu_refill.sh` |
@@ -120,7 +117,7 @@ Result: `NET_SCALE_PASS`.
 | Scenario | Expected behavior | Validation |
 | --- | --- | --- |
 | Unauthenticated API call | `/v1/*` returns 401 without a valid `X-API-Key`; `/health` stays public | e2e: `e2e_cluster.sh` (`infra/auth`) |
-| Internal peer API exposed | `/internal/v1/*` returns 401 without the shared `X-Peer-Secret` | e2e: `e2e_cluster.sh` (`peer security`) |
+| Internal peer API exposed | Peer routes live on a dedicated listener. Invalid request signatures are rejected | e2e: `e2e_cluster.sh` (`peer security`) |
 | Multi-tenant isolation | Hashed multi-key auth; tenants see only their own VMs; per-tenant VM quotas enforced | e2e: `e2e_multitenant.sh` |
 | Admin-only endpoints | `/v1/cluster` and other admin routes require an admin identity | design + `e2e_multitenant.sh` |
 | SSH gateway auth | A session is admitted only if the presented public key is registered and maps to a VM the caller owns | e2e: `e2e_ssh_pty.sh` |
@@ -221,12 +218,7 @@ coverage:
 
 - Managed database failover is simulated as a connection outage (section 2), not
   driven through a provider control API in an automated test.
-- `virtio-balloon` reclaim needs a balloon-enabled guest kernel; the current test
-  kernel lacks `CONFIG_VIRTIO_BALLOON`.
+- The pinned guest kernel enables `CONFIG_VIRTIO_BALLOON`. The [failure audit](../../docs/LIVE_FORK_KNOWN_FAILURE_AUDIT.md) records the tested reclaim and restore matrix.
 - `aarch64` guests are unsupported (KVM VM/vCPU/GIC/PSCI/FDT path pending).
 - Cold boot (create to first exec) is not latency-optimized; sub-100ms today
   comes from restore/warm-pool, not cold boot.
-- Public and internal routes share one listener; isolate `/internal/v1/*` with
-  network policy in production (see `OPERATIONS.md`).
-- `GET /v1/executions/{id}` is not fleet-forwarded; use sticky routing or poll the
-  accepting node.

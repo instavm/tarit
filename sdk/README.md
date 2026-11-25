@@ -18,10 +18,9 @@ Python package, TypeScript package, and npm lock. A release tag must be exactly
 `vMAJOR.MINOR.PATCH` for that version.
 
 Manual runs of the Release workflow build, inspect, install, checksum, attest,
-and retain both SDK packages without publishing them. A matching protected tag
-publishes only after the binary and SDK build jobs succeed. Registry publication
-uses short-lived OIDC credentials; no PyPI or npm write token is stored in the
-repository.
+and retain both SDK packages without publishing them. A matching release tag publishes the GitHub Release after both build jobs
+succeed. The PyPI and npm jobs also require the repository variable
+`PUBLISH_SDKS=true` and use their trusted OIDC publishers. [Release workflow](../.github/workflows/release.yml)
 
 Before the first package release, configure these trusted publishers and protect
 both environments with required reviewers:

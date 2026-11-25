@@ -1,255 +1,41 @@
 # Production readiness
 
-Tarit is not yet approved for hostile multi-tenant production use.
-`TARIT_PRODUCTION=1` enforces the implemented isolation and durability
-configuration gates. This document records what the hardening work proves and
-what remains a release blocker; billing and product-layer concerns are outside
-its scope.
+**Hold v0.2.0.** The release candidate is under qualification. Hostile multi-tenant
+production use still has open security and durability gates. Setting
+`TARIT_PRODUCTION=1` enforces startup and admission checks. [Configuration](orch/docs/CONFIGURATION.md#cluster-and-durability)
 
-## Implemented and testable
+## Release evidence
 
-- VM records carry monotonic revisions and an actual startup path
-  (`cold`, `warm`, or `snapshot_restore`). SQLite and PostgreSQL reject
-  same-revision records with different persisted content, reject stale resource
-  incarnations, and fence ownership deletion.
-- Every guest receives a private CoW rootfs overlay. Guest read-only mount
-  semantics are independent from host-side base-image immutability.
-- Every orchestrated jailed VMM can run as PID 1 in a dedicated PID namespace
-  and in an empty process network namespace. taritd retains the host TAP
-  topology and passes a validated TAP queue descriptor into the isolated VMM.
-- Restored guests receive typed, validated address, route, gateway, and DNS
-  repair instead of interpolated shell input. The guest agent applies and
-  verifies IPv4 state through the kernel without depending on image-provided
-  network tools, and restore readiness verifies host-to-guest reachability.
-- Per-VM cgroup I/O limits and TAP ingress/egress limits are applied on boot,
-  restore, and recovery. Reconciliation removes obsolete limits instead of
-  leaving stale throttles in place.
-- Peer RPC uses short-lived HMACs bound to method, canonical path, payload hash,
-  nonce, source host, and target host. The shared key is never sent. Replay
-  caches are bounded per source and globally, and legacy bearer-secret headers
-  are rejected.
-- Public VM and live-status responses omit host identity, ownership metadata,
-  host paths, boot arguments, VMM sockets, process ids, and device
-  configuration. Internal and VMM errors are not reflected to tenants.
-- Fleet routing rejects unhealthy or stale owners instead of forwarding to
-  their last advertised address. Deleted VMs have consistent not-found/list
-  semantics.
-- API bodies, request rate, concurrency, deadlines, pending PTY sessions, active
-  PTY connections globally and per tenant/VM, WebSocket messages, VMM frames,
-  and PTY idle time are bounded. Invalid credentials pass through the outer
-  admission limit.
-- Suspend is distinct from pause: it retains ownership and scheduler quota,
-  parks vCPUs plus block, network, and vsock workers at one boundary, releases
-  resident guest memory, and requires every worker to leave its parked state
-  before vCPUs restart and resume returns.
-- Hibernation releases the VMM and scheduler allocation. HTTP, PTY, SSH, and
-  share ingress activate a hibernated VM through a single-flight restore gate;
-  failed activation leaves a retryable hibernated record instead of a second
-  VMM or leaked capacity. Private wake snapshots are VM-leased and are removed
-  after successful activation or terminal deletion.
-- Restore keeps KVM realtime advancement disabled so guest monotonic timers do
-  not jump by the host hibernation interval. The mandatory repair barrier sets
-  guest realtime from a host timestamp before admitting workload traffic.
-- Live fork takes one memory, device, and disk boundary, publishes authenticated
-  artifacts, and restores each child with independent lazy RAM and a private
-  disk overlay. Every configured vCPU is armed before any pause acknowledgement
-  is awaited, and publication requires fresh state from each vCPU. VMGenID
-  notification on supported kernels is paired with a mandatory userspace repair
-  barrier; older kernels use the barrier-only path. Private fork snapshots are
-  child-leased and are removed with the child rather than accumulating as
-  user-visible durable snapshots. Cross-node localization preserves the lease;
-  child deletion withdraws global metadata before source and target replicas
-  converge through zero-reference GC. A direct c8i gate stages the exact
-  candidate agent in a private Ubuntu OCI rootfs copy: Linux 6.6.155 observes
-  VMGenID delivery and one kernel fork reseed per sibling, while Linux 5.10.230
-  intentionally has no VMGenID driver and relies on the mandatory userspace
-  barrier. Both paths produce distinct generation, boot, clone, and kernel RNG
-  state without modifying the base image.
-- Provider-neutral local and NFS-backed raw block volumes are generation-fenced,
-  tenant-scoped, and ordered with hibernate, resume, recovery, and deletion.
-  Production generic NFS requires Kerberos privacy (`krb5p`), and mount
-  admission checks the kernel-reported security and transport parameters.
-  On a disposable Ubuntu 24.04.5 arm64 VM (Linux 6.8.0-147), the generic
-  provider passed three loopback nfsd restarts with Kerberos privacy and
-  three with AUTH_SYS. In each run a synchronous write was in the kernel
-  with zero nfsd threads, completed after restart, and appeared exactly once
-  in the server's file. Busy detach, block reopen, and cleanup also passed.
-  The [Kerberos fixture](orch/tests/e2e_nfs_kerberos.sh) includes the command
-  to reproduce this on a fresh Ubuntu 24.04 VM.
-- Snapshot files are opened without following symlinks and validated before
-  restore. A first incremental request without a parent is emitted as a complete
-  full snapshot, and subsequent diff-chain restore plus hardlink-spelled input
-  isolation pass across Ubuntu/Alpine and Linux 6.6/5.10. VMM control frames
-  have absolute deadlines, pathname vsock listeners are identity-owned and
-  removed on teardown, and OCI extraction uses private workspaces and no-follow
-  file access.
-- OCI conversion verifies manifest, config, and layer descriptor size and
-  SHA-256 before extraction, then enforces disk-size-derived limits for layers,
-  compressed and expanded bytes, entries, individual files, and paths. Limit
-  failures publish no rootfs and remove the private build workspace.
-- Every orchestrated snapshot is standalone: it never depends on a parent at
-  restore. An incremental request (`diff=true`) pauses the guest only for pages
-  changed since the VM's previous checkpoint and copies the rest from that
-  checkpoint after resume; direct VMM parent/diff chains remain available for
-  local testing.
-- Python and TypeScript SDKs are generated from the checked-in OpenAPI contract.
-  CI rejects generation drift, type-checks and packages both clients, and tests
-  typed tenant denials, bounded execution polling, stable-ID fork retry, and
-  bounded PTY/WebSocket sessions with server-lease cleanup. Public SDK E2E
-  tests pass against Ubuntu and Alpine OCI guests on Linux 6.6 and 5.10,
-  including hibernate followed by PTY-triggered wake.
-- Release workflows pin third-party actions, publish checksums and an SPDX
-  SBOM, and attest released artifacts. Python and TypeScript SDK publication
-  uses the same release version, validates and installs the exact packages, and
-  uses registry-trusted OIDC identities without stored write tokens.
-- The production guest kernel is built reproducibly from checksum-pinned Linux
-  source. Its config verifier requires the virtio devices used by the VMM and
-  rejects unused legacy hardware entropy drivers.
-
-## Required gates
-
-Normal CI runs formatting, unit/integration tests, linting, dependency policy,
-and security analysis. The protected-main KVM workflow additionally:
-
-- builds release VMM and orchestrator binaries on a dedicated KVM runner;
-- verifies real suspend memory release, state preservation, and bounded
-  resume-to-exec latency;
-- runs the VMM workspace KVM integration suite;
-- takes 100 end-to-end cold and warm create-to-exec samples, requires 100%
-  success, and enforces p99 ceilings of 5,000 ms cold and 1,000 ms warm; and
-- runs strict VMM cold, snapshot-restore, and suspend/resume performance gates
-  and uploads the measurements.
-
-This workflow requires a registered runner labeled `self-hosted`, `linux`, `x64`, and `kvm`; until one is provisioned, the hardware gates remain pending. `scripts/setup-kvm-runner.sh` provisions one: it creates a dedicated `tarit-ci` user with passwordless sudo (the KVM steps need root), installs a pinned, checksum-verified Actions runner as a service, and stages the guest kernel and rootfs where the workflow reads them.
-
-Privileged KVM jobs run only from the protected `main` ref; pull-request code is
-not executed on the persistent privileged runner.
-
-## Evidence from a single development host (2026-11-07)
-
-These results come from one AMD Ryzen 5 5600G host (6 cores, 15 GiB, XFS
-with reflink for VM files), without root, while unrelated CPU-heavy jobs
-kept the load between 5 and 20. They show the code works under load. They
-are not the dedicated-runner gates above, and their timings are not
-benchmarks.
-
-- KVM integration suite, release build, every test that does not need root:
-  612 passed. Not run: the four tests that create TAP devices or network
-  namespaces (they need root; `scripts/run-readiness-gates.sh` runs them).
-  `live_snapshot_captures_device_dma` failed once when run in parallel with
-  the rest, because its pre-copy converged in two rounds instead of three.
-  It passed 4 of 4 alone. The two timing gates
-  (`cold_boot_benchmark_100`, `perf_gates_comprehensive`) fail at this load.
-- taritd unit and integration tests: 452 passed. Store tests: 26 passed.
-- `test/soak/api_soak.py` (6 sandboxes, 2 minutes, `node:22`): 1,709
-  operations, none failed, no data-check failures. 576 VMs were created
-  and none were left behind. No warnings in taritd's log.
-- ComputeSDK burst benchmark (100 `node:22` sandboxes at once) against a
-  taritd with no pool or capacity settings: 100/100 succeeded on each of
-  two runs, all from the warm pool. On this host only 48 VMs fit at once,
-  so most of the remaining latency is creates waiting for capacity.
-- Warm-pool creates: 1.2 ms each, one at a time, and about 1,300 a second
-  eight at a time, with 3,000 past VMs in the store.
-- Full sandbox lifecycle with `tarit-bench sustained` (create, run `true`,
-  live 0.5 s, delete): 100 a second for 20 s with 2,001/2,001 succeeding
-  (8 ms median, 70 ms p99). At a 200-a-second target it held 166 a second
-  under a cap of 120 live sandboxes. All 6,312 creates came from the warm
-  pool.
-- 40 concurrent deletes: about 270 a second.
-- An 8-worker snapshot, restore, fork and delete stress: 200/200 with no
-  warnings in taritd's log.
-
-Still to run on this host: a 100-sandbox, 30-minute soak and the root-only
-gates (`sudo scripts/run-readiness-gates.sh`). Still to run anywhere: soaks
-at thousands of VMs on a large host.
-
-Known scaling gap: deleted VMs stay in the `vms` table, and in taritd's
-in-memory record cache, as `stopped` rows forever. Their ids also keep a client from re-creating a deleted VM under
-the same id. Pruning them needs a tombstone design that keeps that
-guarantee, so it is not done yet. At thousands of creates a second the
-table grows by millions of rows a day.
+The candidate build and SDK package checks passed. The latest lifecycle soak
+failed during its first case. [Failure audit](docs/LIVE_FORK_KNOWN_FAILURE_AUDIT.md) · [Soak procedure](orch/docs/OPERATIONS.md#continuous-lifecycle-qualification)
 
 ## Stop-ship items
 
-The earlier peer-mTLS/session-fencing, opaque authenticated artifact,
-cross-node replication, and immutable signed-image stop-ships now have focused
-implementation and c8i qualification evidence. They remain regression gates,
-but the following unresolved items now block release:
+| Gate | Evidence still required |
+| --- | --- |
+| Lifecycle and ownership | Complete the guest/kernel rotation and verify multi-hour hibernation and ownership handoff between independent hosts. |
+| Fork and snapshot rollback | Verify source recovery and cleanup after cancellation, corruption and storage exhaustion. |
+| CPU compatibility and latency | Check cross-build restore and measure fork, snapshot and restore latency on representative hosts. |
+| Durable storage | Verify independent NFS server loss, stale handles, host-crash durability and remote object recovery. [Storage coverage](orch/docs/SANDBOX-MIGRATION-AND-VOLUMES.md#acceptance-gates) |
+| Release from main | Include the NFS volume SDK fix, run the protected checks and verify the final artifacts. [Release workflow](.github/workflows/release.yml) |
 
-1. Complete the four-case continuous c8i rotation. The gate carries a long-lived
-   process with cached PRNG state,
-   session-ticket key material, nonce allocation state, and a framework-style
-   session cache; every successful fork and resume must rotate the first three,
-   clear the cache, reject the inherited ticket, and leave the source unchanged.
-   Alpine/Linux 5.10 runs passed 225 and 278 API operations, and Ubuntu/Linux
-   6.6 runs passed 261 and 217. Earlier sequences produced a repair command that
-   started and did not complete before the 30-second admission deadline.
-   Restore control requests now use the lifecycle timeout, the repair exchange
-   remains bounded by a host-monotonic deadline, and failures report the last
-   repair stage. Retained state proved the application marker was complete while
-   the agent slept on restored guest time; repair now uses a timer-independent
-   signal/marker handoff with no guest-clock sleep before admission. The
-   repaired Ubuntu/Linux 6.6 lane subsequently passed 803 operations with
-   18 live forks and bounded storage; Ubuntu/Linux 5.10 passed a separate
-   348-operation lane. The installed service also schedules an isolated
-   taritd/VMM crash-recovery, multi-ingress wake, and persistent-volume gates
-   after each configured number of six-hour epochs and publishes a root-only
-   atomic status record. A bounded Ubuntu/Linux 6.6 supervisor acceptance
-   passed 300 API operations, then exact VMM re-adoption, HTTP-triggered wake
-   from zero VMMs, killed-VMM reconciliation, and capacity reuse. A subsequent
-   two-case rehearsal passed Ubuntu/Linux 6.6 and Alpine/Linux 5.10 workload
-   epochs, runtime crash recovery, execute/PTY/SSH/share activation, and local-
-   plus NFS-backed volume hibernation. The workload now also holds a separate
-   logical VM at zero VMMs for the full epoch while the resident anchors keep
-   working; bounded Ubuntu/6.6 and Alpine/5.10 rehearsals passed clock, timer,
-   identity, single-flight wake, and artifact cleanup. The installed six-hour
-   service requires a hold of at least one hour. The full Ubuntu/Alpine and Linux
-   6.6/5.10 service must
-   complete sustained rotation
-   without this stall before ingress admission is considered qualified.
-2. Pass the remaining cancellation, dirty-rate non-convergence, corruption,
-   and near-ENOSPC rollback tests without source pause leaks, duplicate writers,
-   terminal-ID resurrection, or staged files. Cross-node fork interruption now
-   passes after claim, source snapshot, target localization, ownership bind,
-   child publication, and operation commit on both Linux 6.6.155 and 5.10.230.
-   Retry reuses the exact child-bound artifact, target restart reclaims its
-   durable reservation, same-session duplicates and wrong-target takeovers stay
-   fenced, and child deletion converges both replicas and global metadata to
-   zero.
-   Unexpected UFFD handler exit, descriptor loss, UNMAP, and REMAP now fail the
-   VMM closed and preserve retryable hibernated state. The fixed vCPU MSR
-   omission is repaired, but the dynamic KVM custom-MSR set still needs the
-   cross-kernel/build pvclock, PV-EOI, steal-time, and async-PF enabled/disabled
-   compatibility matrix.
-3. Qualify shared/cloud volume recovery from physical NFS server loss,
-   stale handles, and remote object-store interruption. Protected NFS
-   service restart on loopback is covered above. The immutable object
-   provider currently has a local-file implementation. Cloud transports
-   still need a conditional-write/checksum adapter and a real outage test.
-4. Complete multi-hour hibernation and ownership-lease qualification and record 100-sample
-   fork/snapshot/restore latency distributions on a larger reflink-capable
-   fixture. A version-1 binary to version-2 candidate restore passes on Ubuntu
-   and Alpine with Linux 6.6 and 5.10. A separately compiled state-ABI-2 VMM
-   also rejects state-ABI-1 live snapshots before VM publication on
-   Ubuntu/Linux 6.6 and Alpine/Linux 5.10, as does the checksum-valid
-   CPU-template rejection matrix.
-5. Run the full protected release workflow from an immutable source revision
-   and retain its binaries, hashes, configuration, logs, and cleanup audit.
+## Implemented and testable
 
-These are security or correctness boundaries, not optional roadmap features.
-The source-derived threat and regression map is
-[`docs/LIVE_FORK_KNOWN_FAILURE_AUDIT.md`](docs/LIVE_FORK_KNOWN_FAILURE_AUDIT.md).
+- **Isolation and admission.** Production startup requires per-VM UID/GID jails, PID and network namespaces, cgroups and a signed-image policy. taritd owns host TAPs and passes validated descriptors to jailed VMMs. API admission bounds request bodies, concurrency, deadlines and PTY usage. [Isolation](orch/docs/ISOLATION.md)
+- **Ownership and recovery.** Revision and incarnation checks fence writes and deletion. Suspend parks the vCPUs and device workers and releases resident RAM. Hibernation also releases the VMM and its capacity. Concurrent ingress joins one wake operation. [Lifecycle and recovery](orch/docs/RESILIENCE.md)
+- **Fork and restore.** The running source and child share a checkpoint of RAM, devices and writable root disk. Each child has independent lazy memory and a private disk overlay. Before admitting traffic, Tarit repairs clocks, entropy, clone identity and network configuration. Applications with cached keys or PRNG state need a guest hook. [Failure audit](docs/LIVE_FORK_KNOWN_FAILURE_AUDIT.md)
+- **Artifacts and storage.** Orchestrated snapshots are standalone and authenticated. Fleet fork verifies transferred artifacts and enforces replica policy. OCI conversion verifies descriptors and bounds extraction. Production generic NFS requires Kerberos privacy. [Snapshot API](orch/docs/API.md) · [Volume providers](orch/docs/SANDBOX-MIGRATION-AND-VOLUMES.md)
+- **Release artifacts.** The guest kernel uses checksum-pinned source. Release builds checksum and attest binaries and SDK packages. Registry publishing has a separate opt-in. [Guest kernel](vmm/guest/README.md) · [SDK release](sdk/README.md#versioning-and-publication)
+
+## Required gates
+
+CI checks formatting, tests, lint and dependency policy. The protected-main KVM job
+checks lifecycle, disk isolation and cold and warm create-to-exec latency.
+[KVM workflow and thresholds](.github/workflows/kvm.yml)
 
 ## PaaS capability gaps (non-billing)
 
-After the security stop-ship items are closed, a production PaaS control plane
-still needs the following product milestones; they are not implemented claims:
-
-- a declarative app, service, and deployment model;
-- immutable revisions with rolling and blue-green rollout and rollback;
-- durable volumes with backup and tested restore workflows;
-- managed secrets and configuration with rotation;
-- service discovery, ingress, custom domains, and TLS lifecycle management;
-- centralized logs, metrics, traces, and deployment/runtime events;
-- autoscaling plus disruption, affinity, and placement policies; and
-- controlled artifact and image promotion between environments.
+Product work beyond these release gates includes declarative deployments and
+rollback, volume backup and restore, managed secrets, service discovery and
+TLS lifecycle, centralized observability, placement and disruption policies,
+and promotion of images between environments.

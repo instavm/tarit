@@ -99,8 +99,8 @@ and converted with tarit's converter:
 
 ```sh
 docker build -t tarit-agentbench:1 test/compare/agent-image
-target/release/vmm pull docker-daemon:tarit-agentbench:1 --output /var/tmp/agentbench/agent.ext4 \
-  --size 3072 --agent guest/agent/vmm-agent
+vmm/target/release/vmm pull docker-daemon:tarit-agentbench:1 --output /var/tmp/agentbench/agent.ext4 \
+  --size 3072 --agent vmm/guest/agent/vmm-agent
 python3 test/compare/agentbench.py \
   --tarit vmm/target/release/vmm \
   --firecracker /path/to/firecracker-v1.17.0-x86_64 \

@@ -160,33 +160,18 @@ advice off entirely.
 
 ## Snapshot Format
 
-### Choice: Custom format (magic + state + raw memory)
-
-**Alternatives:**
-1. **Custom format**: `[8B magic][8B state_len][8B mem_len][1B diff][state][mem]`
-2. **bincode serialization**: serialize the full VM state with bincode.
-3. **Split format**: separate state file + memory file.
-
-**Why custom:** bincode was too slow for 256MB memory dumps (15s for
-serialization). The custom format writes raw memory directly to the
-file with a small JSON state header. This gives 15ms snapshot times.
-The format is shared between full snapshot and live snapshot so either
-output can be restored interchangeably.
+A full VMM snapshot uses a versioned `VMSN` container with a binary state blob,
+a RAM region, lengths and CRCs. Restore checks CPU, device and state-ABI
+compatibility before publishing a VM. Orchestrated snapshots add an
+authenticated manifest for chunk verification. [Snapshot implementation](../crates/vmm-core/src/controller.rs)
 
 ## Restore Strategy
 
-### Choice: UFFD lazy restore with eager fallback
-
-**Alternatives:**
-1. **Eager copy**: read entire memory from file into mmap (85ms).
-2. **UFFD lazy restore**: mmap the file, fault pages in on demand.
-3. **Hybrid**: try UFFD, fall back to eager if unavailable.
-
-**Why hybrid:** UFFD gives O(1) restore (the VM is "runnable" in <10ms),
-but it may not be available on all hosts (e.g., nested virt may restrict
-userfaultfd). The hybrid approach tries UFFD first and falls back to
-eager copy. Lazy restore with an eager fallback is the standard
-microVM restore pattern.
+With the default memory policy, a standalone restore without an integrity
+manifest first tries a private file mapping. It can fall back to userfaultfd
+(UFFD) or eager loading. Authenticated restores require chunk-verified lazy
+paging and fail if the host cannot provide it. A lazy child faults pages from
+the captured backing and writes its own private memory. [Standalone restore](STANDALONE.md#snapshots-disks-and-forks)
 
 ## vCPU Thread Model
 

@@ -23,16 +23,21 @@ microVMs boot under KVM, so **`e2e.sh` and `bench.sh` need a Linux host with
 
 - bare-metal Linux (best; gives the headline benchmark numbers), or
 - a VM with nested virtualization enabled: AWS `*.metal` or c8i with nested virt,
-  GCP `--enable-nested-virtualization`, or QEMU/KVM with host CPU passthrough.
+  an Azure VM size exposing KVM, GCP with nested virtualization enabled, or
+  QEMU/KVM with host CPU passthrough.
 
 They will **not** run on macOS/Windows, most containers, or cloud VMs without
 nested virtualization. The runners detect this and tell you exactly what is
-missing rather than failing deep in a boot. Nested virt works but pays a ~10x
-KVM-exit tax, so the runner prints a warning and the numbers are directional.
+missing. The runner flags nested virtualization in benchmark output. Compare
+latency figures on hosts with the same virtualization setup.
 
 Also required: a Rust toolchain (`cargo`), `curl`, `python3`, and root (microVM
 networking, the jailer, and the OCI unpack need it). `cluster.sh` instead runs on
 a workstation and needs the AWS CLI with credentials plus the cluster SSH key.
+
+The API soak measures workload and cleanup against a running daemon. The
+release rotation also checks fork repair, long hibernation, crash recovery,
+ingress and persistent volumes on each guest/kernel pair. [Release rotation](../orch/docs/OPERATIONS.md#continuous-lifecycle-qualification)
 
 ## Guest assets (kernel + rootfs)
 
