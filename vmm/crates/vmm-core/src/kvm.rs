@@ -15,6 +15,7 @@ use kvm_ioctls::{IoEventAddress, VcpuFd, VmFd};
 use std::os::fd::FromRawFd;
 use std::sync::Arc;
 use vmm_devices::bus::{MmioBus, MmioRange};
+use vmm_devices::serial::Serial;
 use vmm_loader::LoadedKernel;
 use vmm_memory_backend::GuestMemory;
 use vmm_sys_util::eventfd::EventFd;
@@ -639,6 +640,18 @@ impl KvmVm {
         vcpu_fd: &mut VcpuFd,
         i8042_irq: Option<&EventFd>,
     ) -> Result<()> {
+        let evt = EventFd::new(libc::EFD_NONBLOCK)
+            .map_err(|e| VmmError::Kvm(format!("serial eventfd: {e}")))?;
+        self.run_vcpu_with_serial(vcpu_fd, i8042_irq, &Serial::new(evt))
+    }
+
+    /// Run with the caller's COM1 device, whose IRQ can be routed before boot.
+    pub fn run_vcpu_with_serial(
+        &self,
+        vcpu_fd: &mut VcpuFd,
+        i8042_irq: Option<&EventFd>,
+        serial: &Serial,
+    ) -> Result<()> {
         use kvm_ioctls::VcpuExit;
         use std::time::{Duration, Instant};
         let start = Instant::now();
@@ -804,10 +817,10 @@ impl KvmVm {
                         }
                         VcpuExit::IoOut(port, data) => {
                             io_out_count += 1;
-                            if port == 0x3f8 {
-                                use std::io::Write;
-                                let _ = std::io::stdout().write_all(data);
-                                let _ = std::io::stdout().flush();
+                            if (0x3f8..=0x3ff).contains(&port) {
+                                for &byte in data {
+                                    serial.write((port - 0x3f8) as u8, byte);
+                                }
                             }
                             // i8042: after writing to port 0x60, inject IRQ 1
                             if port == 0x60 {
@@ -831,13 +844,10 @@ impl KvmVm {
                             }
                         }
                         VcpuExit::IoIn(port, data) => {
-                            // Serial port 0x3f8: TX data (we already write it out).
-                            // Serial port 0x3fd: line status register (TX ready)
-                            if port == 0x3fd {
-                                data[0] = 0x60; // LSR: THR empty + data ready
-                            }
-                            if port == 0x3fa {
-                                data[0] = 0; // FCR: no FIFO
+                            if (0x3f8..=0x3ff).contains(&port) {
+                                for byte in data.iter_mut() {
+                                    *byte = serial.read((port - 0x3f8) as u8);
+                                }
                             }
                             // VGA ports: return 0xff
                             if port == 0x3d4 || port == 0x3d5 || port == 0x3da {

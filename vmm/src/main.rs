@@ -1209,6 +1209,13 @@ fn boot_on_kvm(
         None
     };
 
+    let serial_evt = vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK)?;
+    if full_boot {
+        vm.register_irqfd(&serial_evt, 4)
+            .map_err(|e| anyhow::anyhow!("COM1 irqfd: {e}"))?;
+    }
+    let serial = vmm_devices::serial::Serial::new(serial_evt);
+
     let mut vcpu = vm
         .create_vcpu(0)
         .map_err(|e| anyhow::anyhow!("create_vcpu: {e}"))?;
@@ -1217,16 +1224,8 @@ fn boot_on_kvm(
         "vcpu 0 configured: entry=0x{:x} — entering run loop",
         loaded.entry
     );
-    if full_boot {
-        // Full boot: synchronous run loop. The VM runs until the kernel
-        // reboots, panics, or the watchdog timeout fires.
-        vm.run_vcpu_with_i8042(&mut vcpu, i8042_irq_evt.as_ref())
-            .map_err(|e| anyhow::anyhow!("run_vcpu: {e}"))?;
-    } else {
-        // Fast boot: synchronous run (exits on HLT loop).
-        vm.run_vcpu_with_i8042(&mut vcpu, i8042_irq_evt.as_ref())
-            .map_err(|e| anyhow::anyhow!("run_vcpu: {e}"))?;
-    }
+    vm.run_vcpu_with_serial(&mut vcpu, i8042_irq_evt.as_ref(), &serial)
+        .map_err(|e| anyhow::anyhow!("run_vcpu: {e}"))?;
 
     let _ = vcpus;
     Ok(())
