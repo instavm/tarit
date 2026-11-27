@@ -10,6 +10,19 @@ versions may contain breaking changes.
 
 ## [Unreleased]
 
+### Changed
+
+- Live VM controls allow brief lock contention. The VM record remains readable
+  during an exec. DELETE can cancel an active local exec before teardown.
+- A single tenant can use the full authenticated HTTP concurrency budget.
+  Operators can configure the node, tenant and VM limits for background commands.
+- Rebuilt guest kernels with the same Linux version can coexist in the default
+  VMM cache. Python fork callers receive a definitive late response by default.
+- Upgrade the VMM and guest agent together. Older in-memory snapshots need
+  their original host/agent pair for recovery. See the [migration steps](vmm/guest/agent/README.md).
+- Network recovery writes version 3 state. Hosts with existing Tarit TAPs need
+  `conntrack` even with networking disabled. See [host requirements](orch/docs/OPERATIONS.md).
+
 ### Fixed
 
 - A guest FLUSH no longer blocks a pause or snapshot. On a disk backed by

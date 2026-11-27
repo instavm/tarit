@@ -3786,6 +3786,7 @@ mod tests {
             rootfs_read_only: false,
             metrics_expose_tenant_labels: false,
             api_max_in_flight: 128,
+            async_execution_limits: Default::default(),
             execution_retention_hours: 24,
             max_concurrent_snapshots: 2,
             api_requests_per_second: 10_000,

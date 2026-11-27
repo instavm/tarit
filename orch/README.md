@@ -165,25 +165,31 @@ API request admission is per API node. `TARIT_API_REQUESTS_PER_SECOND` (default
 the bucket. Invalid credentials and PTY WebSocket connects without an API key
 share a separate fixed bucket and cannot spend authenticated tenants' capacity.
 `TARIT_API_MAX_IN_FLIGHT` (default 1,024) caps authenticated handlers globally;
-each tenant may hold at most half that budget (minimum one). The unauthenticated
+a sole configured tenant can use the full budget, even with multiple keys.
+With multiple tenants each may hold at most half (minimum one). The unauthenticated
 budget has its own half-sized concurrency cap. Total admitted handlers are thus
 bounded by the global authenticated cap plus the unauthenticated cap. A global
 cap of one cannot reserve simultaneous capacity for another tenant.
 
-Live controls (status, balloon, snapshot/fork, pause/suspend/resume, hibernate,
-egress-policy update and DELETE) return 409 when another operation holds the
-local VM's operation gate, including a long-running asynchronous exec. Retry
-once the current operation finishes. Operations already performing lifecycle
+Use `GET /v1/vms/{id}` for the recorded lifecycle state during an exec.
+Live status, balloon, snapshot/fork, pause/suspend/resume, hibernate and
+egress-policy updates wait briefly for the local VM's operation gate (up to
+100 ms or a quarter of the API request timeout, whichever is shorter). If
+the gate stays busy they return 409. Retry after the current operation
+finishes. DELETE requests cancellation of an active local exec and waits
+for its worker before teardown. Other operations holding the gate can cause
+DELETE to return 409. Operations already performing lifecycle
 publication or rollback continue after an HTTP timeout; only admission to a
 busy VM is rejected. Lifecycle recovery and shutdown keep waiting for their
 existing work to finish safely.
 
 Asynchronous execution admission lasts until the command reaches a terminal state.
-Each API node accepts at most `min(TARIT_API_MAX_IN_FLIGHT, 128)` unfinished
-asynchronous commands. Admission checks the tenant first (all its API keys share
-at most 32 slots, or half a smaller global budget, with a minimum of one), then
-the VM (at most four unfinished commands), then the global budget. Excess
-submissions return 429 without reserving global capacity. These limits apply to
+Set `TARIT_MAX_ASYNC_EXECUTIONS` (default 128) to cap unfinished commands per
+API node. The global cap is also bounded by `TARIT_API_MAX_IN_FLIGHT`.
+Admission checks the tenant first (`TARIT_MAX_ASYNC_EXECUTIONS_PER_TENANT`,
+default 32, capped at half the effective global budget with a minimum of one),
+then the VM (`TARIT_MAX_ASYNC_EXECUTIONS_PER_VM`, default 4), then the node.
+Excess submissions return 429 with `Retry-After: 1`. These limits apply to
 administrators too and are per API node; a global budget of one cannot reserve
 concurrent capacity for a second tenant. Waiting behind another operation on a
 local VM is bounded by `TARIT_API_REQUEST_TIMEOUT_MS`, separately from the

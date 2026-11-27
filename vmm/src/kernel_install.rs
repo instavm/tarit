@@ -104,7 +104,27 @@ fn default_path(release: &KernelRelease) -> Result<PathBuf> {
             .context("HOME or XDG_DATA_HOME is required to choose a kernel install path")?;
         PathBuf::from(home).join(".local/share/tarit")
     };
-    Ok(base.join("kernels").join(&release.version).join("vmlinux"))
+    cached_path(&base, release)
+}
+
+fn cached_path(base: &Path, release: &KernelRelease) -> Result<PathBuf> {
+    let version = base.join("kernels").join(&release.version);
+    let pinned = version.join(&release.sha256).join("vmlinux");
+    // Prefer the new slot, including reporting corruption there. An existing
+    // installation of this exact build can still boot without a download.
+    match fs::symlink_metadata(&pinned) {
+        Ok(_) => return Ok(pinned),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("inspect pinned kernel path"),
+    }
+    let legacy = version.join("vmlinux");
+    if matches!(
+        inspect_installed(&legacy, release),
+        Ok(InstalledKernel::Valid)
+    ) {
+        return Ok(legacy);
+    }
+    Ok(pinned)
 }
 
 fn sha256_file(path: &Path) -> Result<String> {
@@ -329,6 +349,37 @@ mod tests {
         let release = KernelRelease::load().unwrap();
         assert!(release.artifact().starts_with("vmlinux-"));
         assert!(release.url().starts_with("https://github.com/"));
+    }
+
+    #[test]
+    fn rebuilt_kernels_have_distinct_slots_and_keep_a_matching_legacy_install() {
+        let root = tempfile::tempdir().unwrap();
+        let legacy = root.path().join("kernels/1.2.3/vmlinux");
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, b"original").unwrap();
+        let original = release_with_sha256(&sha256_file(&legacy).unwrap());
+        let rebuilt = release_with_sha256(&"2".repeat(64));
+        let original_slot = legacy
+            .parent()
+            .unwrap()
+            .join(&original.sha256)
+            .join("vmlinux");
+        let rebuilt_slot = legacy
+            .parent()
+            .unwrap()
+            .join(&rebuilt.sha256)
+            .join("vmlinux");
+
+        assert_eq!(cached_path(root.path(), &original).unwrap(), legacy);
+        assert_eq!(cached_path(root.path(), &rebuilt).unwrap(), rebuilt_slot);
+        fs::create_dir_all(original_slot.parent().unwrap()).unwrap();
+        fs::write(&original_slot, b"damaged").unwrap();
+        assert_eq!(cached_path(root.path(), &original).unwrap(), original_slot);
+        assert!(matches!(
+            inspect_installed(&original_slot, &original).unwrap(),
+            InstalledKernel::ChecksumMismatch(_)
+        ));
+        assert_eq!(fs::read(&legacy).unwrap(), b"original");
     }
 
     #[test]

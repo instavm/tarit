@@ -758,6 +758,7 @@ pub struct Config {
     pub metrics_expose_tenant_labels: bool,
     /// Public API load-shedding and request envelope limits.
     pub api_max_in_flight: usize,
+    pub(crate) async_execution_limits: AsyncExecutionLimits,
     /// Per configured tenant, with a separate shared unauthenticated budget.
     pub api_requests_per_second: u64,
     pub api_request_timeout_ms: u64,
@@ -816,6 +817,37 @@ pub struct Config {
     pub share_token_ttl_secs: u64,
     pub share_connect_timeout_ms: u64,
     pub share_idle_timeout_secs: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AsyncExecutionLimits {
+    pub(crate) global: usize,
+    pub(crate) per_tenant: usize,
+    pub(crate) per_vm: usize,
+}
+
+impl Default for AsyncExecutionLimits {
+    fn default() -> Self {
+        Self {
+            global: 128,
+            per_tenant: 32,
+            per_vm: 4,
+        }
+    }
+}
+
+impl AsyncExecutionLimits {
+    fn from_env() -> Result<Self> {
+        let defaults = Self::default();
+        Ok(Self {
+            global: env_permit_limit("TARIT_MAX_ASYNC_EXECUTIONS", defaults.global)?,
+            per_tenant: env_permit_limit(
+                "TARIT_MAX_ASYNC_EXECUTIONS_PER_TENANT",
+                defaults.per_tenant,
+            )?,
+            per_vm: env_permit_limit("TARIT_MAX_ASYNC_EXECUTIONS_PER_VM", defaults.per_vm)?,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -958,7 +990,8 @@ impl Config {
 
         let metrics_expose_tenant_labels =
             env_bool_checked("TARIT_METRICS_EXPOSE_TENANT_LABELS", false)?;
-        let api_max_in_flight = env_positive_usize("TARIT_API_MAX_IN_FLIGHT", 1_024)?;
+        let api_max_in_flight = env_permit_limit("TARIT_API_MAX_IN_FLIGHT", 1_024)?;
+        let async_execution_limits = AsyncExecutionLimits::from_env()?;
         let api_requests_per_second = env_positive_u64("TARIT_API_REQUESTS_PER_SECOND", 5_000)?;
         let api_request_timeout_ms = env_positive_u64("TARIT_API_REQUEST_TIMEOUT_MS", 180_000)?;
         let execution_retention_hours = env::var("TARIT_EXECUTION_RETENTION_HOURS")
@@ -1116,6 +1149,7 @@ impl Config {
             rootfs_read_only,
             metrics_expose_tenant_labels,
             api_max_in_flight,
+            async_execution_limits,
             api_requests_per_second,
             api_request_timeout_ms,
             api_max_body_bytes,
@@ -1183,6 +1217,7 @@ impl fmt::Debug for Config {
                 &self.metrics_expose_tenant_labels,
             )
             .field("api_max_in_flight", &self.api_max_in_flight)
+            .field("async_execution_limits", &self.async_execution_limits)
             .field("max_concurrent_snapshots", &self.max_concurrent_snapshots)
             .field("api_requests_per_second", &self.api_requests_per_second)
             .field("api_request_timeout_ms", &self.api_request_timeout_ms)
@@ -2326,6 +2361,14 @@ fn validate_watermark_pair(prefix: &str, high: Option<u64>, low: Option<u64>) ->
 fn env_positive_usize(key: &str, default: usize) -> Result<usize> {
     let value = env_positive_u64(key, default as u64)?;
     usize::try_from(value).with_context(|| format!("{key} exceeds this platform's size limit"))
+}
+
+fn env_permit_limit(key: &str, default: usize) -> Result<usize> {
+    let limit = env_positive_usize(key, default)?;
+    if limit > tokio::sync::Semaphore::MAX_PERMITS {
+        bail!("{key} exceeds the runtime semaphore capacity");
+    }
+    Ok(limit)
 }
 
 fn env_optional_positive_usize(key: &str) -> Result<Option<usize>> {

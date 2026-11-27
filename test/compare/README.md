@@ -109,7 +109,13 @@ python3 test/compare/agentbench.py \
 ```
 
 Requirements: `slirp4netns`, `nft`, `nsenter`/`unshare`, and unprivileged
-user namespaces. Each VMM is driven the way its documentation describes:
+user namespaces. The networked harness launches Tarit inside that namespace.
+If `/` or another runtime-directory ancestor appears there with the unmapped
+overflow UID, Tarit rejects the path. Choosing a different `TMPDIR` cannot
+repair an unmapped `/`. The standalone `vmbench.py` cold and exec scenarios
+launch Tarit outside this namespace.
+
+Each VMM is driven the way its documentation describes:
 tarit restores clones with network overrides, `repair_guest_network`, and
 copy-on-write disk templates; Firecracker restores with `network_overrides`
 and `vsock_override`, gets a private copy of the disk (timed as disk prep),

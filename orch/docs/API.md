@@ -330,7 +330,11 @@ This differs from `GET /v1/vms/{id}`: `/status` reports sanitized live state,
 uptime, shape, and `vcpu_alive`; it does not expose the VMM's kernel path or
 device configuration.
 
-Status codes: `200`, `401`, `403`, `404`, `409` (VM is stopped), `500`, `503`.
+A live probe can record a guest shutdown. If another operation keeps the VM
+busy past the short control wait, the probe returns `409`. Use
+`GET /v1/vms/{id}` to read the recorded state while a command runs.
+
+Status codes: `200`, `401`, `403`, `404`, `409` (VM busy or outside a live state), `500`, `503`.
 
 ### SSH keys
 
@@ -406,9 +410,13 @@ Status codes: `200`, `201`, `204`, `400`, `401`, `404`, `409`, `429`, `500`. A b
 
 Resolve owner, stop the VM on its owner, mark the owner's local record as `stopped`, release the local scheduler slot, and remove the VM ownership row from `fleet_vms`.
 
+If an exec owns the local VM gate, DELETE requests cancellation and waits for
+the worker before teardown. DELETE returns `409` when another operation still
+holds the gate or the worker fails to release it in time.
+
 Response `204`: no body.
 
-Status codes: `204`, `401`, `403`, `404`, `500`.
+Status codes: `204`, `401`, `403`, `404`, `409`, `500`.
 
 Note: the local SQLite VM row is not deleted. On the owner, a later local `GET` can still find the stopped record. Other nodes generally cannot find it after `fleet_vms` is cleared.
 

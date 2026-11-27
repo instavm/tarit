@@ -24,7 +24,10 @@ together.
 
 ## Toolchain
 
-- Rust stable.
+- Rust stable and Python 3 for the Makefile build.
+- To install, run `make build` as your regular user, then `sudo make install`.
+  For the VMM alone, use `make vmm` and `sudo make install-vmm`. The Makefile
+  records the feature set and binary digest checked by the install target.
 - Host for running microVMs: x86_64 Linux with KVM. macOS can build and
   cross-check but cannot run guests.
 

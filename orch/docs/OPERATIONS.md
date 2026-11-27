@@ -275,7 +275,7 @@ When enabled, `taritd`:
 5. Creates one tap per VM named `insta<N>` where `N` is the slot.
 6. Gives each VM a deterministic private `/30`: host `.1`, guest `.2`.
 7. Persists the slot map and each allocation's egress allowlist/default-deny policy in
-   version-2 `TARIT_NET_STATE` (default `<TARIT_DB>.net.json`) and recovers both on
+   version-3 `TARIT_NET_STATE` (default `<TARIT_DB>.net.json`) and recovers both on
    restart. Version-1 state with any live allocation is rejected; only an empty or
    entirely stale version-1 file is safely migrated.
 8. Adds a per-slot nftables masquerade rule tagged with an `taritd` comment.
@@ -287,7 +287,11 @@ When enabled, `taritd`:
 
 Network slot reuse requires `conntrack` from conntrack-tools (1.4.6 or later), with kernel ctnetlink and conntrack-zone support and
 `CAP_NET_ADMIN` in taritd's network namespace. On Debian/Ubuntu install the
-`conntrack` package alongside `iproute2` and `nftables`. Tarit owns its
+`conntrack` package alongside `iproute2` and `nftables`. Hosts with leftover
+Tarit TAPs also need it at startup with `TARIT_ENABLE_NET=0` so taritd can
+recover their network state. For a downgrade, drain the node with the newer
+daemon and use a clean host or a consistent, compatible pre-upgrade backup.
+Tarit owns its
 172.16.0.0/16 pool in that namespace and uses conntrack zone zero; deployments
 must not assign Tarit guest traffic to a different conntrack zone.
 

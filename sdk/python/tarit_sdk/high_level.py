@@ -485,7 +485,7 @@ class TaritClient:
         *,
         child_id: UUID | None = None,
         deadline_seconds: float = 30.0,
-        accept_late_response: bool = False,
+        accept_late_response: bool = True,
     ) -> ForkVmResponse:
         """Fork with one retry id, also exposed on TaritDeadlineExceeded.child_id."""
         deadline = _deadline(deadline_seconds)
@@ -713,7 +713,7 @@ class AsyncTaritClient:
         *,
         child_id: UUID | None = None,
         deadline_seconds: float = 30.0,
-        accept_late_response: bool = False,
+        accept_late_response: bool = True,
     ) -> ForkVmResponse:
         deadline = _deadline(deadline_seconds)
         child_id = child_id or uuid4()

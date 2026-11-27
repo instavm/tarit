@@ -81,7 +81,7 @@ use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
 use crate::cluster::Owner;
-use crate::config::{ApiIdentity, ApiRole, Config};
+use crate::config::{ApiIdentity, ApiRole, AsyncExecutionLimits, Config};
 use crate::openapi;
 use crate::peer::PeerClient;
 use crate::scheduler::Scheduler;
@@ -326,12 +326,17 @@ impl ApiTrafficLimits {
     }
 
     pub(crate) fn new(config: &Config) -> Self {
-        let tenant_concurrency = (config.api_max_in_flight / 2).max(1);
+        let shared_cap = (config.api_max_in_flight / 2).max(1);
+        let names: std::collections::BTreeSet<_> = config.api_keys.tenants().collect();
+        let tenant_concurrency = if names.len() == 1 {
+            config.api_max_in_flight
+        } else {
+            shared_cap
+        };
         // Only configured tenants allocate state. Multiple keys for one tenant
         // share a budget; arbitrary invalid credentials share one fixed budget.
-        let tenants = config
-            .api_keys
-            .tenants()
+        let tenants = names
+            .into_iter()
             .map(|tenant| {
                 (
                     tenant.to_owned(),
@@ -341,7 +346,7 @@ impl ApiTrafficLimits {
             .collect();
         Self {
             concurrency: Arc::new(tokio::sync::Semaphore::new(config.api_max_in_flight)),
-            unauthenticated: TrafficBudget::new(config.api_requests_per_second, tenant_concurrency),
+            unauthenticated: TrafficBudget::new(config.api_requests_per_second, shared_cap),
             tenants: Arc::new(tenants),
             config: Arc::new(config.clone()),
             tenant_isolation: true,
@@ -568,17 +573,13 @@ impl IntoResponse for ShareApiError {
 }
 
 /// Detached work retains admission until terminal persistence, not just HTTP 202.
-const MAX_ASYNC_EXECUTIONS: usize = 128;
-const MAX_TENANT_ASYNC_EXECUTIONS: usize = 32;
-// Includes a running command, so at most three additional commands normally wait.
-const MAX_VM_ASYNC_EXECUTIONS: usize = 4;
-
 #[derive(Clone)]
 struct AsyncExecutionAdmission {
     global: Arc<tokio::sync::Semaphore>,
     tenants: Arc<Mutex<HashMap<String, std::sync::Weak<tokio::sync::Semaphore>>>>,
     vms: Arc<Mutex<HashMap<Uuid, std::sync::Weak<tokio::sync::Semaphore>>>>,
     tenant_limit: usize,
+    vm_limit: usize,
 }
 
 struct AsyncExecutionPermits {
@@ -594,13 +595,14 @@ struct AsyncExecutionPermits {
 struct TenantAsyncPermit(tokio::sync::OwnedSemaphorePermit);
 
 impl AsyncExecutionAdmission {
-    fn new(global_limit: usize) -> Self {
-        let global_limit = global_limit.clamp(1, MAX_ASYNC_EXECUTIONS);
+    fn new(api_max: usize, limits: AsyncExecutionLimits) -> Self {
+        let global_limit = api_max.min(limits.global);
         Self {
             global: Arc::new(tokio::sync::Semaphore::new(global_limit)),
             tenants: Default::default(),
             vms: Default::default(),
-            tenant_limit: MAX_TENANT_ASYNC_EXECUTIONS.min((global_limit / 2).max(1)),
+            tenant_limit: limits.per_tenant.min((global_limit / 2).max(1)),
+            vm_limit: limits.per_vm,
         }
     }
 
@@ -624,7 +626,7 @@ impl AsyncExecutionAdmission {
         vm_id: Uuid,
     ) -> Result<AsyncExecutionPermits, OrchError> {
         // RAII releases the tenant reservation on every later rejection/error path.
-        let vm = keyed(&self.vms, vm_id, MAX_VM_ASYNC_EXECUTIONS)?
+        let vm = keyed(&self.vms, vm_id, self.vm_limit)?
             .try_acquire_owned()
             .map_err(|_| overloaded())?;
         let global = self
@@ -668,7 +670,10 @@ fn overloaded() -> OrchError {
 
 pub fn router(state: AppState) -> Router {
     let traffic_limits = ApiTrafficLimits::new(&state.config);
-    let async_executions = AsyncExecutionAdmission::new(state.config.api_max_in_flight);
+    let async_executions = AsyncExecutionAdmission::new(
+        state.config.api_max_in_flight,
+        state.config.async_execution_limits,
+    );
     let max_body_bytes = state.config.api_max_body_bytes;
     let protected = Router::new()
         .route("/v1/vms", post(create_vm).get(list_vms))
@@ -5179,15 +5184,15 @@ pub(crate) mod tests {
         // Tenant reservations are taken before the VM is resolved; VM and global
         // capacity only after authorisation. Requests that will be refused for a
         // foreign VM therefore never occupy that VM's queue or global slots.
-        let admission = AsyncExecutionAdmission::new(128);
+        let admission = AsyncExecutionAdmission::new(128, AsyncExecutionLimits::default());
         let victim_vm = Uuid::new_v4();
-        let pending: Vec<_> = (0..MAX_VM_ASYNC_EXECUTIONS * 2)
+        let pending: Vec<_> = (0..admission.vm_limit * 2)
             .map(|_| admission.acquire_tenant("intruder").unwrap())
             .collect();
         assert_eq!(admission.global.available_permits(), 128);
         assert!(admission.vms.lock().unwrap().is_empty());
         let mut owner = Vec::new();
-        for _ in 0..MAX_VM_ASYNC_EXECUTIONS {
+        for _ in 0..admission.vm_limit {
             owner.push(admission.acquire("owner", victim_vm).unwrap());
         }
         drop(pending);
@@ -5204,17 +5209,17 @@ pub(crate) mod tests {
 
     #[test]
     fn asynchronous_admission_enforces_tenant_vm_and_global_limits_without_leaking_permits() {
-        let admission = AsyncExecutionAdmission::new(128);
+        let admission = AsyncExecutionAdmission::new(128, AsyncExecutionLimits::default());
         let mut held = Vec::new();
         let vm = Uuid::new_v4();
-        for _ in 0..MAX_VM_ASYNC_EXECUTIONS {
+        for _ in 0..admission.vm_limit {
             held.push(admission.acquire("tenant-a", vm).unwrap());
         }
         assert!(matches!(
             admission.acquire("tenant-a", vm),
             Err(OrchError::Overloaded { .. })
         ));
-        for _ in held.len()..MAX_TENANT_ASYNC_EXECUTIONS {
+        for _ in held.len()..admission.tenant_limit {
             held.push(admission.acquire("tenant-a", Uuid::new_v4()).unwrap());
         }
         for _ in 0..100 {
@@ -5230,7 +5235,7 @@ pub(crate) mod tests {
         drop(permit);
         assert_eq!(admission.global.available_permits(), 128);
 
-        let tiny = AsyncExecutionAdmission::new(2);
+        let tiny = AsyncExecutionAdmission::new(2, AsyncExecutionLimits::default());
         let one = tiny.acquire("one", vm).unwrap();
         let two = tiny.acquire("two", vm).unwrap();
         assert!(tiny.acquire("three", vm).is_err());
@@ -5239,6 +5244,28 @@ pub(crate) mod tests {
         assert!(tiny.acquire("three", vm).is_ok());
         drop(two);
         assert_eq!(tiny.global.available_permits(), 2);
+    }
+
+    #[test]
+    fn configured_async_limits_apply_at_every_scope() {
+        let admission = AsyncExecutionAdmission::new(
+            128,
+            AsyncExecutionLimits {
+                global: 4,
+                per_tenant: 2,
+                per_vm: 1,
+            },
+        );
+        let vm = Uuid::new_v4();
+        let first = admission.acquire("a", vm).unwrap();
+        assert!(admission.acquire("a", vm).is_err());
+        let second = admission.acquire("a", Uuid::new_v4()).unwrap();
+        assert!(admission.acquire("a", Uuid::new_v4()).is_err());
+        let other = admission.acquire("b", Uuid::new_v4()).unwrap();
+        let last = admission.acquire("c", Uuid::new_v4()).unwrap();
+        assert!(admission.acquire("d", Uuid::new_v4()).is_err());
+        drop((first, second, other, last));
+        assert_eq!(admission.global.available_permits(), 4);
     }
 
     #[test]
@@ -6529,6 +6556,15 @@ pub(crate) mod tests {
                 .unwrap()
                 .lock_owned()
                 .await;
+            let vm = request_json(
+                app.clone(),
+                "GET",
+                &format!("/v1/vms/{id}"),
+                "tenant-a-key",
+                serde_json::json!({}),
+            )
+            .await;
+            assert_eq!(vm.status(), StatusCode::OK);
             for _ in 0..3 {
                 for (method, suffix, body) in [
                     ("GET", "/status", serde_json::json!({})),
@@ -6614,6 +6650,20 @@ pub(crate) mod tests {
                 assert_eq!(response.status(), expected);
             }
         });
+    }
+
+    #[test]
+    fn one_tenant_with_two_keys_can_use_the_full_authenticated_budget() {
+        let mut state = test_state();
+        state.config.api_max_in_flight = 5;
+        state.config.api_keys = ApiKeyRegistry::from_plaintext_entries(vec![
+            ("one".into(), "solo".into(), ApiRole::User, 1),
+            ("two".into(), "solo".into(), ApiRole::Admin, 1),
+        ])
+        .unwrap();
+        let limits = ApiTrafficLimits::new(&state.config);
+        assert_eq!(limits.tenants["solo"].concurrency.available_permits(), 5);
+        assert_eq!(limits.unauthenticated.concurrency.available_permits(), 2);
     }
 
     #[test]
@@ -8140,6 +8190,7 @@ pub(crate) mod tests {
             rootfs_read_only: false,
             metrics_expose_tenant_labels: false,
             api_max_in_flight: 128,
+            async_execution_limits: Default::default(),
             execution_retention_hours: 24,
             max_concurrent_snapshots: 2,
             api_requests_per_second: 10_000,
