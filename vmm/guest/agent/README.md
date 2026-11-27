@@ -69,6 +69,9 @@ Rollout order:
 1. Build the new agent and VMM, bake the agent into every rootfs/OCI image
    variant, and test a cold boot with that exact pair. Keep old production
    images and VMM binaries available for the old pool during the drain.
+   For quickstart hosts, `make guest` reuses an existing rootfs. After building
+   the new pair, run `sudo make guest OUT_DIR=/var/lib/tarit/guest-next` with
+   a fresh output directory and point the new pool at those assets.
 2. Stop admitting new VMs on old hosts and drain their running VMs, warm pools,
    and golden templates. Do not restart the new agent in a live guest managed
    by an old VMM: old-host PTY/SSH still targets port 1025.

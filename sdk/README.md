@@ -68,10 +68,11 @@ accepted, and the SDK cannot recover its server-generated ID from that response.
 A fork deadline stops waiting; it does not cancel creation on the server. Catch
 `TaritDeadlineExceeded` and use its `child_id` to query or delete the child VM,
 or retry the fork with that same `child_id`. The error exposes the stable ID
-whether you supplied it or the SDK generated it. Python checks the deadline before returning. Pass
-`accept_late_response=True` to accept a definitive response received at the
-deadline. An undecodable fork response exposes the same `child_id` on its
-decoding exception.
+whether you supplied it or the SDK generated it. If the server has already
+returned a definitive response when the deadline expires, Python returns the
+child or reports the server's error. Pass `accept_late_response=False` to
+enforce the deadline through response decoding. An undecodable fork response
+exposes the same `child_id` on its decoding exception.
 
 ## TypeScript
 

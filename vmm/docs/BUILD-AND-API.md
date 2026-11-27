@@ -134,7 +134,11 @@ vmm kernel install [--output <PATH>] [--force]
 
 The command downloads the version and URL embedded at build time, requires
 HTTPS, verifies the embedded SHA-256, and installs with an atomic rename.
-`TARIT_KERNEL` overrides the default path. `--force` replaces a regular file
+The default cache stores each build under `kernels/<linux-version>/<sha256>/vmlinux`.
+A matching installation at the previous version-only path is still usable offline.
+After upgrading, run `vmm kernel install` as the account that starts the VMM to
+install a changed pin before starting guests non-interactively. An older binary
+can continue using its installed kernel. `TARIT_KERNEL` overrides the default path. `--force` replaces a regular file
 whose checksum is wrong; symlinks and non-regular files are rejected.
 
 ### `vmm serve` (`server`): Start the API server

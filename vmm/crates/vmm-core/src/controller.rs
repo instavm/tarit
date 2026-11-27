@@ -4099,7 +4099,7 @@ fn verify_runtime_ancestors(base: &Path, allow_symlinks: bool) -> Result<()> {
     )?;
     if let Some(ancestor) = untrusted {
         return Err(VmmError::Snapshot(format!(
-            "untrusted runtime ancestor: {}",
+            "untrusted runtime ancestor: {} (expected root or effective uid {uid} as owner; group- or world-writable directories require root ownership and the sticky bit)",
             ancestor.display()
         )));
     }

@@ -44,8 +44,9 @@ fi
 # then fall back visibly to the checksum-pinned source build.
 KERNEL_READY=0
 if [ -f "$OUT_DIR/vmlinux" ] && [ -f "$KERNEL_MARKER" ]; then
-  read -r installed_version installed_sha256 < "$KERNEL_MARKER" || true
+  read -r installed_version installed_sha256 release_sha256 < "$KERNEL_MARKER" || true
   if [ "${installed_version:-}" = "$KERNEL_VERSION" ] &&
+      [ "${release_sha256:-${installed_sha256:-}}" = "$KERNEL_ARTIFACT_SHA256" ] &&
       [ "${installed_sha256:-}" = "$(sha256_file "$OUT_DIR/vmlinux")" ]; then
     KERNEL_READY=1
   fi
@@ -69,7 +70,9 @@ if [ "$KERNEL_READY" != "1" ]; then
     mv "$OUT_DIR/vmlinux.new" "$OUT_DIR/vmlinux"
     mv "$OUT_DIR/kernel.config.new" "$OUT_DIR/kernel.config"
   fi
-  printf '%s %s\n' "$KERNEL_VERSION" "$(sha256_file "$OUT_DIR/vmlinux")" > "$KERNEL_MARKER.new"
+  # A local source build may differ from the downloadable binary. Record both
+  # the installed bytes and the release pin that selected this build.
+  printf '%s %s %s\n' "$KERNEL_VERSION" "$(sha256_file "$OUT_DIR/vmlinux")" "$KERNEL_ARTIFACT_SHA256" > "$KERNEL_MARKER.new"
   mv "$KERNEL_MARKER.new" "$KERNEL_MARKER"
 else
   echo "== kernel $KERNEL_VERSION already at $OUT_DIR/vmlinux =="

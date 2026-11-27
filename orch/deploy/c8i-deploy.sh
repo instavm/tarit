@@ -78,6 +78,17 @@ echo "== remote build + e2e =="
 set -euo pipefail
 export PATH="\$HOME/.cargo/bin:\$PATH"
 
+# This host runs the network-enabled orchestrator. Check the tool in the
+# service's root PATH before stopping an existing daemon.
+if ! sudo sh -c 'command -v conntrack >/dev/null'; then
+  if ! command -v apt-get >/dev/null; then
+    echo "Install conntrack-tools on the KVM host before deploying taritd." >&2
+    exit 1
+  fi
+  sudo apt-get update
+  sudo apt-get install -y conntrack
+fi
+
 mkdir -p ~/.taritd/sockets
 PID_FILE="\$HOME/.taritd/taritd.pid"
 if [[ -f "\$PID_FILE" ]]; then

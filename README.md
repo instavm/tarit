@@ -76,7 +76,7 @@ The quickstart is layered. Layer 1 gets your code running in a microVM. Layer 2
 adds snapshots, suspend, and restore. Layer 3 runs a managed fleet with the
 orchestrator. Take only the layer you need.
 
-You need a Linux host with KVM (`/dev/kvm`) and a Rust toolchain. Running
+You need a Linux host with KVM (`/dev/kvm`) and a Rust toolchain. The Makefile also requires Python 3 to build the VMM. Running
 microVMs needs root (or membership in the `kvm` group), so the commands use
 `sudo`.
 

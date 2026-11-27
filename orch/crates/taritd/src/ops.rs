@@ -2330,15 +2330,23 @@ fn ensure_execution_incarnation(expected: &VmRecord, current: &VmRecord) -> Resu
     Ok(())
 }
 
-/// Take a live-control gate without queueing behind another VM operation.
-/// Never cancel a handler after it acquires this guard: its publication and
-/// rollback work must still run to completion even if the HTTP deadline fires.
-fn try_live_operation_gate(
-    gate: Arc<tokio::sync::Mutex<()>>,
+/// Let short operations finish without tying up HTTP admission behind a guest
+/// command. Once acquired, keep the gate through publication and rollback.
+async fn lock_live_operation_gate(
+    state: &AppState,
     vm_id: Uuid,
 ) -> Result<tokio::sync::OwnedMutexGuard<()>, OrchError> {
-    gate.try_lock_owned()
-        .map_err(|_| OrchError::Conflict(format!("VM {vm_id} is busy with another operation")))
+    let gate = state.supervisor.operation_gate(vm_id)?;
+    let wait_ms = (state.config.api_request_timeout_ms / 4).min(100);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
+    let guard = lock_operation_gate(Arc::clone(&gate), vm_id, Some(deadline)).await?;
+    // A deletion or wake can replace the runtime while this request is queued.
+    if !Arc::ptr_eq(&gate, &state.supervisor.operation_gate(vm_id)?) {
+        return Err(OrchError::Conflict(format!(
+            "VM {vm_id} runtime changed while waiting"
+        )));
+    }
+    Ok(guard)
 }
 
 async fn lock_operation_gate(
@@ -2667,8 +2675,7 @@ async fn hibernate_local_owned(
     // prepare_hibernation has installed its durable binding.
     let activation = activation_gate(state, id)?;
     let _activation = activation.lock().await;
-    let gate = state.supervisor.operation_gate(id)?;
-    let _operation = try_live_operation_gate(gate, id)?;
+    let _operation = lock_live_operation_gate(state, id).await?;
     let current = ensure_vm_status(state, id, "hibernate", &[VmStatus::Running])?;
     // Check revision exhaustion before pausing or persisting a wake path.
     let record = terminal_record(state, id, VmStatus::Hibernated)?;
@@ -3405,8 +3412,7 @@ pub async fn snapshot_local(state: &AppState, id: Uuid, _diff: bool) -> Result<S
         &[VmStatus::Running, VmStatus::Paused],
     )?;
     ensure_no_data_volumes(state, &vm, "snapshot").await?;
-    let gate = state.supervisor.operation_gate(id)?;
-    let _operation = try_live_operation_gate(gate, id)?;
+    let _operation = lock_live_operation_gate(state, id).await?;
     Ok(
         snapshot_local_locked(state, id, None, None, SnapshotMode::ResumeRunning)
             .await?
@@ -3446,8 +3452,8 @@ pub async fn snapshot_local_for_fork(
     }
     let source = ensure_vm_status(state, source_id, "fork", &[VmStatus::Running])?;
     ensure_no_data_volumes(state, &source, "fork").await?;
-    let gate = state.supervisor.operation_gate(source_id)?;
-    let _operation = try_live_operation_gate(gate, source_id)?;
+    let _operation = lock_live_operation_gate(state, source_id).await?;
+    ensure_vm_status(state, source_id, "fork", &[VmStatus::Running])?;
     snapshot_local_locked(
         state,
         source_id,
@@ -4597,10 +4603,7 @@ pub async fn put_egress_policy_local(
     let _operation = if vm.status == VmStatus::Hibernated {
         None
     } else {
-        Some(try_live_operation_gate(
-            state.supervisor.operation_gate(id)?,
-            id,
-        )?)
+        Some(lock_live_operation_gate(state, id).await?)
     };
     let allowlist = crate::net::normalize_tenant_egress_allowlist(&allowlist)?;
     let now = Timestamp::now();
@@ -4755,8 +4758,7 @@ pub fn get_local(state: &AppState, id: Uuid) -> Result<VmRecord, OrchError> {
 /// queried from the `vmm serve` process over its UDS.
 pub async fn status_local(state: &AppState, id: Uuid) -> Result<serde_json::Value, OrchError> {
     ensure_vm_status(state, id, "query live status for", LIVE_CONTROL_STATUSES)?;
-    let gate = state.supervisor.operation_gate(id)?;
-    let _operation = try_live_operation_gate(gate, id)?;
+    let _operation = lock_live_operation_gate(state, id).await?;
     let record = ensure_vm_status(state, id, "query live status for", LIVE_CONTROL_STATUSES)?;
     let sup = Arc::clone(&state.supervisor);
     let status = tokio::task::spawn_blocking(move || sup.status_vm(id))
@@ -4785,8 +4787,7 @@ pub async fn set_balloon_local(
             vm.memory_mib
         )));
     }
-    let gate = state.supervisor.operation_gate(id)?;
-    let _operation = try_live_operation_gate(gate, id)?;
+    let _operation = lock_live_operation_gate(state, id).await?;
     let vm = ensure_vm_status(
         state,
         id,
@@ -4812,8 +4813,7 @@ pub async fn balloon_local(state: &AppState, id: Uuid) -> Result<(u64, u64, u32,
         "get balloon for",
         &[VmStatus::Running, VmStatus::Paused],
     )?;
-    let gate = state.supervisor.operation_gate(id)?;
-    let _operation = try_live_operation_gate(gate, id)?;
+    let _operation = lock_live_operation_gate(state, id).await?;
     ensure_vm_status(
         state,
         id,
@@ -4840,8 +4840,7 @@ where
     // to preserve serialization with concurrent live transitions.
     let observed = get_local(state, id)?;
     validate_live_transition(id, observed.status, new_status)?;
-    let gate = state.supervisor.operation_gate(id)?;
-    let _operation = try_live_operation_gate(gate, id)?;
+    let _operation = lock_live_operation_gate(state, id).await?;
     let current = get_local(state, id)?;
     match validate_live_transition(id, current.status, new_status)? {
         TransitionDecision::Noop => return Ok(current),
@@ -5614,6 +5613,28 @@ mod tests {
             rollback_plan(VmStatus::Suspended, VmStatus::Running),
             Some(RollbackPlan::Suspend)
         );
+    }
+
+    #[test]
+    fn live_control_waits_for_a_short_operation() {
+        let (state, _rx) = test_state_with_durable_writer();
+        let id = Uuid::new_v4();
+        state
+            .supervisor
+            .install_test_control_runtime(id, "unused.sock".into());
+        test_runtime().block_on(async {
+            let gate = state.supervisor.operation_gate(id).unwrap();
+            let held = gate.lock_owned().await;
+            let waiter = lock_live_operation_gate(&state, id);
+            tokio::pin!(waiter);
+            tokio::select! {
+                biased;
+                _ = &mut waiter => panic!("control did not wait for the current operation"),
+                _ = std::future::ready(()) => {}
+            }
+            drop(held);
+            drop(waiter.await.unwrap());
+        });
     }
 
     #[test]
@@ -7934,6 +7955,7 @@ mod tests {
             rootfs_read_only: false,
             metrics_expose_tenant_labels: false,
             api_max_in_flight: 128,
+            async_execution_limits: Default::default(),
             execution_retention_hours: 24,
             max_concurrent_snapshots: 2,
             api_requests_per_second: 10_000,
