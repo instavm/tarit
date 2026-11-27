@@ -64,6 +64,12 @@ jobs:
           sudo install -m 0644 /tmp/guest-assets/rootfs.ext4 /tmp/vsock-rootfs.ext4
           test -r /tmp/vmlinux.microvm && test -r /tmp/vsock-rootfs.ext4
 
+      - name: Verify guest console writes with standalone boot
+        env:
+          VMM_BIN: ${{ github.workspace }}/vmm/target/release/vmm
+          VMM_TEST_KERNEL: /tmp/vmlinux.microvm
+        run: bash vmm/ci/test-direct-serial.sh
+
       - name: Build release orchestrator
         working-directory: orch
         run: cargo build --release --locked -p taritd -p tarit-bench
